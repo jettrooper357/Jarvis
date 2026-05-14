@@ -22,6 +22,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
+_AUTO_COLLABORATION_TOOLS = (
+    "managed_agent_directory",
+    "managed_agent_delegate",
+    "managed_agent_message",
+    "managed_agent_assign_task",
+    "managed_agent_list_tasks",
+    "managed_agent_update_task",
+    "managed_agent_inspect",
+)
+
+
+def _format_open_task(task: dict[str, Any]) -> str:
+    parts = [
+        f"id={task.get('id', '')}",
+        f"status={task.get('status', 'unknown')}",
+        f"description={str(task.get('description', '') or '').strip()}",
+    ]
+    progress = task.get("progress") or {}
+    if progress:
+        parts.append(f"progress={progress}")
+    findings = task.get("findings") or []
+    if findings:
+        parts.append(f"findings={len(findings)}")
+    return " | ".join(parts)
+
+
+def _truncate_task_feedback(value: str, limit: int = 400) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
 
 
 class AgentExecutor:
@@ -74,6 +105,49 @@ class AgentExecutor:
         elif name.startswith("channel_"):
             if hasattr(tool, "_channel"):
                 tool._channel = getattr(self._system, "channel_backend", None)
+
+    @staticmethod
+    def _fallback_response_from_tool_results(tool_results: list[Any]) -> str:
+        if not tool_results:
+            return ""
+        last = tool_results[-1]
+        content = str(getattr(last, "content", "") or "").strip()
+        if content:
+            return content
+        tool_name = str(getattr(last, "tool_name", "") or "tool")
+        success = bool(getattr(last, "success", False))
+        if success:
+            return f"{tool_name} completed successfully, but no final response was produced."
+        return f"{tool_name} failed, and no final response was produced."
+
+    def _sync_response_to_single_open_task(self, agent_id: str, response_text: str) -> None:
+        text = str(response_text or "").strip()
+        if not text:
+            return
+        open_tasks = [
+            task
+            for task in self._manager.list_tasks(agent_id)
+            if str(task.get("status", "")).strip() != "completed"
+        ]
+        if len(open_tasks) != 1:
+            return
+        task = open_tasks[0]
+        progress = dict(task.get("progress") or {})
+        progress["note"] = _truncate_task_feedback(text, 400)
+        findings = list(task.get("findings") or [])
+        summary = _truncate_task_feedback(text, 240)
+        if not any(
+            isinstance(entry, dict)
+            and str(entry.get("summary", "")).strip() == summary
+            for entry in findings
+        ):
+            findings.append(
+                {
+                    "source": "agent_response",
+                    "summary": summary,
+                }
+            )
+        self._manager.update_task(task["id"], progress=progress, findings=findings)
 
     def run_ephemeral(
         self,
@@ -281,6 +355,11 @@ class AgentExecutor:
         tool_names = config.get("tools", [])
         if isinstance(tool_names, str):
             tool_names = [t.strip() for t in tool_names.split(",") if t.strip()]
+        else:
+            tool_names = list(tool_names)
+        for tool_name in _AUTO_COLLABORATION_TOOLS:
+            if tool_name not in tool_names:
+                tool_names.append(tool_name)
 
         tool_instances: list[Any] = []
         if tool_names:
@@ -337,6 +416,13 @@ class AgentExecutor:
             base = memory or "Continue your assigned task."
             input_text = f"Current date: {today}\n\n{base}"
         pending = self._manager.get_pending_messages(agent["id"])
+        open_tasks = self._manager.list_tasks(agent["id"])
+        actionable_tasks = [
+            task for task in open_tasks if str(task.get("status", "")).strip() != "completed"
+        ]
+        if actionable_tasks:
+            task_lines = "\n".join(_format_open_task(task) for task in actionable_tasks[:10])
+            input_text = f"{input_text}\n\nOpen tasks:\n{task_lines}"
         if pending:
             user_msgs = "\n".join(f"User: {m['content']}" for m in pending)
             input_text = f"{input_text}\n\nNew instructions:\n{user_msgs}"
@@ -353,8 +439,9 @@ class AgentExecutor:
             )
         else:
             logger.info(
-                "Agent %s: no pending messages, running with instruction only",
+                "Agent %s: no pending messages, running with instruction%s",
                 agent["name"],
+                " and open tasks" if actionable_tasks else " only",
             )
 
         # Build AgentContext with memory results from FTS5 backend
@@ -429,6 +516,12 @@ class AgentExecutor:
                 agent["name"],
             )
             result = agent_instance.run(input_text, context=agent_ctx)
+            if not (result.content or "").strip():
+                fallback = self._fallback_response_from_tool_results(
+                    result.tool_results
+                )
+                if fallback:
+                    result.content = fallback
 
         _elapsed = time.time() - _t0
         logger.info(
@@ -519,6 +612,7 @@ class AgentExecutor:
                     result.content[:2000],
                 )
                 self._manager.store_agent_response(agent_id, result.content[:2000])
+                self._sync_response_to_single_open_task(agent_id, result.content)
 
             # Budget enforcement (post-tick check)
             agent_data = self._manager.get_agent(agent_id)

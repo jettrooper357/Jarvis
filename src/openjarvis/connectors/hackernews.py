@@ -52,9 +52,14 @@ class HackerNewsConnector(BaseConnector):
         self, *, since: Optional[datetime] = None, cursor: Optional[str] = None
     ) -> Iterator[Document]:
         """Yield Documents for the top 5 Hacker News stories."""
+        self._status.state = "syncing"
+        self._status.error = None
+        self._status.items_synced = 0
         top_ids = _hn_top_story_ids()
+        story_ids = top_ids[:5]
+        self._status.items_total = len(story_ids)
 
-        for story_id in top_ids[:5]:
+        for story_id in story_ids:
             item = _hn_item(story_id)
             if item is None:
                 continue
@@ -83,6 +88,7 @@ class HackerNewsConnector(BaseConnector):
                     "descendants": descendants,
                 },
             )
+            self._status.items_synced += 1
 
         self._status.state = "idle"
         self._status.last_sync = datetime.now()

@@ -171,3 +171,18 @@ def test_sync_filters_by_since(connector):
 def test_disconnect(connector):
     connector.disconnect()
     assert connector.is_connected() is False
+
+
+def test_sync_updates_status_counters(connector):
+    with patch(
+        "openjarvis.connectors.news_rss._fetch_feed",
+        return_value=_SAMPLE_RSS,
+    ):
+        docs = list(connector.sync())
+
+    status = connector.sync_status()
+    assert len(docs) == 3
+    assert status.state == "idle"
+    assert status.items_total == 3
+    assert status.items_synced == 3
+    assert status.last_sync is not None

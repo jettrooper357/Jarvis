@@ -122,3 +122,27 @@ def test_disconnect_is_noop(connector):
     """Disconnect should succeed without error."""
     connector.disconnect()
     assert connector.is_connected() is True
+
+
+def test_sync_updates_status_counters(connector):
+    def mock_item(item_id):
+        return _STORY_ITEMS[item_id]
+
+    with (
+        patch(
+            "openjarvis.connectors.hackernews._hn_top_story_ids",
+            return_value=_TOP_STORY_IDS,
+        ),
+        patch(
+            "openjarvis.connectors.hackernews._hn_item",
+            side_effect=mock_item,
+        ),
+    ):
+        docs = list(connector.sync())
+
+    status = connector.sync_status()
+    assert len(docs) == 5
+    assert status.state == "idle"
+    assert status.items_total == 5
+    assert status.items_synced == 5
+    assert status.last_sync is not None

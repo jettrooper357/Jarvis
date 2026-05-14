@@ -121,6 +121,10 @@ class NewsRSSConnector(BaseConnector):
     ) -> Iterator[Document]:
         """Yield Documents for recent items across all configured feeds."""
         feeds = self._load_config()
+        self._status.state = "syncing"
+        self._status.error = None
+        self._status.items_synced = 0
+        self._status.items_total = 0
 
         for feed in feeds:
             feed_name = feed.get("name", "Unknown Feed")
@@ -134,6 +138,7 @@ class NewsRSSConnector(BaseConnector):
                 continue
 
             items = _parse_rss_items(xml_text)
+            self._status.items_total += len(items)
             for item in items:
                 pub_dt = _parse_pub_date(item["pubDate"])
 
@@ -154,6 +159,7 @@ class NewsRSSConnector(BaseConnector):
                     url=item["link"] or None,
                     metadata={"feed_name": feed_name},
                 )
+                self._status.items_synced += 1
 
         self._status.state = "idle"
         self._status.last_sync = datetime.now()

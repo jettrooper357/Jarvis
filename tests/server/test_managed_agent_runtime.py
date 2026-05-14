@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 
 from openjarvis.agents.manager import AgentManager
+from openjarvis.core.events import EventBus, EventType
 from openjarvis.server.managed_agent_runtime import ManagedAgentRuntime
 from tests.agents.fake_engine import FakeEngine
 
@@ -120,7 +121,7 @@ def test_agents_can_assign_tasks_and_message_each_other():
                                 (
                                     '{"agent_name_or_id":"Developer",'
                                     '"description":"Implement the export endpoint.",'
-                                    '"status":"pending"}'
+                                    '"status":"pending","start_now":false}'
                                 ),
                             )
                         ]
@@ -172,5 +173,228 @@ def test_agents_can_assign_tasks_and_message_each_other():
                 "managed_agent_assign_task",
                 "managed_agent_message",
             ]
+        finally:
+            manager.close()
+
+
+def test_assign_task_starts_assignee_immediately_by_default():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = AgentManager(db_path=str(Path(tmpdir) / "agents.db"))
+        try:
+            ceo = manager.create_agent(
+                name="My Assistant",
+                agent_type="deep_research",
+                org_role="Chief Executive Officer (CEO)",
+                config={"max_turns": 6},
+            )
+            project_manager = manager.create_agent(
+                name="Project Manager",
+                agent_type="simple",
+                org_role="Project Manager",
+                manager_agent_id=ceo["id"],
+                config={"system_prompt": "You manage assigned projects."},
+            )
+
+            engine = FakeEngine(
+                [
+                    {
+                        "tool_calls": [
+                            _tool_call(
+                                "call-1",
+                                "managed_agent_assign_task",
+                                (
+                                    '{"agent_name_or_id":"Project Manager",'
+                                    '"description":"Set up a new test project.",'
+                                    '"status":"active"}'
+                                ),
+                            )
+                        ]
+                    },
+                    {"content": "I have started the new project and will post a plan next."},
+                    {"content": "The project manager has started the project."},
+                ]
+            )
+
+            runtime = ManagedAgentRuntime(manager, engine, default_model="fake-model")
+            response = runtime.run(ceo["id"], "Start a new project.")
+
+            assert response == "The project manager has started the project."
+
+            project_tasks = manager.list_tasks(project_manager["id"])
+            assert len(project_tasks) == 1
+            assert project_tasks[0]["description"] == "Set up a new test project."
+            assert project_tasks[0]["assigned_by_agent_id"] == ceo["id"]
+
+            project_messages = manager.list_messages(project_manager["id"])
+            assert any(
+                msg["direction"] == "user_to_agent"
+                and "You have been assigned a persistent task by My Assistant." in msg["content"]
+                and "Set up a new test project." in msg["content"]
+                for msg in project_messages
+            )
+            assert any(
+                msg["direction"] == "agent_to_user"
+                and "started the new project" in msg["content"]
+                for msg in project_messages
+            )
+
+            ceo_messages = manager.list_messages(ceo["id"])
+            ceo_reply = next(
+                msg for msg in ceo_messages if msg["direction"] == "agent_to_user"
+            )
+            assert ceo_reply["tool_calls"] is not None
+            assert ceo_reply["tool_calls"][0]["tool"] == "managed_agent_assign_task"
+            assert "Initial response from Project Manager" in ceo_reply["tool_calls"][0]["result"]
+        finally:
+            manager.close()
+
+
+def test_ceo_can_inspect_subordinate_state():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = AgentManager(db_path=str(Path(tmpdir) / "agents.db"))
+        try:
+            ceo = manager.create_agent(
+                name="My Assistant",
+                agent_type="monitor_operative",
+                org_role="Chief Executive Officer (CEO)",
+                config={"system_prompt": "Lead the organization."},
+            )
+            worker = manager.create_agent(
+                name="Developer",
+                agent_type="monitor_operative",
+                org_role="Developer",
+                manager_agent_id=ceo["id"],
+                config={"system_prompt": "Build things."},
+            )
+            manager.create_task(
+                worker["id"],
+                description="Ship the export endpoint.",
+                status="active",
+                assigned_by_agent_id=ceo["id"],
+            )
+            manager.send_message(worker["id"], "Please status this work.", mode="delegated")
+            manager.store_agent_response(worker["id"], "The export endpoint is underway.")
+            manager.add_learning_log(
+                worker["id"],
+                "tool_call",
+                "Ran apply_patch",
+                {"tool": "apply_patch"},
+            )
+
+            engine = FakeEngine(
+                [
+                    {
+                        "tool_calls": [
+                            _tool_call(
+                                "call-1",
+                                "managed_agent_inspect",
+                                '{"agent_name_or_id":"Developer"}',
+                            )
+                        ]
+                    },
+                    {"content": "Inspection complete."},
+                ]
+            )
+
+            runtime = ManagedAgentRuntime(manager, engine, default_model="fake-model")
+            response = runtime.run(ceo["id"], "Inspect the developer.")
+
+            assert response == "Inspection complete."
+            ceo_messages = manager.list_messages(ceo["id"])
+            ceo_reply = next(
+                msg for msg in ceo_messages if msg["direction"] == "agent_to_user"
+            )
+            assert ceo_reply["tool_calls"] is not None
+            assert ceo_reply["tool_calls"][0]["tool"] == "managed_agent_inspect"
+            inspect_result = ceo_reply["tool_calls"][0]["result"]
+            assert "Ship the export endpoint." in inspect_result
+            assert "The export endpoint is underway." in inspect_result
+            assert "Ran apply_patch" in inspect_result
+        finally:
+            manager.close()
+
+
+def test_subordinate_cannot_inspect_manager_state():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = AgentManager(db_path=str(Path(tmpdir) / "agents.db"))
+        try:
+            ceo = manager.create_agent(
+                name="My Assistant",
+                agent_type="monitor_operative",
+                org_role="Chief Executive Officer (CEO)",
+                config={"system_prompt": "Lead the organization."},
+            )
+            developer = manager.create_agent(
+                name="Developer",
+                agent_type="monitor_operative",
+                org_role="Developer",
+                manager_agent_id=ceo["id"],
+                config={"system_prompt": "Build things."},
+            )
+
+            engine = FakeEngine(
+                [
+                    {
+                        "tool_calls": [
+                            _tool_call(
+                                "call-1",
+                                "managed_agent_inspect",
+                                '{"agent_name_or_id":"My Assistant"}',
+                            )
+                        ]
+                    },
+                    {"content": "Inspection denied."},
+                ]
+            )
+
+            runtime = ManagedAgentRuntime(manager, engine, default_model="fake-model")
+            response = runtime.run(developer["id"], "Inspect the CEO.")
+
+            assert response == "Inspection denied."
+            developer_messages = manager.list_messages(developer["id"])
+            developer_reply = next(
+                msg for msg in developer_messages if msg["direction"] == "agent_to_user"
+            )
+            assert developer_reply["tool_calls"] is not None
+            assert developer_reply["tool_calls"][0]["tool"] == "managed_agent_inspect"
+            assert "Access denied" in developer_reply["tool_calls"][0]["result"]
+        finally:
+            manager.close()
+
+
+def test_runtime_publishes_agent_events_for_external_turns():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = AgentManager(db_path=str(Path(tmpdir) / "agents.db"))
+        try:
+            agent = manager.create_agent(
+                name="Project Manager",
+                agent_type="monitor_operative",
+                config={"system_prompt": "You manage projects."},
+            )
+            bus = EventBus(record_history=True)
+            engine = FakeEngine([{"content": "Project acknowledged."}])
+
+            runtime = ManagedAgentRuntime(
+                manager,
+                engine,
+                bus=bus,
+                default_model="fake-model",
+            )
+            response = runtime.run(agent["id"], "Start the project.")
+
+            assert response == "Project acknowledged."
+            event_types = [event.event_type for event in bus.history]
+            assert EventType.AGENT_TICK_START in event_types
+            assert EventType.AGENT_MESSAGE_RECEIVED in event_types
+            assert EventType.AGENT_TICK_END in event_types
+            relevant = [
+                event for event in bus.history
+                if event.event_type in {
+                    EventType.AGENT_TICK_START,
+                    EventType.AGENT_MESSAGE_RECEIVED,
+                    EventType.AGENT_TICK_END,
+                }
+            ]
+            assert all(event.data.get("agent_id") == agent["id"] for event in relevant)
         finally:
             manager.close()

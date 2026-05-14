@@ -190,6 +190,47 @@ export const SOURCE_CATALOG: ConnectorMeta[] = [
     ],
   },
   {
+    connector_id: 'hackernews',
+    display_name: 'Hacker News',
+    auth_type: 'local',
+    category: 'other',
+    icon: 'BookText',
+    color: 'text-orange-400',
+    description: 'Top stories from Hacker News',
+    unitLabel: 'stories',
+    steps: [
+      {
+        label: 'No credentials are required. OpenJarvis can sync the current top Hacker News stories directly.',
+      },
+      {
+        label: 'If it looks stale, click Sync on the connected card to pull the latest top stories.',
+      },
+    ],
+    inputFields: [],
+  },
+  {
+    connector_id: 'news_rss',
+    display_name: 'News / RSS',
+    auth_type: 'local',
+    category: 'other',
+    icon: 'Link2',
+    color: 'text-amber-300',
+    description: 'Headlines from custom RSS and Atom feeds',
+    unitLabel: 'articles',
+    steps: [
+      {
+        label: 'Add feed URLs to ~/.openjarvis/connectors/news_rss.json under a top-level "feeds" array, then refresh this page.',
+      },
+      {
+        label: 'Example: {"feeds":[{"name":"Hacker News Front Page","url":"https://hnrss.org/frontpage"}]}',
+      },
+      {
+        label: 'After saving the file, click Sync to ingest the latest feed items.',
+      },
+    ],
+    inputFields: [],
+  },
+  {
     connector_id: 'imessage',
     display_name: 'iMessage',
     auth_type: 'local',

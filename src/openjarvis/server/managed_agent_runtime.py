@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence
 
 from openjarvis.core.registry import ToolRegistry
+from openjarvis.core.events import EventType
 from openjarvis.core.types import Message, Role, ToolCall, ToolResult
 from openjarvis.tools._stubs import ToolExecutor
 
@@ -25,6 +27,7 @@ _AUTO_COLLABORATION_TOOLS = (
     "managed_agent_assign_task",
     "managed_agent_list_tasks",
     "managed_agent_update_task",
+    "managed_agent_inspect",
 )
 _KNOWLEDGE_TOOL_NAMES = ("knowledge_search", "knowledge_sql", "scan_chunks", "think")
 
@@ -211,10 +214,41 @@ class ManagedAgentRuntime:
             raise KeyError(f"Agent {agent_id!r} not found")
 
         mode = "delegated" if parent_agent_id else "channel"
+        started_at = time.time()
+        agent_name = str(agent_record.get("name", agent_id))
+        if self._bus is not None:
+            try:
+                self._bus.publish(
+                    EventType.AGENT_TICK_START,
+                    {
+                        "agent_id": agent_id,
+                        "agent_name": agent_name,
+                        "mode": mode,
+                    },
+                )
+            except Exception:
+                logger.exception("Failed to publish AGENT_TICK_START for %s", agent_id)
         message = self._manager.send_message(agent_id, user_content, mode=mode)
         message_id = message["id"]
+        if self._bus is not None:
+            try:
+                self._bus.publish(
+                    EventType.AGENT_MESSAGE_RECEIVED,
+                    {
+                        "agent_id": agent_id,
+                        "agent_name": agent_name,
+                        "message_id": message_id,
+                        "mode": mode,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to publish AGENT_MESSAGE_RECEIVED for %s",
+                    agent_id,
+                )
         response_text = ""
         tool_calls: Optional[List[Dict[str, Any]]] = None
+        had_error = False
         try:
             response_text, tool_calls = self._run_turn(
                 agent_record=agent_record,
@@ -226,6 +260,7 @@ class ManagedAgentRuntime:
         except Exception as exc:
             logger.exception("Managed agent turn failed for %s", agent_id)
             response_text = f"Sorry, the agent failed: {exc}"
+            had_error = True
         finally:
             try:
                 self._manager.mark_message_delivered(message_id)
@@ -236,6 +271,21 @@ class ManagedAgentRuntime:
             response_text,
             tool_calls=tool_calls or None,
         )
+        if self._bus is not None:
+            try:
+                event_type = EventType.AGENT_TICK_ERROR if had_error else EventType.AGENT_TICK_END
+                payload = {
+                    "agent_id": agent_id,
+                    "agent_name": agent_name,
+                    "duration": time.time() - started_at,
+                    "status": "error" if had_error else "ok",
+                    "summary": response_text[:240],
+                }
+                if had_error:
+                    payload["error"] = response_text[:240]
+                self._bus.publish(event_type, payload)
+            except Exception:
+                logger.exception("Failed to publish completion event for %s", agent_id)
         return response_text
 
     def _run_turn(

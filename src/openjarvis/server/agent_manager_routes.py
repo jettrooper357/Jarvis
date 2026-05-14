@@ -453,6 +453,7 @@ def _build_deep_research_tools(
                         "managed_agent_assign_task",
                         "managed_agent_list_tasks",
                         "managed_agent_update_task",
+                        "managed_agent_inspect",
                     ),
                     engine=engine,
                     model=model,
@@ -503,18 +504,32 @@ def _effective_agent_tool_names(agent_record: Dict[str, Any]) -> List[str]:
             cleaned = entry.strip()
             if cleaned and cleaned not in names:
                 names.append(cleaned)
-    if str(agent_record.get("name", "")).strip().casefold() == "my assistant":
-        for tool_name in (
-            "managed_agent_directory",
-            "managed_agent_delegate",
-            "managed_agent_message",
-            "managed_agent_assign_task",
-            "managed_agent_list_tasks",
-            "managed_agent_update_task",
-        ):
-            if tool_name not in names:
-                names.append(tool_name)
+    for tool_name in (
+        "managed_agent_directory",
+        "managed_agent_delegate",
+        "managed_agent_message",
+        "managed_agent_assign_task",
+        "managed_agent_list_tasks",
+        "managed_agent_update_task",
+        "managed_agent_inspect",
+    ):
+        if tool_name not in names:
+            names.append(tool_name)
     return names
+
+
+def _fallback_response_from_tool_calls(tool_calls: List[Dict[str, Any]]) -> str:
+    """Build a readable fallback when the model returns no final text."""
+    if not tool_calls:
+        return ""
+    last = tool_calls[-1]
+    result_text = str(last.get("result", "") or "").strip()
+    if result_text:
+        return result_text
+    tool_name = str(last.get("tool", "") or "tool")
+    if last.get("success", False):
+        return f"{tool_name} completed successfully, but no final response was produced."
+    return f"{tool_name} failed, and no final response was produced."
 
 
 def _get_mcp_tools(app_state: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -1267,6 +1282,7 @@ async def _stream_managed_agent(
                                     "managed_agent_assign_task",
                                     "managed_agent_list_tasks",
                                     "managed_agent_update_task",
+                                    "managed_agent_inspect",
                                 ):
                                     tool_instance = tool_cls(context=runtime_context)
                                 else:
@@ -1367,6 +1383,26 @@ async def _stream_managed_agent(
 
             # No tool calls — this is the final response
             collected_content += turn_content
+            if not collected_content.strip() and collected_tool_calls:
+                fallback_content = _fallback_response_from_tool_calls(
+                    collected_tool_calls
+                )
+                if fallback_content:
+                    collected_content = fallback_content
+                    persist_state["content"] = collected_content
+                    fallback_chunk = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": fallback_content},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(fallback_chunk)}\n\n"
             persist_state["content"] = collected_content
             persist_state["tool_calls"] = list(collected_tool_calls)
             break
@@ -1504,16 +1540,12 @@ def create_agent_manager_router(
             raise HTTPException(status_code=404, detail="Agent not found")
         if agent["status"] == "archived":
             raise HTTPException(status_code=400, detail="Agent is archived")
+        if agent["status"] == "running":
+            raise HTTPException(status_code=409, detail="Agent is already running")
 
         # Auto-recover from error/needs_attention state
         if agent["status"] in ("error", "needs_attention"):
             manager.update_agent(agent_id, status="idle")
-
-        # Acquire tick BEFORE spawning thread — prevents race
-        try:
-            manager.start_tick(agent_id)
-        except ValueError:
-            raise HTTPException(status_code=409, detail="Agent is already running")
 
         # Re-use the server's engine + model so we don't pick a
         # random model from Ollama's list.

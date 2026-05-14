@@ -38,7 +38,7 @@ class TestAgentManagerRoutes:
 
         app = FastAPI()
         routers = create_agent_manager_router(manager)
-        agents_router, templates_router, global_router, tools_router = routers
+        agents_router, templates_router, global_router, tools_router, *_ = routers
         app.include_router(agents_router)
         app.include_router(templates_router)
         app.include_router(global_router)
@@ -223,6 +223,50 @@ class TestAgentManagerRoutes:
         )
         assert res.status_code == 404
 
+    def test_run_agent_does_not_prelock_tick(self, manager, monkeypatch):
+        from fastapi import FastAPI
+
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+
+        app = FastAPI()
+        app.state.engine = MagicMock()
+        app.state.model = "test-model"
+        app.state.config = None
+        app.state.trace_store = None
+
+        routers = create_agent_manager_router(manager)
+        agents_router, templates_router, global_router, tools_router, *_ = routers
+        app.include_router(agents_router)
+        app.include_router(templates_router)
+        app.include_router(global_router)
+        app.include_router(tools_router)
+        client = TestClient(app)
+
+        agent = manager.create_agent(name="runner", agent_type="monitor_operative")
+
+        class _ImmediateThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                if self._target:
+                    self._target()
+
+        monkeypatch.setattr("threading.Thread", _ImmediateThread)
+
+        def _fake_execute_tick(self, agent_id: str):
+            manager.update_agent(agent_id, status="idle")
+
+        monkeypatch.setattr(
+            "openjarvis.agents.executor.AgentExecutor.execute_tick",
+            _fake_execute_tick,
+        )
+
+        res = client.post(f"/v1/managed-agents/{agent['id']}/run")
+        assert res.status_code == 200
+        refreshed = manager.get_agent(agent["id"])
+        assert refreshed["status"] == "idle"
+
 
 def test_run_agent_concurrent_returns_409(tmp_path):
     """Rapid Run Now clicks should not spawn multiple ticks."""
@@ -287,7 +331,7 @@ class TestAgentManagerStreaming:
         app.state.bus = None
 
         routers = create_agent_manager_router(manager)
-        agents_router, templates_router, global_router, tools_router = routers
+        agents_router, templates_router, global_router, tools_router, *_ = routers
         app.include_router(agents_router)
         app.include_router(templates_router)
         app.include_router(global_router)
