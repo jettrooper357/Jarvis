@@ -86,6 +86,40 @@ else
   fail "Node.js not found. Install from https://nodejs.org"
 fi
 
+# ── 3b. Check / install espeak-ng (kokoro TTS phonemizer) ────────────
+# kokoro's phonemizer dlopens libespeak-ng. Without it /v1/speech/synthesize
+# returns 500. Cheap to probe; skip silently when already present.
+info "Checking espeak-ng..."
+if command -v espeak-ng &>/dev/null; then
+  ok "espeak-ng found"
+else
+  warn "espeak-ng not found — installing..."
+  case "$(uname -s)" in
+    Darwin)
+      if command -v brew &>/dev/null; then
+        brew install espeak-ng || brew install espeak
+      else
+        warn "Homebrew not found — install espeak from https://github.com/espeak-ng/espeak-ng/releases and re-run."
+      fi
+      ;;
+    Linux)
+      if command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq && sudo apt-get install -y espeak-ng
+      elif command -v dnf &>/dev/null; then
+        sudo dnf install -y espeak-ng
+      elif command -v pacman &>/dev/null; then
+        sudo pacman -S --noconfirm espeak-ng
+      else
+        warn "No recognized package manager — install espeak-ng manually."
+      fi
+      ;;
+    *)
+      warn "Unknown OS — install espeak-ng manually."
+      ;;
+  esac
+  command -v espeak-ng &>/dev/null && ok "espeak-ng installed" || warn "espeak-ng still missing; local TTS will be disabled."
+fi
+
 # ── 4. Check / install Ollama ────────────────────────────────────────
 info "Checking Ollama..."
 if command -v ollama &>/dev/null; then
@@ -142,8 +176,13 @@ else
 fi
 
 # ── 7. Install Python dependencies ──────────────────────────────────
+# `speech` pulls faster-whisper / silero-vad / soundfile (STT + audio I/O).
+# `speech-tts-kokoro` pulls kokoro plus the transformers<5 / hf_hub<1.0 pins
+# it needs (declared as conflicting with `inference-mlx` in pyproject.toml,
+# so uv resolves them into separate lockfile splits).
 info "Installing Python dependencies..."
-uv sync --extra server --quiet 2>/dev/null || uv sync --extra server
+EXTRAS=(--extra server --extra speech --extra speech-tts-kokoro)
+uv sync "${EXTRAS[@]}" --quiet 2>/dev/null || uv sync "${EXTRAS[@]}"
 ok "Python dependencies installed"
 
 # ── 7b. Build Rust extension ──────────────────────────────────────
@@ -158,8 +197,10 @@ info "Installing frontend dependencies..."
 ok "Frontend dependencies installed"
 
 # ── 9. Start backend ────────────────────────────────────────────────
+# Pass the same extras as the sync above so `uv run` picks the lockfile split
+# that pins hf_hub<1.0 / transformers<5 (kokoro needs these to import).
 info "Starting backend API server on port 8000..."
-uv run jarvis serve --port 8000 &>/dev/null &
+uv run "${EXTRAS[@]}" jarvis serve --port 8000 &>/dev/null &
 CLEANUP_PIDS+=($!)
 sleep 3
 

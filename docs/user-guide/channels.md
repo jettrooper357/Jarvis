@@ -143,6 +143,46 @@ channel.disconnect()
 
 ---
 
+## Per-agent routing (Telegram)
+
+When you have multiple managed agents and want each one to handle messages
+from a specific Telegram chat, bind chat IDs to agents instead of running
+separate bots:
+
+1. **One shared bot.** Create a single Telegram bot via @BotFather and put
+   its token in `~/.openjarvis/config.toml`:
+
+    ```toml
+    [channels.telegram]
+    bot_token = "1234567890:AA..."
+    ```
+
+    Make sure the `channel-telegram` extra is installed:
+
+    ```bash
+    uv sync --extra server --extra channel-telegram
+    ```
+
+2. **Find each chat's numeric ID.** Open Telegram, send any message to your
+   bot from each account/group you want to route. Then talk to
+   [@userinfobot](https://t.me/userinfobot) or
+   [@getmyid_bot](https://t.me/getmyid_bot) to read your numeric chat ID.
+
+3. **Bind chat IDs to agents.** In OpenJarvis: **Agents → choose an agent →
+   Channels tab → Telegram → paste the chat ID → Connect.** Repeat for each
+   agent you want to expose, using a different chat ID per agent.
+
+4. **Talk to your bot.** Each chat sees the same bot identity, but messages
+   from chat ID *X* route to agent *X* (its model, system_prompt, and
+   message history). Unbound chats fall through to the server's global
+   default agent.
+
+The lookup happens on every inbound message via
+`AgentManager.find_binding_for_channel("telegram", chat_id)`, so adding or
+removing a binding takes effect immediately — no restart needed.
+
+---
+
 ## ChannelMessage Fields
 
 Every incoming message is delivered to handlers as a `ChannelMessage` dataclass.

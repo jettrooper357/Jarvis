@@ -58,6 +58,36 @@ class TestAgentCRUD:
         updated = manager.update_agent(created["id"], name="new")
         assert updated["name"] == "new"
 
+    def test_create_agent_with_hierarchy(self, manager):
+        ceo = manager.create_agent(
+            name="My Assistant",
+            agent_type="deep_research",
+            org_role="Chief Executive Officer (CEO)",
+        )
+        developer = manager.create_agent(
+            name="Builder",
+            agent_type="simple",
+            org_role="Developer",
+            manager_agent_id=ceo["id"],
+        )
+        assert developer["org_role"] == "Developer"
+        assert developer["manager_agent_id"] == ceo["id"]
+
+    def test_rejects_hierarchy_cycles(self, manager):
+        ceo = manager.create_agent(name="CEO", agent_type="simple")
+        manager_ = manager.create_agent(
+            name="Manager",
+            agent_type="simple",
+            manager_agent_id=ceo["id"],
+        )
+        worker = manager.create_agent(
+            name="Worker",
+            agent_type="simple",
+            manager_agent_id=manager_["id"],
+        )
+        with pytest.raises(ValueError, match="cycle"):
+            manager.update_agent(ceo["id"], manager_agent_id=worker["id"])
+
     def test_delete_agent_soft(self, manager):
         created = manager.create_agent(name="doomed", agent_type="simple")
         manager.delete_agent(created["id"])
@@ -132,6 +162,33 @@ class TestChannelBindings:
         binding = manager.bind_channel(agent["id"], channel_type="slack", config={})
         manager.unbind_channel(binding["id"])
         assert len(manager.list_channel_bindings(agent["id"])) == 0
+
+    def test_find_binding_for_channel_accepts_legacy_chat_id(self, manager):
+        agent = manager.create_agent(name="telegram-agent", agent_type="simple")
+        manager.bind_channel(
+            agent["id"],
+            channel_type="telegram",
+            config={"chat_id": "123"},
+        )
+        binding = manager.find_binding_for_channel("telegram", "123")
+        assert binding is not None
+        assert binding["agent_id"] == agent["id"]
+
+    def test_find_bindings_for_channel_returns_all_matches(self, manager):
+        a1 = manager.create_agent(name="a1", agent_type="simple")
+        a2 = manager.create_agent(name="a2", agent_type="simple")
+        manager.bind_channel(
+            a1["id"],
+            channel_type="telegram",
+            config={"channel": "shared-chat"},
+        )
+        manager.bind_channel(
+            a2["id"],
+            channel_type="telegram",
+            config={"chat_id": "shared-chat"},
+        )
+        bindings = manager.find_bindings_for_channel("telegram", "shared-chat")
+        assert {b["agent_id"] for b in bindings} == {a1["id"], a2["id"]}
 
 
 class TestSummaryMemory:

@@ -20,6 +20,14 @@ curl -fsSL https://openjarvis.ai/install.sh | bash
 
 About 3 minutes. Type `jarvis` to start.
 
+### Local clone (contributors / dev workflow)
+
+If you cloned the repo and want the chat UI running end-to-end, run
+`start.bat` from a Windows shell at the repo root. It bootstraps `uv`,
+`espeak-ng`, the Python venv, and the frontend in one go. See
+[Installation → Browser App → Windows](installation.md#browser-app) for the
+full list of steps and pre-reqs.
+
 ## WSL-specific notes
 
 - The installer detects WSL via `/proc/sys/kernel/osrelease` and uses `nohup ollama serve &` instead of systemd to start the Ollama daemon (WSL2 doesn't ship systemd by default).

@@ -352,21 +352,38 @@ class SystemBuilder:
         return None
 
     def _resolve_channel(self, config, bus):
-        if not config.channel.enabled:
-            return None
-        key = config.channel.default_channel
+        # First, the explicit path: config.toml enables a channel.
+        if config.channel.enabled and config.channel.default_channel:
+            key = config.channel.default_channel
+            try:
+                import openjarvis.channels  # noqa: F401 -- trigger registration
+                from openjarvis.core.registry import ChannelRegistry
+                from openjarvis.system._channel_kwargs import build_channel_kwargs
+
+                if key and ChannelRegistry.contains(key):
+                    kwargs = {"bus": bus, **build_channel_kwargs(config.channel, key)}
+                    return ChannelRegistry.create(key, **kwargs)
+            except Exception as exc:
+                logger.warning("Failed to resolve channel backend %r: %s", key, exc)
+
+        # Implicit bootstrap: the UI may have saved Telegram credentials to
+        # ~/.openjarvis/connectors/telegram.json. Honor those without
+        # requiring the user to also edit config.toml — the "saved a token
+        # in the UI and expected it to just work" path.
         try:
             import openjarvis.channels  # noqa: F401 -- trigger registration
-            from openjarvis.core.registry import ChannelRegistry
-            from openjarvis.system._channel_kwargs import build_channel_kwargs
+            from openjarvis.channels.telegram import (
+                TelegramChannel,
+                _load_token_from_credentials_file,
+            )
 
-            if not key or not ChannelRegistry.contains(key):
-                return None
-            kwargs = {"bus": bus, **build_channel_kwargs(config.channel, key)}
-            return ChannelRegistry.create(key, **kwargs)
+            if _load_token_from_credentials_file():
+                logger.info("Bootstrapping Telegram channel from UI-saved credentials")
+                return TelegramChannel(bus=bus)
         except Exception as exc:
-            logger.warning("Failed to resolve channel backend %r: %s", key, exc)
-            return None
+            logger.warning("Telegram bootstrap from credentials file failed: %s", exc)
+
+        return None
 
     def _resolve_tools(
         self, config, engine, model, memory_backend, channel_backend=None

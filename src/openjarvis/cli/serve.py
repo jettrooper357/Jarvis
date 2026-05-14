@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
+import subprocess
 import sys
+from pathlib import Path
+from typing import Optional
 
 import click
 from rich.console import Console
@@ -23,6 +28,112 @@ from openjarvis.intelligence import (
 logger = logging.getLogger(__name__)
 
 
+def _find_uv() -> Optional[str]:
+    """Locate the ``uv`` binary.
+
+    Checks PATH, ``~/.local/bin``, and ``~/.cargo/bin`` — uv's default install
+    locations. Returns ``None`` if not found so callers can fall back to pip.
+    """
+    found = shutil.which("uv")
+    if found:
+        return found
+    for candidate in (
+        Path.home() / ".local" / "bin" / "uv",
+        Path.home() / ".cargo" / "bin" / "uv",
+    ):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def _install_clone_backend(console: Console) -> bool:
+    """Run ``uv sync --extra speech-clone`` (or pip equivalent).
+
+    Returns True on success. Streams the installer's stdout/stderr through
+    Rich so the user sees the download progress instead of a silent block.
+    """
+    uv = _find_uv()
+    if uv is not None:
+        cmd = [uv, "sync", "--extra", "speech-clone"]
+    else:
+        # uv missing — fall back to plain pip in the running interpreter's venv.
+        cmd = [sys.executable, "-m", "pip", "install", "f5-tts>=0.3"]
+
+    console.print(f"[yellow]Installing voice-cloning backend:[/yellow] {' '.join(cmd)}")
+    console.print("[dim]This may take several minutes and download ~1.4 GB.[/dim]")
+    try:
+        proc = subprocess.run(cmd, check=False)
+    except OSError as exc:
+        console.print(f"[red]Installer failed to launch: {exc}[/red]")
+        return False
+    if proc.returncode != 0:
+        console.print(
+            f"[red]Install exited with code {proc.returncode}.[/red] "
+            "See output above; you can retry manually with the command shown."
+        )
+        return False
+    console.print("[green]Voice-cloning backend installed.[/green]")
+    return True
+
+
+def _has_clone_voices() -> bool:
+    """True if the user has saved any cloned voices and would expect F5 to work."""
+    try:
+        from openjarvis.speech import custom_voices
+
+        return any(v.kind == "clone" for v in custom_voices.list_voices())
+    except Exception:
+        return False
+
+
+def _try_load_clone_backend():
+    """Return an F5-TTS instance if importable and healthy, else None."""
+    try:
+        from openjarvis.core.registry import TTSRegistry
+
+        # Re-import speech package so newly-installed modules register.
+        import importlib
+        import openjarvis.speech as _speech_pkg
+
+        importlib.reload(_speech_pkg)
+
+        if not TTSRegistry.contains("f5-tts"):
+            return None
+        candidate = TTSRegistry.get("f5-tts")()
+        return candidate if candidate.health() else None
+    except Exception as exc:  # pragma: no cover — environment-dependent
+        logger.debug("Clone backend load failed: %s", exc)
+        return None
+
+
+def _discover_clone_backend(console: Console, *, force_install: bool):
+    """Locate (and optionally install) the voice-cloning backend.
+
+    Install conditions, in order: an explicit ``--install-clone`` flag, then
+    the presence of stored clone voices (the user has already opted in by
+    creating one). Silent otherwise — clone is genuinely optional.
+    """
+    backend = _try_load_clone_backend()
+    if backend is not None:
+        return backend
+
+    should_install = force_install or _has_clone_voices()
+    if not should_install:
+        return None
+
+    if not _install_clone_backend(console):
+        return None
+
+    backend = _try_load_clone_backend()
+    if backend is None:
+        console.print(
+            "[yellow]Install completed but F5-TTS still won't import. "
+            "Try restarting `jarvis serve` so a fresh Python process picks "
+            "up the new modules.[/yellow]"
+        )
+    return backend
+
+
 @click.command()
 @click.option("--host", default=None, help="Bind address (default: config).")
 @click.option(
@@ -40,12 +151,22 @@ logger = logging.getLogger(__name__)
     default=None,
     help="Agent for non-streaming requests (simple, orchestrator, react, openhands).",
 )
+@click.option(
+    "--install-clone",
+    is_flag=True,
+    default=False,
+    help=(
+        "If the voice-cloning backend (F5-TTS) is missing, run "
+        "`uv sync --extra speech-clone` before starting the server."
+    ),
+)
 def serve(
     host: str | None,
     port: int | None,
     engine_key: str | None,
     model_name: str | None,
     agent_name: str | None,
+    install_clone: bool,
 ) -> None:
     """Start the OpenAI-compatible API server."""
     console = Console(stderr=True)
@@ -232,24 +353,31 @@ def serve(
 
     # Set up channel backend if enabled
     channel_bridge = None
-    if config.channel.enabled and config.channel.default_channel:
-        try:
-            from openjarvis.system import SystemBuilder
+    # Always try to build a channel: _resolve_channel honors config.toml first
+    # but also bootstraps from UI-saved credential files (e.g. telegram.json)
+    # so users who set their bot token in the UI don't have to also edit
+    # config.toml to flip channel.enabled.
+    try:
+        from openjarvis.system import SystemBuilder
 
-            # Reuse _resolve_channel logic from SystemBuilder
-            sb = SystemBuilder(config)
-            sb._bus = bus
-            channel_bridge = sb._resolve_channel(config, bus)
-            if channel_bridge is not None:
-                channel_bridge.connect()
-                console.print(
-                    f"  Channel: [cyan]{config.channel.default_channel}[/cyan]"
-                )
-        except Exception as exc:
-            console.print(f"[yellow]Channel failed to start: {exc}[/yellow]")
-            channel_bridge = None
+        sb = SystemBuilder(config)
+        sb._bus = bus
+        channel_bridge = sb._resolve_channel(config, bus)
+        if channel_bridge is not None:
+            channel_bridge.connect()
+            channel_label = (
+                config.channel.default_channel
+                if (config.channel.enabled and config.channel.default_channel)
+                else getattr(channel_bridge, "channel_id", "channel")
+            )
+            console.print(f"  Channel: [cyan]{channel_label}[/cyan]")
+    except Exception as exc:
+        console.print(f"[yellow]Channel failed to start: {exc}[/yellow]")
+        channel_bridge = None
 
-    # Wire channel messages → agent / engine (per-chat session isolation)
+    # Build the fallback system used by ChannelBridge when an incoming chat
+    # does not match a managed-agent binding.
+    channel_system = None
     if channel_bridge is not None:
         from openjarvis.system import JarvisSystem
 
@@ -297,7 +425,7 @@ def serve(
             except Exception as exc:
                 logger.warning("Channel tools failed to load: %s", exc)
 
-        _wire_system = JarvisSystem(
+        channel_system = JarvisSystem(
             config=config,
             bus=bus,
             engine=engine,
@@ -306,7 +434,6 @@ def serve(
             agent_name=channel_agent,
             tools=_channel_tools,
         )
-        _wire_system.wire_channel(channel_bridge)
 
     # Set up speech backend
     speech_backend = None
@@ -318,6 +445,25 @@ def serve(
             console.print(f"  Speech: [cyan]{speech_backend.backend_id}[/cyan]")
     except Exception as exc:
         logger.debug("Speech backend discovery failed: %s", exc)
+
+    tts_backend = None
+    try:
+        from openjarvis.speech._tts_discovery import get_tts_backend
+
+        tts_backend = get_tts_backend(config)
+        if tts_backend:
+            console.print(f"  TTS:    [cyan]{tts_backend.backend_id}[/cyan]")
+    except Exception as exc:
+        logger.debug("TTS backend discovery failed: %s", exc)
+
+    # Voice cloning backend — separate from the default TTS so users can keep
+    # Kokoro for built-in voices and switch only cloned voices to F5-TTS.
+    tts_clone_backend = _discover_clone_backend(
+        console,
+        force_install=install_clone,
+    )
+    if tts_clone_backend is not None:
+        console.print(f"  Clone:  [cyan]{tts_clone_backend.backend_id}[/cyan]")
 
     # Create app
     from openjarvis.server.app import create_app
@@ -454,8 +600,10 @@ def serve(
                 channels=channels,
                 session_store=session_store,
                 bus=bus,
-                system=None,
+                system=channel_system,
                 agent_manager=agent_manager,
+                engine=engine,
+                default_model=model_name or "",
             )
         except Exception as exc:
             logger.debug("ChannelBridge init skipped: %s", exc)
@@ -471,6 +619,8 @@ def serve(
         config=config,
         memory_backend=memory_backend,
         speech_backend=speech_backend,
+        tts_backend=tts_backend,
+        tts_clone_backend=tts_clone_backend,
         agent_manager=agent_manager,
         agent_scheduler=agent_scheduler,
         api_key=api_key,

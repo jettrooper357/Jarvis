@@ -9,6 +9,8 @@ export interface ManagedAgent {
   id: string;
   name: string;
   agent_type: string;
+  org_role?: string;
+  manager_agent_id?: string | null;
   config: Record<string, unknown>;
   status: 'idle' | 'running' | 'paused' | 'error' | 'archived' | 'needs_attention' | 'budget_exceeded' | 'stalled';
   summary_memory: string;
@@ -27,6 +29,7 @@ export interface ManagedAgent {
 export interface AgentTask {
   id: string;
   agent_id: string;
+  assigned_by_agent_id?: string | null;
   description: string;
   status: 'pending' | 'active' | 'completed' | 'failed';
   progress: Record<string, unknown>;
@@ -85,7 +88,13 @@ export async function fetchTemplates(apiUrl: string): Promise<AgentTemplate[]> {
 
 export async function createManagedAgent(
   apiUrl: string,
-  body: { name: string; template_id?: string; config?: Record<string, unknown> },
+  body: {
+    name: string;
+    template_id?: string;
+    config?: Record<string, unknown>;
+    org_role?: string;
+    manager_agent_id?: string | null;
+  },
 ): Promise<ManagedAgent> {
   return request<ManagedAgent>(apiUrl, '/v1/managed-agents', {
     method: 'POST',

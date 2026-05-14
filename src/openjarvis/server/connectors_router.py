@@ -7,6 +7,14 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+try:
+    # FastAPI resolves endpoint annotations from module globals. Keep Request
+    # available here so nested route functions still inject the raw request
+    # object correctly under postponed evaluation of annotations.
+    from fastapi import Request
+except ImportError:  # pragma: no cover - optional server dependency
+    Request = Any  # type: ignore[assignment,misc]
+
 # Module-level cache of connector instances (keyed by connector_id).
 _instances: Dict[str, Any] = {}
 
@@ -78,7 +86,7 @@ def create_connectors_router():
     this package.
     """
     try:
-        from fastapi import APIRouter, HTTPException, Request
+        from fastapi import APIRouter, HTTPException
     except ImportError as exc:
         raise ImportError(
             "fastapi and pydantic are required for the connectors router"
@@ -101,6 +109,11 @@ def create_connectors_router():
             cls = ConnectorRegistry.get(connector_id)
             _instances[connector_id] = cls()
         return _instances[connector_id]
+
+    def _clear_cached_provider_instances(provider: Any) -> None:
+        """Drop cached connector instances covered by an OAuth provider."""
+        for connector_id in getattr(provider, "connector_ids", ()):
+            _instances.pop(connector_id, None)
 
     def _connector_summary(connector_id: str, instance: Any) -> Dict[str, Any]:
         """Build the dict returned by GET /connectors."""
@@ -303,6 +316,62 @@ def create_connectors_router():
             "status": "disconnected",
         }
 
+    @router.post("/oauth-clients/{provider_name}")
+    async def save_oauth_client(provider_name: str, request: Request):
+        """Persist OAuth client credentials for *provider_name*.
+
+        Accepts either the raw Google ``client_secret_*.json`` payload
+        (with ``installed`` or ``web`` wrapper) or a flat dict containing
+        ``client_id`` + ``client_secret``. Saved via the existing
+        :func:`openjarvis.connectors.oauth.save_client_credentials` so every
+        connector for that provider picks them up.
+        """
+        from openjarvis.connectors.oauth import (
+            OAUTH_PROVIDERS,
+            save_client_credentials,
+        )
+
+        provider = OAUTH_PROVIDERS.get(provider_name)
+        if provider is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Unknown OAuth provider: {provider_name!r}",
+            )
+
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be JSON")
+
+        if isinstance(payload, dict):
+            inner = (
+                payload.get("installed")
+                or payload.get("web")
+                or payload
+            )
+        else:
+            inner = {}
+        if not isinstance(inner, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="Expected an object with client_id and client_secret",
+            )
+
+        client_id = (inner.get("client_id") or "").strip()
+        client_secret = (inner.get("client_secret") or "").strip()
+        if not client_id or not client_secret:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing client_id or client_secret in payload",
+            )
+
+        save_client_credentials(provider, client_id, client_secret)
+        return {
+            "provider": provider_name,
+            "client_id_preview": f"{client_id[:12]}…{client_id[-12:]}",
+            "saved_files": list(provider.credential_files),
+        }
+
     @router.get("/{connector_id}/oauth/start")
     async def oauth_start(connector_id: str, request: Request):
         """Redirect to the OAuth provider's consent page.
@@ -426,8 +495,9 @@ def create_connectors_router():
         for filename in provider.credential_files:
             save_tokens(str(_CONNECTORS_DIR / filename), payload)
 
-        # Clear cached instance so it picks up new credentials
-        _instances.pop(connector_id, None)
+        # Clear every connector covered by this provider so the next list/detail
+        # request rebuilds them against the freshly written shared token files.
+        _clear_cached_provider_instances(provider)
 
         _style = "font-family:system-ui;text-align:center;padding:60px"
         return HTMLResponse(

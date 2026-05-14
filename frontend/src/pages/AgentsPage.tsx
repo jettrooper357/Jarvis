@@ -180,6 +180,82 @@ function formatSchedule(type?: string, value?: string): string {
   return type || 'Manual';
 }
 
+const ORG_ROLE_PRESETS = [
+  'Chief Executive Officer (CEO)',
+  'Chief of Staff',
+  'Chief Financial Officer (CFO)',
+  'Chief Technology Officer (CTO)',
+  'Chief Operating Officer (COO)',
+  'Vice President of Engineering',
+  'Engineering Manager',
+  'Project Manager',
+  'Research Lead',
+  'Senior Developer',
+  'Developer',
+  'Employee',
+];
+
+function roleLabel(agent: Pick<ManagedAgent, 'org_role' | 'agent_type'>): string {
+  return agent.org_role?.trim() || agent.agent_type;
+}
+
+function findAgentById(
+  agents: ManagedAgent[],
+  agentId?: string | null,
+): ManagedAgent | undefined {
+  if (!agentId) return undefined;
+  return agents.find((agent) => agent.id === agentId);
+}
+
+function collectDescendantIds(agentId: string, agents: ManagedAgent[]): Set<string> {
+  const seen = new Set<string>();
+  const stack = [agentId];
+  while (stack.length > 0) {
+    const currentId = stack.pop()!;
+    for (const agent of agents) {
+      if (agent.manager_agent_id === currentId && !seen.has(agent.id)) {
+        seen.add(agent.id);
+        stack.push(agent.id);
+      }
+    }
+  }
+  return seen;
+}
+
+function buildManagementChain(agent: ManagedAgent, agents: ManagedAgent[]): ManagedAgent[] {
+  const chain: ManagedAgent[] = [];
+  const seen = new Set<string>();
+  let current: ManagedAgent | undefined = agent;
+  while (current && !seen.has(current.id)) {
+    chain.unshift(current);
+    seen.add(current.id);
+    current = findAgentById(agents, current.manager_agent_id);
+  }
+  return chain;
+}
+
+function compareAgentsForOrg(a: ManagedAgent, b: ManagedAgent): number {
+  const aRole = roleLabel(a).toLowerCase();
+  const bRole = roleLabel(b).toLowerCase();
+  const aIsChief = aRole.includes('chief executive officer') || aRole === 'ceo';
+  const bIsChief = bRole.includes('chief executive officer') || bRole === 'ceo';
+  if (aIsChief !== bIsChief) return aIsChief ? -1 : 1;
+  return a.name.localeCompare(b.name);
+}
+
+function getOrgChildren(agents: ManagedAgent[], managerId?: string | null): ManagedAgent[] {
+  return agents
+    .filter((agent) => (managerId ? agent.manager_agent_id === managerId : !agent.manager_agent_id))
+    .sort(compareAgentsForOrg);
+}
+
+function getOrgRoots(agents: ManagedAgent[]): ManagedAgent[] {
+  const knownIds = new Set(agents.map((agent) => agent.id));
+  return agents
+    .filter((agent) => !agent.manager_agent_id || !knownIds.has(agent.manager_agent_id))
+    .sort(compareAgentsForOrg);
+}
+
 // ---------------------------------------------------------------------------
 // Launch Wizard
 // ---------------------------------------------------------------------------
@@ -254,6 +330,8 @@ interface WizardState {
   templateId: string;
   templateData: AgentTemplate | null;
   name: string;
+  orgRole: string;
+  managerAgentId: string;
   instruction: string;
   model: string;
   scheduleType: string;
@@ -635,10 +713,12 @@ function ToolsPicker({
 
 function LaunchWizard({
   templates,
+  managedAgents,
   onClose,
   onLaunched,
 }: {
   templates: AgentTemplate[];
+  managedAgents: ManagedAgent[];
   onClose: () => void;
   onLaunched: () => void;
 }) {
@@ -656,6 +736,8 @@ function LaunchWizard({
     templateId: '',
     templateData: null,
     name: '',
+    orgRole: '',
+    managerAgentId: '',
     instruction: '',
     model: '',
     scheduleType: 'manual',
@@ -690,6 +772,8 @@ function LaunchWizard({
         templateId: tpl.id,
         templateData: tpl,
         name: '',
+        orgRole: '',
+        managerAgentId: '',
         instruction: (tpl as any).instruction || TEMPLATE_INSTRUCTIONS[tpl.id] || '',
         model: recommendedModel || w.model,
         scheduleType: (tpl as any).schedule_type || 'manual',
@@ -709,6 +793,8 @@ function LaunchWizard({
         templateId: '',
         templateData: null,
         name: '',
+        orgRole: '',
+        managerAgentId: '',
         instruction: '',
         model: recommendedModel || w.model,
         scheduleType: 'manual',
@@ -755,6 +841,8 @@ function LaunchWizard({
         name: wizard.name.trim(),
         template_id: wizard.templateId || undefined,
         config,
+        org_role: wizard.orgRole.trim() || undefined,
+        manager_agent_id: wizard.managerAgentId || null,
       });
       toast.success(`Agent "${wizard.name}" created`);
       onLaunched();
@@ -857,6 +945,41 @@ function LaunchWizard({
               className="w-full px-3 py-2 rounded-lg text-sm bg-transparent"
               style={{ border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
             />
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-sm font-medium mb-1" style={{ color: 'var(--color-text-secondary)' }}>Organization Role</label>
+              <input
+                list="agent-org-role-presets"
+                value={wizard.orgRole}
+                onChange={(e) => setWizard((w) => ({ ...w, orgRole: e.target.value }))}
+                placeholder="e.g. Chief Executive Officer (CEO)"
+                className="w-full px-3 py-2 rounded-lg text-sm bg-transparent"
+                style={{ border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+              />
+              <datalist id="agent-org-role-presets">
+                {ORG_ROLE_PRESETS.map((role) => (
+                  <option key={role} value={role} />
+                ))}
+              </datalist>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1" style={{ color: 'var(--color-text-secondary)' }}>Reports To</label>
+              <select
+                value={wizard.managerAgentId}
+                onChange={(e) => setWizard((w) => ({ ...w, managerAgentId: e.target.value }))}
+                className="w-full px-3 py-2 rounded-lg text-sm"
+                style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+              >
+                <option value="">Top-level leader</option>
+                {managedAgents.map((agent) => (
+                  <option key={agent.id} value={agent.id}>
+                    {agent.name} - {roleLabel(agent)}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
 
           {/* Instruction */}
@@ -1201,6 +1324,7 @@ function AgentCard({
   const canPause = agent.status === 'running' || agent.status === 'idle';
   const canResume = agent.status === 'paused';
   const canRecover = agent.status === 'error' || agent.status === 'stalled' || agent.status === 'needs_attention';
+  const title = roleLabel(agent);
 
   return (
     <div
@@ -1223,6 +1347,8 @@ function AgentCard({
 
       {/* Row 2: Schedule + last run */}
       <div className="text-xs mb-2 flex items-center gap-3" style={{ color: 'var(--color-text-tertiary)' }}>
+        <span>{title}</span>
+        <span>·</span>
         <span>{formatSchedule(agent.schedule_type, agent.schedule_value)}</span>
         <span>·</span>
         <span>Last run: {formatRelativeTime(agent.last_run_at)}</span>
@@ -1333,6 +1459,64 @@ function AgentCard({
 // ---------------------------------------------------------------------------
 // Detail view — Configuration grid with editable model
 // ---------------------------------------------------------------------------
+
+function AgentNameField({ agent, onAgentUpdated }: { agent: ManagedAgent; onAgentUpdated: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  async function commit() {
+    const trimmed = draft.trim();
+    if (!trimmed || trimmed === agent.name) {
+      setEditing(false);
+      return;
+    }
+    setSaving(true);
+    try {
+      await updateManagedAgent(agent.id, { name: trimmed });
+      onAgentUpdated();
+    } catch { /* keep the user in edit mode on failure */ setSaving(false); return; }
+    setSaving(false);
+    setEditing(false);
+  }
+
+  if (editing) {
+    return (
+      <input
+        autoFocus
+        value={draft}
+        disabled={saving}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') { e.preventDefault(); commit(); }
+          else if (e.key === 'Escape') { e.preventDefault(); setEditing(false); }
+        }}
+        className="text-xl font-semibold px-1 py-0 rounded outline-none"
+        style={{
+          color: 'var(--color-text)',
+          background: 'var(--color-bg-secondary)',
+          border: '1px solid var(--color-accent)',
+          minWidth: 12 + draft.length + 'ch',
+          maxWidth: '32ch',
+        }}
+      />
+    );
+  }
+
+  return (
+    <h1
+      className="text-xl font-semibold cursor-text rounded px-1 -mx-1 transition-colors"
+      style={{ color: 'var(--color-text)' }}
+      title="Click to rename"
+      onClick={() => { setDraft(agent.name); setEditing(true); }}
+      onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--color-bg-secondary)')}
+      onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+    >
+      {agent.name}
+    </h1>
+  );
+}
 
 function AgentInstructionSection({ agent, onAgentUpdated }: { agent: ManagedAgent; onAgentUpdated: () => void }) {
   const [editing, setEditing] = useState(false);
@@ -1545,6 +1729,303 @@ function AgentConfigGrid({ agent, onAgentUpdated }: { agent: ManagedAgent; onAge
 // ---------------------------------------------------------------------------
 // Detail view — Interact tab
 // ---------------------------------------------------------------------------
+
+function AgentOrganizationSection({
+  agent,
+  managedAgents,
+  onAgentUpdated,
+}: {
+  agent: ManagedAgent;
+  managedAgents: ManagedAgent[];
+  onAgentUpdated: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [orgRole, setOrgRole] = useState(agent.org_role || '');
+  const [managerId, setManagerId] = useState(agent.manager_agent_id || '');
+
+  useEffect(() => {
+    setOrgRole(agent.org_role || '');
+    setManagerId(agent.manager_agent_id || '');
+    setEditing(false);
+    setSaving(false);
+  }, [agent.id, agent.org_role, agent.manager_agent_id]);
+
+  const manager = findAgentById(managedAgents, agent.manager_agent_id);
+  const directReports = managedAgents.filter((candidate) => candidate.manager_agent_id === agent.id);
+  const chain = buildManagementChain(agent, managedAgents);
+  const blockedManagerIds = collectDescendantIds(agent.id, managedAgents);
+  blockedManagerIds.add(agent.id);
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      await updateManagedAgent(agent.id, {
+        org_role: orgRole.trim(),
+        manager_agent_id: managerId || null,
+      });
+      setEditing(false);
+      onAgentUpdated();
+      toast.success('Organization updated');
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to update organization');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div
+      className="p-3 rounded-lg space-y-3"
+      style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
+    >
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+            Organization
+          </h3>
+          <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+            Define this agent&apos;s title and reporting line.
+          </p>
+        </div>
+        {editing ? (
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                setOrgRole(agent.org_role || '');
+                setManagerId(agent.manager_agent_id || '');
+                setEditing(false);
+              }}
+              className="px-2 py-1 rounded text-xs cursor-pointer"
+              style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleSave}
+              disabled={saving}
+              className="px-2 py-1 rounded text-xs cursor-pointer flex items-center gap-1"
+              style={{ background: 'var(--color-accent)', color: 'var(--color-on-accent)', opacity: saving ? 0.7 : 1 }}
+            >
+              <Check size={12} />
+              {saving ? 'Saving...' : 'Save'}
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={() => setEditing(true)}
+            className="px-2 py-1 rounded text-xs cursor-pointer flex items-center gap-1"
+            style={{ border: '1px solid var(--color-border)', color: 'var(--color-accent)' }}
+          >
+            <Pencil size={12} />
+            Edit
+          </button>
+        )}
+      </div>
+
+      {editing ? (
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-secondary)' }}>
+              Role
+            </label>
+            <input
+              list={`org-role-presets-${agent.id}`}
+              value={orgRole}
+              onChange={(e) => setOrgRole(e.target.value)}
+              className="w-full px-3 py-2 rounded-lg text-sm bg-transparent"
+              style={{ border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+              placeholder="e.g. Chief Executive Officer (CEO)"
+            />
+            <datalist id={`org-role-presets-${agent.id}`}>
+              {ORG_ROLE_PRESETS.map((role) => (
+                <option key={role} value={role} />
+              ))}
+            </datalist>
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-secondary)' }}>
+              Reports To
+            </label>
+            <select
+              value={managerId}
+              onChange={(e) => setManagerId(e.target.value)}
+              className="w-full px-3 py-2 rounded-lg text-sm"
+              style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+            >
+              <option value="">Top-level leader</option>
+              {managedAgents
+                .filter((candidate) => !blockedManagerIds.has(candidate.id))
+                .map((candidate) => (
+                  <option key={candidate.id} value={candidate.id}>
+                    {candidate.name} - {roleLabel(candidate)}
+                  </option>
+                ))}
+            </select>
+          </div>
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+          <div>
+            <div style={{ color: 'var(--color-text-tertiary)' }} className="text-xs mb-1">Role</div>
+            <div style={{ color: 'var(--color-text)' }}>{agent.org_role?.trim() || 'Unassigned'}</div>
+          </div>
+          <div>
+            <div style={{ color: 'var(--color-text-tertiary)' }} className="text-xs mb-1">Reports To</div>
+            <div style={{ color: 'var(--color-text)' }}>
+              {manager ? `${manager.name} - ${roleLabel(manager)}` : 'Top-level leader'}
+            </div>
+          </div>
+          <div>
+            <div style={{ color: 'var(--color-text-tertiary)' }} className="text-xs mb-1">Direct Reports</div>
+            <div style={{ color: 'var(--color-text)' }}>
+              {directReports.length > 0
+                ? directReports.map((report) => `${report.name} (${roleLabel(report)})`).join(', ')
+                : 'None'}
+            </div>
+          </div>
+          <div>
+            <div style={{ color: 'var(--color-text-tertiary)' }} className="text-xs mb-1">Chain</div>
+            <div style={{ color: 'var(--color-text)' }}>
+              {chain.map((item) => `${item.name} (${roleLabel(item)})`).join(' -> ')}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OrgChartNode({
+  agent,
+  managedAgents,
+  selectedAgentId,
+  onSelect,
+}: {
+  agent: ManagedAgent;
+  managedAgents: ManagedAgent[];
+  selectedAgentId: string | null;
+  onSelect: (agentId: string) => void;
+}) {
+  const reports = getOrgChildren(managedAgents, agent.id);
+  const isSelected = selectedAgentId === agent.id;
+
+  return (
+    <div className="flex flex-col items-center min-w-[220px]">
+      <button
+        onClick={() => onSelect(agent.id)}
+        className="w-[220px] rounded-2xl p-4 text-left transition-colors"
+        style={{
+          background: isSelected ? 'color-mix(in srgb, var(--color-accent) 14%, var(--color-bg-secondary))' : 'var(--color-bg-secondary)',
+          border: `1px solid ${isSelected ? 'var(--color-accent)' : 'var(--color-border)'}`,
+          boxShadow: isSelected ? '0 0 0 1px color-mix(in srgb, var(--color-accent) 20%, transparent)' : 'none',
+        }}
+      >
+        <div className="flex items-center justify-between gap-2 mb-3">
+          <div className="flex items-center gap-2 min-w-0">
+            <Bot size={16} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
+            <span className="font-medium text-sm truncate" style={{ color: 'var(--color-text)' }}>
+              {agent.name}
+            </span>
+          </div>
+          <StatusDot status={agent.status} />
+        </div>
+        <div className="text-xs mb-2" style={{ color: 'var(--color-accent)' }}>
+          {roleLabel(agent)}
+        </div>
+        <div className="flex items-center gap-3 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+          <span>{formatSchedule(agent.schedule_type, agent.schedule_value)}</span>
+          <span>•</span>
+          <span>{reports.length} report{reports.length === 1 ? '' : 's'}</span>
+        </div>
+      </button>
+
+      {reports.length > 0 && (
+        <div className="mt-3 flex flex-col items-center">
+          <div className="h-6 w-px" style={{ background: 'var(--color-border)' }} />
+          <div className="flex items-start justify-center">
+            {reports.map((report, index) => {
+              const isOnly = reports.length === 1;
+              const isFirst = index === 0;
+              const isLast = index === reports.length - 1;
+
+              return (
+                <div key={report.id} className="relative flex flex-col items-center px-3 pt-6">
+                  {!isOnly && (
+                    <div
+                      className="absolute top-0 h-px"
+                      style={{
+                        left: isFirst ? '50%' : 0,
+                        right: isLast ? '50%' : 0,
+                        background: 'var(--color-border)',
+                      }}
+                    />
+                  )}
+                  <div className="absolute top-0 h-6 w-px" style={{ background: 'var(--color-border)' }} />
+                  <OrgChartNode
+                    agent={report}
+                    managedAgents={managedAgents}
+                    selectedAgentId={selectedAgentId}
+                    onSelect={onSelect}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AgentOrgChart({
+  managedAgents,
+  selectedAgentId,
+  onSelect,
+}: {
+  managedAgents: ManagedAgent[];
+  selectedAgentId: string | null;
+  onSelect: (agentId: string) => void;
+}) {
+  const roots = getOrgRoots(managedAgents);
+
+  if (roots.length === 0) return null;
+
+  return (
+    <section
+      className="rounded-2xl p-4 overflow-x-auto"
+      style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
+    >
+      <div className="flex items-start justify-between gap-4 mb-5">
+        <div>
+          <h2 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+            Organization Chart
+          </h2>
+          <p className="text-sm mt-1" style={{ color: 'var(--color-text-secondary)' }}>
+            Reporting lines are drawn from each agent&apos;s manager assignment. Click any node to open that agent.
+          </p>
+        </div>
+        <div className="text-xs whitespace-nowrap" style={{ color: 'var(--color-text-tertiary)' }}>
+          {managedAgents.length} agent{managedAgents.length === 1 ? '' : 's'}
+        </div>
+      </div>
+
+      <div className="min-w-max pb-2">
+        <div className="flex items-start justify-center gap-10">
+          {roots.map((root) => (
+            <OrgChartNode
+              key={root.id}
+              agent={root}
+              managedAgents={managedAgents}
+              selectedAgentId={selectedAgentId}
+              onSelect={onSelect}
+            />
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
 
 /** AgentMessage extended with optional response metadata for the footer. */
 type InteractMessage = AgentMessage & {
@@ -2468,6 +2949,27 @@ const MESSAGING_CHANNELS: MessagingChannelConfig[] = [
     ],
     activeLabel: () => 'Connected to Slack',
     howToUse: () => 'Open Slack and DM @OpenJarvis to talk to your agent.',
+  },
+  {
+    type: 'telegram',
+    name: 'Telegram',
+    icon: '✈',
+    description: 'DM this agent on Telegram via a shared bot',
+    setupSteps: [
+      '1. Create one Telegram bot via @BotFather (use the same bot for every agent).',
+      '2. Put its token in ~/.openjarvis/config.toml under [channels.telegram] bot_token = "..." and restart the server.',
+      '3. Open Telegram, talk to your bot once (any message), then visit @userinfobot or @getmyid_bot to read your numeric chat ID.',
+      '4. Paste that chat ID below. You can dedicate that chat to this agent, or reuse the same chat for multiple agents and target one explicitly with /agent <id> <message>.',
+    ],
+    fields: [
+      { key: 'channel', label: 'Telegram Chat ID', placeholder: '123456789', type: 'text', required: true },
+    ],
+    activeLabel: (cfg) =>
+      cfg.channel ? `Chat ID ${String(cfg.channel)}` : 'Telegram connected',
+    howToUse: (cfg) =>
+      cfg.channel
+        ? `Message your bot from chat ${String(cfg.channel)}. If this chat is shared across agents, use /agent <id> <message> to route to a specific one.`
+        : 'Message your bot from the bound chat. If that chat is shared across agents, use /agent <id> <message> to target one.',
   },
 ];
 
@@ -3665,11 +4167,15 @@ export function AgentsPage() {
           <div className="flex items-center gap-3">
             <Bot size={24} style={{ color: 'var(--color-accent)' }} />
             <div>
-              <h1 className="text-xl font-semibold" style={{ color: 'var(--color-text)' }}>
-                {selectedAgent.name}
-              </h1>
+              <AgentNameField agent={selectedAgent} onAgentUpdated={refresh} />
               <div className="flex items-center gap-2 mt-1">
                 <StatusBadge status={selectedAgent.status} />
+                <span
+                  className="text-xs px-2 py-0.5 rounded-full"
+                  style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text-secondary)' }}
+                >
+                  {roleLabel(selectedAgent)}
+                </span>
                 <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
                   {selectedAgent.agent_type}
                 </span>
@@ -3778,6 +4284,12 @@ export function AgentsPage() {
                 </span>
               </div>
             </div>
+
+            <AgentOrganizationSection
+              agent={selectedAgent}
+              managedAgents={managedAgents}
+              onAgentUpdated={refresh}
+            />
 
             {/* Hint for deep research agents */}
             {selectedAgent.agent_type === 'deep_research' && (
@@ -3925,9 +4437,21 @@ export function AgentsPage() {
                 style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
               >
                 <div className="flex justify-between items-start gap-3">
-                  <span className="text-sm" style={{ color: 'var(--color-text)' }}>
-                    {t.description}
-                  </span>
+                  <div className="space-y-1">
+                    <span className="text-sm block" style={{ color: 'var(--color-text)' }}>
+                      {t.description}
+                    </span>
+                    {t.assigned_by_agent_id && (
+                      <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                        Assigned by {findAgentById(managedAgents, t.assigned_by_agent_id)?.name || t.assigned_by_agent_id}
+                      </span>
+                    )}
+                    {t.progress && Object.keys(t.progress).length > 0 && (
+                      <span className="text-xs block" style={{ color: 'var(--color-text-secondary)' }}>
+                        Progress: {String((t.progress as Record<string, unknown>).note || JSON.stringify(t.progress))}
+                      </span>
+                    )}
+                  </div>
                   <span
                     className="text-xs px-2 py-0.5 rounded flex-shrink-0"
                     style={{
@@ -3986,6 +4510,7 @@ export function AgentsPage() {
       {showWizard && (
         <LaunchWizard
           templates={templates}
+          managedAgents={managedAgents}
           onClose={() => setShowWizard(false)}
           onLaunched={() => {
             setShowWizard(false);
@@ -4028,6 +4553,17 @@ export function AgentsPage() {
           <AlertTriangle size={16} />
           <span>Agent manager is not enabled. Set <code className="font-mono text-xs">agent_manager.enabled = true</code> in your config.</span>
         </div>
+      )}
+
+      {managedAgents.length > 0 && (
+        <AgentOrgChart
+          managedAgents={managedAgents}
+          selectedAgentId={selectedAgentId}
+          onSelect={(agentId) => {
+            setSelectedAgentId(agentId);
+            setDetailTab('overview');
+          }}
+        />
       )}
 
       {/* Agent cards grid */}

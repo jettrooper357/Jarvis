@@ -5,10 +5,12 @@ import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import 'katex/dist/katex.min.css';
-import { Copy, Check } from 'lucide-react';
+import { Copy, Check, Volume2, Square } from 'lucide-react';
 import { AudioPlayer } from './AudioPlayer';
 import { ToolCallCard } from './ToolCallCard';
 import { XRayFooter } from './XRayFooter';
+import { useTTSPlayer } from '../../hooks/useTTSPlayer';
+import { useAppStore } from '../../lib/store';
 import type { ChatMessage } from '../../types';
 
 function stripThinkTags(text: string): string {
@@ -73,6 +75,29 @@ function CodeBlockPre({ children, ...props }: any) {
         {children}
       </pre>
     </div>
+  );
+}
+
+function SpeakMessageButton({ content }: { content: string }) {
+  const ttsVoice = useAppStore((s) => s.settings.ttsVoice);
+  const ttsSpeed = useAppStore((s) => s.settings.ttsSpeed);
+  const tts = useTTSPlayer({ voiceId: ttsVoice, speed: ttsSpeed });
+  const handleClick = () => {
+    if (tts.isSpeaking) {
+      tts.stop();
+    } else {
+      tts.speak(content);
+    }
+  };
+  return (
+    <button
+      onClick={handleClick}
+      className="p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+      style={{ color: 'var(--color-text-tertiary)' }}
+      title={tts.isSpeaking ? 'Stop speaking' : 'Speak message'}
+    >
+      {tts.isSpeaking ? <Square size={14} /> : <Volume2 size={14} />}
+    </button>
   );
 }
 
@@ -150,9 +175,10 @@ export function MessageBubble({ message }: Props) {
         </div>
       )}
 
-      {/* Footer: copy + x-ray */}
+      {/* Footer: copy + speak + x-ray */}
       <div className="flex items-center gap-2 mt-1.5">
         <CopyMessageButton content={cleanContent} />
+        {cleanContent && <SpeakMessageButton content={cleanContent} />}
       </div>
       <XRayFooter usage={message.usage} telemetry={message.telemetry} />
     </div>

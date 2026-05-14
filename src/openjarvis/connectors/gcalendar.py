@@ -16,6 +16,7 @@ from openjarvis.connectors._stubs import BaseConnector, Document, SyncStatus
 from openjarvis.connectors.oauth import (
     GOOGLE_ALL_SCOPES,
     build_google_auth_url,
+    call_with_token_refresh,
     delete_tokens,
     load_tokens,
     resolve_google_credentials,
@@ -303,12 +304,18 @@ class GCalendarConnector(BaseConnector):
         if not tokens:
             return
 
-        token: str = tokens.get("access_token", tokens.get("token", ""))
-        if not token:
+        def _tok() -> str:
+            t = load_tokens(self._credentials_path) or {}
+            return t.get("access_token") or t.get("token") or ""
+
+        if not _tok():
             return
 
         # Fetch list of calendars
-        calendars_resp = _gcal_api_calendars_list(token)
+        calendars_resp = call_with_token_refresh(
+            self._credentials_path,
+            lambda: _gcal_api_calendars_list(_tok()),
+        )
         calendars: List[Dict[str, Any]] = calendars_resp.get("items", [])
 
         # Default to 24 hours ago so we don't dump the entire calendar history
@@ -327,11 +334,14 @@ class GCalendarConnector(BaseConnector):
 
             while True:
                 try:
-                    events_resp = _gcal_api_events_list(
-                        token,
-                        calendar_id,
-                        page_token=page_token,
-                        time_min=time_min,
+                    events_resp = call_with_token_refresh(
+                        self._credentials_path,
+                        lambda cid=calendar_id, pt=page_token: _gcal_api_events_list(
+                            _tok(),
+                            cid,
+                            page_token=pt,
+                            time_min=time_min,
+                        ),
                     )
                 except httpx.HTTPStatusError:
                     break

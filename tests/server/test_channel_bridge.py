@@ -14,6 +14,7 @@ pytest.importorskip("fastapi", reason="openjarvis[server] not installed")
 from openjarvis.channels._stubs import (
     BaseChannel,
     ChannelHandler,
+    ChannelMessage,
     ChannelStatus,
 )
 from openjarvis.core.events import EventBus
@@ -116,6 +117,21 @@ class TestBackwardCompatible:
         fake = bridge._channels["fake"]
         assert fake.sent[-1]["content"] == "hello"
 
+    def test_incoming_channel_message_is_auto_wired(self, bridge, mock_system):
+        fake = bridge._channels["fake"]
+        assert len(fake._handlers) == 1
+        fake._handlers[0](
+            ChannelMessage(
+                channel="fake",
+                sender="user1",
+                content="ping",
+                message_id="1",
+                conversation_id="chat-1",
+            )
+        )
+        mock_system.ask.assert_called_once()
+        assert fake.sent[-1]["content"] == "Hello from Jarvis!"
+
 
 class TestCommandParsing:
     def test_help_command(self, bridge):
@@ -146,6 +162,15 @@ class TestCommandParsing:
         reply = bridge.handle_incoming("user1", "/more", "fake")
         assert "the rest of the long response" in reply
 
+    def test_agent_command_runs_bound_runtime_immediately(self, bridge):
+        bridge._agent_manager = MagicMock()
+        bridge._agent_manager.get_agent.return_value = {"id": "agent-1", "name": "A"}
+        bridge._agent_runtime = MagicMock()
+        bridge._agent_runtime.run.return_value = "Agent reply"
+        reply = bridge.handle_incoming("user1", "/agent agent-1 hello there", "fake")
+        assert reply == "Agent reply"
+        bridge._agent_runtime.run.assert_called_once_with("agent-1", "hello there")
+
 
 class TestChatRouting:
     def test_routes_to_system_ask(self, bridge, mock_system):
@@ -167,6 +192,60 @@ class TestChatRouting:
         mock_system.ask.side_effect = RuntimeError("engine down")
         reply = bridge.handle_incoming("user1", "hello", "fake")
         assert "sorry" in reply.lower() or "couldn't" in reply.lower()
+
+    def test_multiple_bound_agents_require_explicit_agent_command(self, bridge):
+        bridge._agent_manager = MagicMock()
+        bridge._agent_runtime = MagicMock()
+        bridge._agent_manager.find_bindings_for_channel.return_value = [
+            {"agent_id": "alpha"},
+            {"agent_id": "beta"},
+        ]
+        bridge._agent_manager.get_agent.side_effect = lambda _agent_id: {"name": "Not My Assistant"}
+        reply = bridge.handle_incoming("shared-chat", "hello", "fake")
+        assert "multiple agents" in reply.lower()
+        assert "/agent <id>" in reply
+
+    def test_multiple_bound_agents_default_to_my_assistant(self, bridge):
+        bridge._agent_manager = MagicMock()
+        bridge._agent_runtime = MagicMock()
+        bridge._agent_runtime.run.return_value = "Handled by My Assistant"
+        bridge._agent_manager.find_bindings_for_channel.return_value = [
+            {"agent_id": "project-manager", "routing_mode": "dedicated"},
+            {"agent_id": "my-assistant", "routing_mode": "dedicated"},
+        ]
+        bridge._agent_manager.get_agent.side_effect = lambda agent_id: {
+            "name": "My Assistant" if agent_id == "my-assistant" else "Project Manager"
+        }
+        reply = bridge.handle_incoming("shared-chat", "hello", "fake")
+        assert reply == "Handled by My Assistant"
+        bridge._agent_runtime.run.assert_called_once_with("my-assistant", "hello")
+
+    def test_multiple_bound_agents_default_to_ceo_role(self, bridge):
+        bridge._agent_manager = MagicMock()
+        bridge._agent_runtime = MagicMock()
+        bridge._agent_runtime.run.return_value = "Handled by CEO"
+        bridge._agent_manager.find_bindings_for_channel.return_value = [
+            {"agent_id": "project-manager", "routing_mode": "dedicated"},
+            {"agent_id": "my-assistant", "routing_mode": "dedicated"},
+        ]
+
+        def _get_agent(agent_id):
+            if agent_id == "my-assistant":
+                return {
+                    "name": "Executive Assistant",
+                    "org_role": "Chief Executive Officer (CEO)",
+                    "manager_agent_id": None,
+                }
+            return {
+                "name": "Project Manager",
+                "org_role": "Project Manager",
+                "manager_agent_id": "my-assistant",
+            }
+
+        bridge._agent_manager.get_agent.side_effect = _get_agent
+        reply = bridge.handle_incoming("shared-chat", "hello", "fake")
+        assert reply == "Handled by CEO"
+        bridge._agent_runtime.run.assert_called_once_with("my-assistant", "hello")
 
 
 class TestResponseFormatting:

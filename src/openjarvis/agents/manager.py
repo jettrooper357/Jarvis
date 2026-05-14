@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS managed_agents (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL,
     agent_type      TEXT NOT NULL DEFAULT 'monitor_operative',
+    org_role        TEXT NOT NULL DEFAULT '',
+    manager_agent_id TEXT REFERENCES managed_agents(id),
     config_json     TEXT NOT NULL DEFAULT '{}',
     status          TEXT NOT NULL DEFAULT 'idle',
     summary_memory  TEXT NOT NULL DEFAULT '',
@@ -31,6 +33,7 @@ _CREATE_TASKS = """\
 CREATE TABLE IF NOT EXISTS agent_tasks (
     id              TEXT PRIMARY KEY,
     agent_id        TEXT NOT NULL REFERENCES managed_agents(id),
+    assigned_by_agent_id TEXT REFERENCES managed_agents(id),
     description     TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending',
     progress_json   TEXT NOT NULL DEFAULT '{}',
@@ -105,6 +108,8 @@ class AgentManager:
         self._conn.commit()
         # Schema migrations for runtime columns
         _MIGRATIONS = [
+            "ALTER TABLE managed_agents ADD COLUMN org_role TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE managed_agents ADD COLUMN manager_agent_id TEXT",
             "ALTER TABLE managed_agents ADD COLUMN total_tokens INTEGER DEFAULT 0",
             "ALTER TABLE managed_agents ADD COLUMN total_cost REAL DEFAULT 0",
             "ALTER TABLE managed_agents ADD COLUMN total_runs INTEGER DEFAULT 0",
@@ -114,6 +119,7 @@ class AgentManager:
             "ALTER TABLE managed_agents ADD COLUMN current_activity TEXT DEFAULT ''",
             "ALTER TABLE managed_agents ADD COLUMN input_tokens INTEGER DEFAULT 0",
             "ALTER TABLE managed_agents ADD COLUMN output_tokens INTEGER DEFAULT 0",
+            "ALTER TABLE agent_tasks ADD COLUMN assigned_by_agent_id TEXT",
             # JSON-encoded array of {tool, arguments, result, success, latency}
             "ALTER TABLE agent_messages ADD COLUMN tool_calls TEXT",
         ]
@@ -134,16 +140,29 @@ class AgentManager:
         name: str,
         agent_type: str = "monitor_operative",
         config: Optional[Dict[str, Any]] = None,
+        org_role: str = "",
+        manager_agent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         agent_id = uuid.uuid4().hex[:12]
         now = time.time()
         config_json = json.dumps(config or {})
+        normalized_manager_id = self._normalize_manager_id(manager_agent_id)
+        self._validate_manager_assignment(agent_id, normalized_manager_id)
         self._conn.execute(
             "INSERT INTO managed_agents"
-            " (id, name, agent_type, config_json,"
+            " (id, name, agent_type, org_role, manager_agent_id, config_json,"
             " status, summary_memory, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, 'idle', '', ?, ?)",
-            (agent_id, name, agent_type, config_json, now, now),
+            " VALUES (?, ?, ?, ?, ?, ?, 'idle', '', ?, ?)",
+            (
+                agent_id,
+                name,
+                agent_type,
+                (org_role or "").strip(),
+                normalized_manager_id,
+                config_json,
+                now,
+                now,
+            ),
         )
         self._conn.commit()
         return self.get_agent(agent_id)  # type: ignore[return-value]
@@ -169,6 +188,16 @@ class AgentManager:
             if key in kwargs:
                 sets.append(f"{key} = ?")
                 vals.append(kwargs[key])
+        if "org_role" in kwargs:
+            sets.append("org_role = ?")
+            vals.append((kwargs["org_role"] or "").strip())
+        if "manager_agent_id" in kwargs:
+            normalized_manager_id = self._normalize_manager_id(
+                kwargs["manager_agent_id"]
+            )
+            self._validate_manager_assignment(agent_id, normalized_manager_id)
+            sets.append("manager_agent_id = ?")
+            vals.append(normalized_manager_id)
         if "config" in kwargs:
             sets.append("config_json = ?")
             vals.append(json.dumps(kwargs["config"]))
@@ -329,14 +358,26 @@ class AgentManager:
     # ── Task CRUD ─────────────────────────────────────────────────
 
     def create_task(
-        self, agent_id: str, description: str, status: str = "pending"
+        self,
+        agent_id: str,
+        description: str,
+        status: str = "pending",
+        assigned_by_agent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         task_id = uuid.uuid4().hex[:12]
         now = time.time()
         self._conn.execute(
-            "INSERT INTO agent_tasks (id, agent_id, description, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (task_id, agent_id, description, status, now),
+            "INSERT INTO agent_tasks "
+            "(id, agent_id, assigned_by_agent_id, description, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                agent_id,
+                self._normalize_manager_id(assigned_by_agent_id),
+                description,
+                status,
+                now,
+            ),
         )
         self._conn.commit()
         return self._get_task(task_id)  # type: ignore[return-value]
@@ -425,17 +466,32 @@ class AgentManager:
     def find_binding_for_channel(
         self, channel_type: str, channel_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Find a dedicated binding for a specific channel."""
+        """Find the first binding for a specific channel."""
+        bindings = self.find_bindings_for_channel(channel_type, channel_id)
+        return bindings[0] if bindings else None
+
+    def find_bindings_for_channel(
+        self, channel_type: str, channel_id: str
+    ) -> List[Dict[str, Any]]:
+        """Find all bindings that target a specific channel/chat ID.
+
+        Telegram historically used both ``config.channel`` and
+        ``config.chat_id`` in different call sites, so we match both.
+        """
         rows = self._conn.execute(
             "SELECT * FROM channel_bindings WHERE channel_type = ?",
             (channel_type,),
         ).fetchall()
+        matches: List[Dict[str, Any]] = []
         for row in rows:
             binding = self._row_to_binding(row)
             config = binding.get("config", {})
-            if config.get("channel") == channel_id:
-                return binding
-        return None
+            if (
+                str(config.get("channel", "")).strip() == channel_id
+                or str(config.get("chat_id", "")).strip() == channel_id
+            ):
+                matches.append(binding)
+        return matches
 
     # ── Templates ─────────────────────────────────────────────────
 
@@ -478,7 +534,13 @@ class AgentManager:
         return templates
 
     def create_from_template(
-        self, template_id: str, name: str, overrides: Optional[Dict[str, Any]] = None
+        self,
+        template_id: str,
+        name: str,
+        overrides: Optional[Dict[str, Any]] = None,
+        *,
+        org_role: str = "",
+        manager_agent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create an agent from a template with optional overrides."""
         templates = self.list_templates()
@@ -499,7 +561,43 @@ class AgentManager:
                 instruction=instruction or "(No specific instruction provided)",
             )
 
-        return self.create_agent(name=name, agent_type=agent_type, config=config)
+        return self.create_agent(
+            name=name,
+            agent_type=agent_type,
+            config=config,
+            org_role=org_role,
+            manager_agent_id=manager_agent_id,
+        )
+
+    @staticmethod
+    def _normalize_manager_id(manager_agent_id: Optional[str]) -> Optional[str]:
+        value = str(manager_agent_id or "").strip()
+        return value or None
+
+    def _validate_manager_assignment(
+        self,
+        agent_id: str,
+        manager_agent_id: Optional[str],
+    ) -> None:
+        if not manager_agent_id:
+            return
+        if manager_agent_id == agent_id:
+            raise ValueError("An agent cannot report to itself.")
+        manager = self.get_agent(manager_agent_id)
+        if manager is None:
+            raise ValueError(f"Manager agent not found: {manager_agent_id}")
+        seen: set[str] = {agent_id}
+        current_manager_id = manager_agent_id
+        while current_manager_id:
+            if current_manager_id in seen:
+                raise ValueError("This reporting change would create a cycle.")
+            seen.add(current_manager_id)
+            current = self.get_agent(current_manager_id)
+            if current is None:
+                break
+            current_manager_id = self._normalize_manager_id(
+                current.get("manager_agent_id")
+            )
 
     # ── Message queue ─────────────────────────────────────────────
 
@@ -679,6 +777,8 @@ class AgentManager:
             "id": row["id"],
             "name": row["name"],
             "agent_type": row["agent_type"],
+            "org_role": row["org_role"] or "",
+            "manager_agent_id": row["manager_agent_id"],
             "config": json.loads(config_raw) if config_raw else {},
             "status": row["status"],
             "summary_memory": row["summary_memory"] or "",
@@ -702,6 +802,7 @@ class AgentManager:
         return {
             "id": row["id"],
             "agent_id": row["agent_id"],
+            "assigned_by_agent_id": row["assigned_by_agent_id"],
             "description": row["description"],
             "status": row["status"],
             "progress": json.loads(progress_raw) if progress_raw else {},

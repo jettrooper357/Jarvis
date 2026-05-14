@@ -775,12 +775,345 @@ async def transcribe_speech(request: Request):
 async def speech_health(request: Request):
     """Check if a speech backend is available."""
     backend = getattr(request.app.state, "speech_backend", None)
-    if backend is None:
+    tts = getattr(request.app.state, "tts_backend", None)
+    if backend is None and tts is None:
         return {"available": False, "reason": "No speech backend configured"}
     return {
-        "available": backend.health(),
-        "backend": backend.backend_id,
+        "available": backend.health() if backend else False,
+        "backend": backend.backend_id if backend else None,
+        "tts_available": tts.health() if tts else False,
+        "tts_backend": tts.backend_id if tts else None,
     }
+
+
+@speech_router.websocket("/stream")
+async def speech_stream(websocket: WebSocket):
+    """Stream STT: client sends 16kHz mono int16 PCM frames, server emits transcripts.
+
+    Protocol
+    --------
+    Client → server: binary frames (raw little-endian int16 PCM @ 16kHz mono).
+    Client → server: text frames as JSON for control, e.g. ``{"type": "flush"}``
+        to force-transcribe the current buffer.
+
+    Server → client: JSON messages::
+
+        {"type": "speech_start"}
+        {"type": "partial", "text": "...so far..."}
+        {"type": "final",   "text": "...", "is_final": true}
+        {"type": "speech_end"}
+        {"type": "error",   "detail": "..."}
+    """
+    import asyncio
+
+    await websocket.accept()
+    backend = getattr(websocket.app.state, "speech_backend", None)
+    if backend is None or getattr(backend, "backend_id", "") != "faster-whisper":
+        await websocket.send_json(
+            {
+                "type": "error",
+                "detail": "Streaming STT requires the faster-whisper backend",
+            }
+        )
+        await websocket.close()
+        return
+
+    try:
+        from openjarvis.speech.streaming import StreamingTranscriber
+    except ImportError as exc:
+        await websocket.send_json(
+            {"type": "error", "detail": f"Streaming unavailable: {exc}"}
+        )
+        await websocket.close()
+        return
+
+    language = websocket.query_params.get("language") or None
+    try:
+        transcriber = StreamingTranscriber(backend, language=language)
+    except ImportError as exc:
+        await websocket.send_json(
+            {
+                "type": "error",
+                "detail": (
+                    f"silero-vad not installed: {exc}. "
+                    "Run: uv sync --extra speech"
+                ),
+            }
+        )
+        await websocket.close()
+        return
+
+    async def _emit(events) -> None:
+        for ev in events:
+            await websocket.send_json(
+                {
+                    "type": ev.type,
+                    "text": ev.text,
+                    "is_final": ev.is_final,
+                }
+            )
+
+    async def _run(fn) -> bool:
+        """Run a transcription step in a worker thread; report failures."""
+        try:
+            events = await asyncio.to_thread(lambda: list(fn()))
+        except Exception as exc:
+            logger.exception("Streaming transcription failed")
+            try:
+                await websocket.send_json(
+                    {"type": "error", "detail": f"Transcription failed: {exc}"}
+                )
+            except Exception:
+                pass
+            return False
+        await _emit(events)
+        return True
+
+    try:
+        while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            if "bytes" in msg and msg["bytes"] is not None:
+                ok = await _run(lambda b=msg["bytes"]: transcriber.feed_int16(b))
+                if not ok:
+                    break
+            elif "text" in msg and msg["text"] is not None:
+                try:
+                    payload = json.loads(msg["text"])
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if payload.get("type") == "flush":
+                    ok = await _run(lambda: transcriber.flush())
+                    if not ok:
+                        break
+                elif payload.get("type") == "reset":
+                    transcriber.reset()
+    except WebSocketDisconnect:
+        pass
+
+
+class TTSSynthesizeRequest(BaseModel):
+    text: str
+    voice_id: str = ""
+    speed: float = 1.0
+    output_format: str = "wav"
+
+
+def _resolve_voice(request: Request, voice_id: str):
+    """Map a voice_id to (backend, kwargs) for synthesize/stream.
+
+    Custom voices live in :mod:`openjarvis.speech.custom_voices` — a mix
+    expands to a comma-string passed to Kokoro; a clone routes to the F5-TTS
+    backend with the reference audio path. Built-in IDs and empty strings
+    fall through to the default TTS backend.
+    """
+    from openjarvis.speech import custom_voices
+
+    default_tts = getattr(request.app.state, "tts_backend", None)
+    clone_tts = getattr(request.app.state, "tts_clone_backend", None)
+
+    if voice_id.startswith(("mix_", "clone_")):
+        voice = custom_voices.get_voice(voice_id)
+        if voice is None:
+            raise HTTPException(status_code=404, detail=f"Unknown voice: {voice_id}")
+        if voice.kind == "mix":
+            return default_tts, {"voice_id": voice.kokoro_voice}
+        # clone
+        if clone_tts is None:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "Voice cloning backend not available. Install the "
+                    "speech-clone extras and restart: uv sync --extra speech-clone"
+                ),
+            )
+        kwargs = {"voice_id": voice.ref_audio}
+        if voice.ref_text:
+            kwargs["ref_text"] = voice.ref_text
+        return clone_tts, kwargs
+
+    return default_tts, ({"voice_id": voice_id} if voice_id else {})
+
+
+@speech_router.post("/synthesize")
+async def synthesize_speech(req: TTSSynthesizeRequest, request: Request):
+    """Synthesize text to a single audio blob (non-streaming)."""
+    from fastapi.responses import Response
+
+    backend, voice_kwargs = _resolve_voice(request, req.voice_id)
+    if backend is None:
+        raise HTTPException(status_code=501, detail="TTS backend not configured")
+    kwargs: Dict[str, Any] = {
+        "speed": req.speed,
+        "output_format": req.output_format,
+        **voice_kwargs,
+    }
+    try:
+        result = backend.synthesize(req.text, **kwargs)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    mime = "audio/wav" if result.format.lower() == "wav" else f"audio/{result.format}"
+    return Response(content=result.audio, media_type=mime)
+
+
+@speech_router.post("/synthesize/stream")
+async def synthesize_speech_stream(req: TTSSynthesizeRequest, request: Request):
+    """Synthesize text and stream sentence-sized audio chunks as SSE.
+
+    Each event has ``audio`` (base64 WAV bytes), ``format``, ``sample_rate``,
+    and ``text`` (the sentence rendered). A terminal ``[DONE]`` line marks
+    end-of-stream.
+    """
+    import asyncio
+    import base64
+
+    from fastapi.responses import StreamingResponse
+
+    backend, voice_kwargs = _resolve_voice(request, req.voice_id)
+    if backend is None:
+        raise HTTPException(status_code=501, detail="TTS backend not configured")
+
+    stream_kwargs: Dict[str, Any] = {
+        "speed": req.speed,
+        "output_format": req.output_format,
+        **voice_kwargs,
+    }
+
+    async def event_stream():
+        try:
+            it = await asyncio.to_thread(
+                lambda: iter(backend.stream(req.text, **stream_kwargs))
+            )
+            while True:
+                chunk = await asyncio.to_thread(next, it, None)
+                if chunk is None:
+                    break
+                payload = {
+                    "audio": base64.b64encode(chunk.audio).decode("ascii"),
+                    "format": chunk.format,
+                    "sample_rate": chunk.sample_rate,
+                    "text": chunk.text,
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+        except Exception as exc:
+            err = json.dumps({"error": str(exc)})
+            yield f"data: {err}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+@speech_router.get("/voices")
+async def list_voices(request: Request):
+    """Return available TTS voices, grouped by source.
+
+    Response shape::
+
+        {
+          "backend": "kokoro",
+          "clone_backend": "f5-tts" | null,
+          "builtin": [{"id": "af_heart", "lang": "a", "gender": "f", "name": "heart"}, ...],
+          "custom": [{"id": "mix_xxx", "name": "...", "kind": "mix", "kokoro_voice": "..."}, ...]
+        }
+    """
+    from openjarvis.speech import custom_voices
+
+    tts = getattr(request.app.state, "tts_backend", None)
+    clone_tts = getattr(request.app.state, "tts_clone_backend", None)
+    builtin = []
+    if tts is not None:
+        for v in tts.available_voices():
+            entry: Dict[str, Any] = {"id": v}
+            if len(v) >= 3 and v[2] == "_":
+                entry["lang"] = v[0]
+                entry["gender"] = v[1]
+                entry["name"] = v[3:]
+            builtin.append(entry)
+    custom = [custom_voices.to_public_dict(v) for v in custom_voices.list_voices()]
+    return {
+        "backend": tts.backend_id if tts is not None else None,
+        "clone_backend": clone_tts.backend_id if clone_tts is not None else None,
+        "builtin": builtin,
+        "custom": custom,
+    }
+
+
+class VoiceMixRequest(BaseModel):
+    name: str
+    voice_ids: List[str]
+
+
+@speech_router.post("/voices/mix")
+async def create_voice_mix(req: VoiceMixRequest, request: Request):
+    """Save a named blend of built-in Kokoro voices."""
+    from openjarvis.speech import custom_voices
+
+    tts = getattr(request.app.state, "tts_backend", None)
+    if tts is None or tts.backend_id != "kokoro":
+        raise HTTPException(
+            status_code=501,
+            detail="Voice mixing requires the Kokoro TTS backend",
+        )
+    valid = set(tts.available_voices())
+    bad = [v for v in req.voice_ids if v not in valid]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Unknown voice ID(s): {bad}")
+    try:
+        voice = custom_voices.add_mix(req.name, ",".join(req.voice_ids))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return custom_voices.to_public_dict(voice)
+
+
+@speech_router.post("/voices/clone")
+async def create_voice_clone(request: Request):
+    """Upload a reference audio clip to create a cloned voice.
+
+    Multipart fields: ``name`` (str), ``file`` (audio), ``ref_text`` (optional str).
+    """
+    from openjarvis.speech import custom_voices
+
+    clone_tts = getattr(request.app.state, "tts_clone_backend", None)
+    if clone_tts is None:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Voice cloning backend not installed. Install with: "
+                "uv sync --extra speech-clone"
+            ),
+        )
+
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+    ref_text = (form.get("ref_text") or "").strip()
+    audio_file = form.get("file")
+    if audio_file is None or not hasattr(audio_file, "read"):
+        raise HTTPException(status_code=400, detail="Missing audio file in 'file' field")
+    audio_bytes = await audio_file.read()
+    if len(audio_bytes) < 1024:
+        raise HTTPException(status_code=400, detail="Audio file is too small (need ~6-10s of speech)")
+    filename = getattr(audio_file, "filename", "ref.wav") or "ref.wav"
+    suffix = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ".wav"
+    try:
+        voice = custom_voices.add_clone(name, audio_bytes, ref_text=ref_text, suffix=suffix)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return custom_voices.to_public_dict(voice)
+
+
+@speech_router.delete("/voices/{voice_id}")
+async def delete_voice(voice_id: str):
+    from openjarvis.speech import custom_voices
+
+    if not custom_voices.delete_voice(voice_id):
+        raise HTTPException(status_code=404, detail="Voice not found")
+    return {"deleted": voice_id}
 
 
 # ---- Feedback routes ----

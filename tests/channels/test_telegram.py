@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -233,3 +234,84 @@ class TestChannelAgentWiring:
 
         assert len(calls_a) == 1
         assert len(calls_b) == 1
+
+
+class TestPolling:
+    def test_dispatch_update_forwards_message(self):
+        ch = TelegramChannel(bot_token="tok", allowed_chat_ids="111")
+        handler = MagicMock()
+        bus = EventBus(record_history=True)
+        ch._bus = bus
+        ch.on_message(handler)
+
+        ch._dispatch_update(
+            {
+                "update_id": 1,
+                "message": {
+                    "message_id": 99,
+                    "text": "hello",
+                    "chat": {"id": "111"},
+                    "from": {"id": "222"},
+                },
+            }
+        )
+
+        handler.assert_called_once()
+        message = handler.call_args[0][0]
+        assert message.content == "hello"
+        assert message.conversation_id == "111"
+        assert EventType.CHANNEL_MESSAGE_RECEIVED in [e.event_type for e in bus.history]
+
+    def test_poll_loop_retries_after_transient_failure(self):
+        ch = TelegramChannel(bot_token="tok", allowed_chat_ids="111")
+        handler = MagicMock()
+        ch.on_message(handler)
+
+        first = RuntimeError("temporary failure")
+        second = MagicMock()
+        second.status_code = 200
+        second.json.return_value = {
+            "ok": True,
+            "result": [
+                {
+                    "update_id": 10,
+                    "message": {
+                        "message_id": 1,
+                        "text": "ping",
+                        "chat": {"id": "111"},
+                        "from": {"id": "111"},
+                    },
+                }
+            ],
+        }
+
+        def fake_get(*_args, **_kwargs):
+            result = responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            ch._stop_event.set()
+            return result
+
+        responses = [first, second]
+        with patch("httpx.get", side_effect=fake_get), patch(
+            "openjarvis.channels.telegram.time.sleep"
+        ):
+            ch._poll_loop()
+
+        handler.assert_called_once()
+        assert ch.status() == ChannelStatus.CONNECTED
+
+    def test_connect_starts_listener_without_python_telegram_bot(self):
+        ch = TelegramChannel(bot_token="tok")
+
+        started = threading.Event()
+
+        def fake_poll_loop():
+            started.set()
+            ch._stop_event.wait(0.01)
+
+        with patch.object(ch, "_poll_loop", side_effect=fake_poll_loop):
+            ch.connect()
+            assert started.wait(1.0)
+            assert ch.status() == ChannelStatus.CONNECTED
+            ch.disconnect()

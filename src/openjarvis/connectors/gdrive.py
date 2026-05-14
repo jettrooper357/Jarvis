@@ -16,6 +16,7 @@ from openjarvis.connectors._stubs import BaseConnector, Document, SyncStatus
 from openjarvis.connectors.oauth import (
     GOOGLE_ALL_SCOPES,
     build_google_auth_url,
+    call_with_token_refresh,
     delete_tokens,
     load_tokens,
     resolve_google_credentials,
@@ -235,15 +236,21 @@ class GDriveConnector(BaseConnector):
         if not tokens:
             return
 
-        token: str = tokens.get("access_token", tokens.get("token", ""))
-        if not token:
+        def _tok() -> str:
+            t = load_tokens(self._credentials_path) or {}
+            return t.get("access_token") or t.get("token") or ""
+
+        if not _tok():
             return
 
         page_token: Optional[str] = cursor
         synced = 0
 
         while True:
-            list_resp = _gdrive_api_list_files(token, page_token=page_token)
+            list_resp = call_with_token_refresh(
+                self._credentials_path,
+                lambda pt=page_token: _gdrive_api_list_files(_tok(), page_token=pt),
+            )
             files: List[Dict[str, Any]] = list_resp.get("files", [])
 
             for file_meta in files:
@@ -263,7 +270,12 @@ class GDriveConnector(BaseConnector):
                 export_mime = _EXPORT_MIME_MAP.get(mime_type)
                 if export_mime is not None:
                     try:
-                        content = _gdrive_api_export(token, file_id, export_mime)
+                        content = call_with_token_refresh(
+                            self._credentials_path,
+                            lambda fid=file_id, em=export_mime: _gdrive_api_export(
+                                _tok(), fid, em
+                            ),
+                        )
                     except Exception:  # noqa: BLE001
                         content = f"[File: {name}] ({mime_type})"
                 else:

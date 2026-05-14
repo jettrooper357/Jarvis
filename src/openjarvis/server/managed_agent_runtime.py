@@ -1,0 +1,469 @@
+"""Synchronous managed-agent runtime used by channel dispatch and delegation."""
+
+from __future__ import annotations
+
+import contextvars
+import logging
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence
+
+from openjarvis.core.registry import ToolRegistry
+from openjarvis.core.types import Message, Role, ToolCall, ToolResult
+from openjarvis.tools._stubs import ToolExecutor
+
+if TYPE_CHECKING:
+    from openjarvis.tools._stubs import BaseTool
+
+logger = logging.getLogger(__name__)
+
+_AUTO_COLLABORATION_TOOLS = (
+    "managed_agent_directory",
+    "managed_agent_delegate",
+    "managed_agent_message",
+    "managed_agent_assign_task",
+    "managed_agent_list_tasks",
+    "managed_agent_update_task",
+)
+_KNOWLEDGE_TOOL_NAMES = ("knowledge_search", "knowledge_sql", "scan_chunks", "think")
+
+
+@dataclass(frozen=True)
+class ManagedAgentExecutionContext:
+    """Runtime state exposed to delegation-aware tools via a context var."""
+
+    runtime: "ManagedAgentRuntime"
+    manager: Any
+    engine: Any
+    current_agent_id: str
+    parent_agent_id: str = ""
+    visited_agent_ids: tuple[str, ...] = ()
+
+
+_execution_context: contextvars.ContextVar[ManagedAgentExecutionContext | None] = (
+    contextvars.ContextVar("openjarvis_managed_agent_execution", default=None)
+)
+
+
+def get_managed_agent_context() -> ManagedAgentExecutionContext | None:
+    """Return the current managed-agent tool execution context, if any."""
+    return _execution_context.get()
+
+
+@contextmanager
+def use_managed_agent_context(
+    context: ManagedAgentExecutionContext,
+) -> Iterator[ManagedAgentExecutionContext]:
+    """Bind managed-agent runtime state for tool execution."""
+    token = _execution_context.set(context)
+    try:
+        yield context
+    finally:
+        _execution_context.reset(token)
+
+
+def _tool_call_name(raw: Dict[str, Any]) -> str:
+    function = raw.get("function")
+    if isinstance(function, dict):
+        return str(function.get("name", ""))
+    return str(raw.get("name", ""))
+
+
+def _tool_call_args(raw: Dict[str, Any]) -> str:
+    function = raw.get("function")
+    if isinstance(function, dict):
+        return str(function.get("arguments", ""))
+    return str(raw.get("arguments", ""))
+
+
+def _response_content(result: Any) -> str:
+    if isinstance(result, dict):
+        return str(result.get("content", "") or "")
+    return str(result or "")
+
+
+def _effective_tool_names(agent_record: Dict[str, Any]) -> List[str]:
+    config = agent_record.get("config", {}) or {}
+    raw_tools = config.get("tools") or []
+    names: List[str] = []
+    for entry in raw_tools:
+        if isinstance(entry, str):
+            cleaned = entry.strip()
+            if cleaned and cleaned not in names:
+                names.append(cleaned)
+    agent_name = str(agent_record.get("name", "")).strip().casefold()
+    if agent_name or agent_record.get("id"):
+        for tool_name in _AUTO_COLLABORATION_TOOLS:
+            if tool_name not in names:
+                names.append(tool_name)
+    return names
+
+
+def _build_knowledge_tools(engine: Any, model: str) -> Dict[str, BaseTool]:
+    """Instantiate the knowledge/search tools used by deep-research agents."""
+    from openjarvis.connectors.retriever import TwoStageRetriever
+    from openjarvis.connectors.store import KnowledgeStore
+    from openjarvis.core.config import DEFAULT_CONFIG_DIR
+    from openjarvis.tools.knowledge_search import KnowledgeSearchTool
+    from openjarvis.tools.knowledge_sql import KnowledgeSQLTool
+    from openjarvis.tools.scan_chunks import ScanChunksTool
+    from openjarvis.tools.think import ThinkTool
+
+    knowledge_db_path = DEFAULT_CONFIG_DIR / "knowledge.db"
+    if not Path(knowledge_db_path).exists():
+        return {"think": ThinkTool()}
+
+    store = KnowledgeStore(str(knowledge_db_path))
+    retriever = TwoStageRetriever(store)
+    return {
+        "knowledge_search": KnowledgeSearchTool(retriever=retriever),
+        "knowledge_sql": KnowledgeSQLTool(store=store),
+        "scan_chunks": ScanChunksTool(store=store, engine=engine, model=model),
+        "think": ThinkTool(),
+    }
+
+
+def _build_tool_instances(
+    tool_names: Sequence[str],
+    *,
+    engine: Any,
+    model: str,
+    execution_context: ManagedAgentExecutionContext | None = None,
+) -> List[BaseTool]:
+    """Instantiate tools for a managed-agent turn."""
+    import importlib
+    import sys
+
+    import openjarvis.tools  # noqa: F401
+
+    names = [name for name in tool_names if name]
+    if not names:
+        return []
+
+    missing = [name for name in names if not ToolRegistry.contains(name)]
+    if missing:
+        for module_name in list(sys.modules):
+            if module_name.startswith("openjarvis.tools.") and not module_name.endswith(
+                "_stubs"
+            ):
+                try:
+                    importlib.reload(sys.modules[module_name])
+                except Exception:
+                    logger.exception("Failed to reload tool module %s", module_name)
+
+    knowledge_instances: Dict[str, BaseTool] = {}
+    if any(name in _KNOWLEDGE_TOOL_NAMES for name in names):
+        try:
+            knowledge_instances = _build_knowledge_tools(engine, model)
+        except Exception:
+            logger.exception("Failed to build knowledge tools")
+
+    instances: List[BaseTool] = []
+    seen: set[str] = set()
+    for tool_name in names:
+        if tool_name in seen:
+            continue
+        seen.add(tool_name)
+        if tool_name in knowledge_instances:
+            instances.append(knowledge_instances[tool_name])
+            continue
+        if not ToolRegistry.contains(tool_name):
+            logger.warning("Tool '%s' is not registered", tool_name)
+            continue
+        tool_cls = ToolRegistry.get(tool_name)
+        try:
+            if tool_name in _AUTO_COLLABORATION_TOOLS:
+                instances.append(tool_cls(context=execution_context))
+            else:
+                instances.append(tool_cls())
+        except Exception:
+            logger.exception("Failed to instantiate tool %s", tool_name)
+    return instances
+
+
+class ManagedAgentRuntime:
+    """Run managed agents synchronously with tool-calling and delegation."""
+
+    def __init__(
+        self,
+        manager: Any,
+        engine: Any,
+        *,
+        bus: Any = None,
+        default_model: str = "",
+    ) -> None:
+        self._manager = manager
+        self._engine = engine
+        self._bus = bus
+        self._default_model = default_model
+
+    def run(
+        self,
+        agent_id: str,
+        user_content: str,
+        *,
+        parent_agent_id: str = "",
+        visited_agent_ids: Optional[Sequence[str]] = None,
+    ) -> str:
+        agent_record = self._manager.get_agent(agent_id)
+        if agent_record is None:
+            raise KeyError(f"Agent {agent_id!r} not found")
+
+        mode = "delegated" if parent_agent_id else "channel"
+        message = self._manager.send_message(agent_id, user_content, mode=mode)
+        message_id = message["id"]
+        response_text = ""
+        tool_calls: Optional[List[Dict[str, Any]]] = None
+        try:
+            response_text, tool_calls = self._run_turn(
+                agent_record=agent_record,
+                user_content=user_content,
+                message_id=message_id,
+                parent_agent_id=parent_agent_id,
+                visited_agent_ids=visited_agent_ids or (),
+            )
+        except Exception as exc:
+            logger.exception("Managed agent turn failed for %s", agent_id)
+            response_text = f"Sorry, the agent failed: {exc}"
+        finally:
+            try:
+                self._manager.mark_message_delivered(message_id)
+            except Exception:
+                logger.exception("Failed to mark message delivered for %s", agent_id)
+        self._manager.store_agent_response(
+            agent_id,
+            response_text,
+            tool_calls=tool_calls or None,
+        )
+        return response_text
+
+    def _run_turn(
+        self,
+        *,
+        agent_record: Dict[str, Any],
+        user_content: str,
+        message_id: str,
+        parent_agent_id: str,
+        visited_agent_ids: Sequence[str],
+    ) -> tuple[str, List[Dict[str, Any]]]:
+        agent_id = agent_record["id"]
+        config = agent_record.get("config", {}) or {}
+        model = config.get("model") or getattr(self._engine, "_model", "") or self._default_model
+        if not model:
+            raise RuntimeError("No model configured for managed agent runtime")
+
+        execution_context = ManagedAgentExecutionContext(
+            runtime=self,
+            manager=self._manager,
+            engine=self._engine,
+            current_agent_id=agent_id,
+            parent_agent_id=parent_agent_id,
+            visited_agent_ids=tuple(visited_agent_ids),
+        )
+
+        with use_managed_agent_context(execution_context):
+            if agent_record.get("agent_type", "") == "deep_research":
+                return self._run_deep_research_turn(
+                    agent_record=agent_record,
+                    user_content=user_content,
+                    model=model,
+                    execution_context=execution_context,
+                )
+            return self._run_standard_turn(
+                agent_record=agent_record,
+                user_content=user_content,
+                message_id=message_id,
+                model=model,
+                execution_context=execution_context,
+            )
+
+    def _run_deep_research_turn(
+        self,
+        *,
+        agent_record: Dict[str, Any],
+        user_content: str,
+        model: str,
+        execution_context: ManagedAgentExecutionContext,
+    ) -> tuple[str, List[Dict[str, Any]]]:
+        from openjarvis.agents.deep_research import DeepResearchAgent
+
+        config = agent_record.get("config", {}) or {}
+        tool_names = list(_KNOWLEDGE_TOOL_NAMES)
+        for extra_name in _effective_tool_names(agent_record):
+            if extra_name not in tool_names:
+                tool_names.append(extra_name)
+        tools = _build_tool_instances(
+            tool_names,
+            engine=self._engine,
+            model=model,
+            execution_context=execution_context,
+        )
+        collected_tool_calls: List[Dict[str, Any]] = []
+
+        dr_agent = DeepResearchAgent(
+            engine=self._engine,
+            model=model,
+            tools=tools,
+            bus=self._bus,
+            max_turns=int(config.get("max_turns", 8)),
+            temperature=float(config.get("temperature", 0.3)),
+            max_tokens=int(config.get("max_tokens", 4096)),
+            interactive=True,
+            confirm_callback=lambda _prompt: True,
+        )
+
+        original_execute = dr_agent._executor.execute
+
+        def _tracked_execute(tool_call: ToolCall) -> ToolResult:
+            result = original_execute(tool_call)
+            collected_tool_calls.append(
+                {
+                    "tool": tool_call.name,
+                    "arguments": tool_call.arguments or "",
+                    "result": result.content or "",
+                    "success": bool(result.success),
+                    "latency": float(result.latency_seconds or 0.0),
+                }
+            )
+            return result
+
+        dr_agent._executor.execute = _tracked_execute
+        result = dr_agent.run(user_content)
+        return result.content or "No results found.", collected_tool_calls
+
+    def _run_standard_turn(
+        self,
+        *,
+        agent_record: Dict[str, Any],
+        user_content: str,
+        message_id: str,
+        model: str,
+        execution_context: ManagedAgentExecutionContext,
+    ) -> tuple[str, List[Dict[str, Any]]]:
+        config = agent_record.get("config", {}) or {}
+        tool_names = _effective_tool_names(agent_record)
+        tool_instances = _build_tool_instances(
+            tool_names,
+            engine=self._engine,
+            model=model,
+            execution_context=execution_context,
+        )
+        tool_specs = [tool.to_openai_function() for tool in tool_instances]
+        tool_map = {tool.spec.name: tool for tool in tool_instances}
+
+        messages: List[Message] = []
+        system_prompt = config.get("system_prompt")
+        if system_prompt:
+            messages.append(Message(role=Role.SYSTEM, content=str(system_prompt)))
+
+        history = self._manager.list_messages(agent_record["id"], limit=50)
+        for item in reversed(history):
+            if item["id"] == message_id:
+                continue
+            if item["direction"] == "user_to_agent":
+                messages.append(Message(role=Role.USER, content=item["content"]))
+            elif item["direction"] == "agent_to_user":
+                messages.append(Message(role=Role.ASSISTANT, content=item["content"]))
+        messages.append(Message(role=Role.USER, content=user_content))
+
+        temperature = float(config.get("temperature", 0.7))
+        max_tokens = int(config.get("max_tokens", 1024))
+        max_turns = int(config.get("max_turns", 10))
+        collected_prefix = ""
+        collected_tool_calls: List[Dict[str, Any]] = []
+
+        for _turn in range(max_turns):
+            kwargs: Dict[str, Any] = {
+                "model": model,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            if tool_specs:
+                kwargs["tools"] = tool_specs
+            result = self._engine.generate(messages, **kwargs)
+            turn_content = _response_content(result)
+            tool_calls_raw = result.get("tool_calls", []) if isinstance(result, dict) else []
+
+            if not tool_calls_raw:
+                return f"{collected_prefix}{turn_content}", collected_tool_calls
+
+            messages.append(
+                Message(
+                    role=Role.ASSISTANT,
+                    content=turn_content,
+                    tool_calls=[
+                        ToolCall(
+                            id=str(raw.get("id", "")),
+                            name=_tool_call_name(raw),
+                            arguments=_tool_call_args(raw),
+                        )
+                        for raw in tool_calls_raw
+                    ],
+                )
+            )
+
+            for raw in tool_calls_raw:
+                tool_name = _tool_call_name(raw)
+                tool_args = _tool_call_args(raw)
+                tool_result_content = f"Tool '{tool_name}' not available"
+                tool_success = False
+                try:
+                    tool = tool_map.get(tool_name)
+                    if tool is None:
+                        raise KeyError(tool_name)
+                    executor = ToolExecutor(
+                        tools=[tool],
+                        bus=self._bus,
+                        interactive=True,
+                        confirm_callback=lambda _prompt: True,
+                    )
+                    result_obj = executor.execute(
+                        ToolCall(
+                            id=str(raw.get("id", "")),
+                            name=tool_name,
+                            arguments=tool_args,
+                        )
+                    )
+                    tool_result_content = result_obj.content or ""
+                    tool_success = bool(result_obj.success)
+                except Exception as exc:
+                    logger.exception("Managed agent tool execution failed for %s", tool_name)
+                    tool_result_content = f"Error executing {tool_name}: {exc}"
+
+                collected_tool_calls.append(
+                    {
+                        "tool": tool_name,
+                        "arguments": tool_args,
+                        "result": tool_result_content,
+                        "success": tool_success,
+                        "latency": 0.0,
+                    }
+                )
+                messages.append(
+                    Message(
+                        role=Role.TOOL,
+                        content=tool_result_content,
+                        tool_call_id=str(raw.get("id", "")),
+                        name=tool_name,
+                    )
+                )
+
+            collected_prefix += turn_content
+
+        messages.append(
+            Message(
+                role=Role.USER,
+                content=(
+                    "Write the best final answer you can from the completed tool results. "
+                    "Do not call more tools."
+                ),
+            )
+        )
+        fallback = self._engine.generate(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return f"{collected_prefix}{_response_content(fallback)}", collected_tool_calls

@@ -52,15 +52,35 @@ class ChannelBridge:
         system: Any = None,
         agent_manager: Any = None,
         deep_research_agent: Any = None,
+        engine: Any = None,
+        default_model: str = "",
     ) -> None:
-        self._channels = channels
+        self._channels: Dict[str, BaseChannel] = {}
         self._session_store = session_store
         self._bus = bus
         self._system = system
         self._agent_manager = agent_manager
         self._deep_research_agent = deep_research_agent
         self._notification_timestamps: Dict[str, float] = {}
+        # Per-agent runtime: when a channel message matches a binding, the
+        # bound agent's own config handles it, including managed-agent
+        # tool calling and delegation when available.
+        self._agent_runtime: Any = None
+        if agent_manager is not None and engine is not None:
+            try:
+                from openjarvis.server.managed_agent_runtime import ManagedAgentRuntime
+
+                self._agent_runtime = ManagedAgentRuntime(
+                    agent_manager,
+                    engine,
+                    bus=bus,
+                    default_model=default_model,
+                )
+            except Exception:
+                logger.exception("Failed to build ManagedAgentRuntime")
         self._subscribe_notifications()
+        for channel_name, channel in channels.items():
+            self.add_channel(channel_name, channel)
 
     # --------------------------------------------------------------
     # Backward-compatible BaseChannel interface
@@ -73,6 +93,17 @@ class ChannelBridge:
     def disconnect(self) -> None:
         for ch in self._channels.values():
             ch.disconnect()
+
+    def add_channel(self, channel_name: str, channel: BaseChannel) -> None:
+        """Register a live channel adapter and wire its incoming handler."""
+        self._channels[channel_name] = channel
+        try:
+            channel.on_message(self._handle_channel_message)
+        except Exception:
+            logger.exception(
+                "Failed to register incoming handler for channel %s",
+                channel_name,
+            )
 
     def list_channels(self) -> List[str]:
         result: List[str] = []
@@ -108,6 +139,37 @@ class ChannelBridge:
                 )
         logger.warning("No adapter found for channel %s", channel)
         return False
+
+    def _handle_channel_message(self, message) -> None:  # noqa: ANN001
+        """Process an incoming channel message and send the reply."""
+        sender_id = message.conversation_id or message.sender
+        max_length = _SMS_MAX_LENGTH if message.channel in {"twilio", "sendblue"} else _DEFAULT_MAX_LENGTH
+        try:
+            response = self.handle_incoming(
+                sender_id=sender_id,
+                content=message.content,
+                channel_type=message.channel,
+                metadata=getattr(message, "metadata", None),
+                max_length=max_length,
+            )
+        except Exception:
+            logger.exception(
+                "Incoming channel handler failed for %s",
+                message.channel,
+            )
+            response = "Sorry, I couldn't process that right now. Try again in a moment."
+
+        if not response:
+            return
+
+        try:
+            self.send(
+                message.channel,
+                response,
+                conversation_id=message.conversation_id or sender_id,
+            )
+        except Exception:
+            logger.exception("Failed to send channel reply on %s", message.channel)
 
     # --------------------------------------------------------------
     # Incoming message handling
@@ -198,10 +260,10 @@ class ChannelBridge:
         if not self._agent_manager:
             return "No agent manager configured."
         action_lower = action.strip().lower()
+        state = self._agent_manager.get_agent(agent_id)
+        if state is None:
+            return f"Agent '{agent_id}' not found."
         if action_lower == "status":
-            state = self._agent_manager.get_agent(agent_id)
-            if state is None:
-                return f"Agent '{agent_id}' not found."
             name = state.get("name", agent_id)
             status = state.get("status", "unknown")
             return f"Agent '{name}': {status}"
@@ -211,9 +273,14 @@ class ChannelBridge:
         if action_lower == "resume":
             self._agent_manager.resume_agent(agent_id)
             return f"Agent '{agent_id}' resumed."
-        # Treat as a message to the agent
+        # Treat as an immediate message to the agent when a runtime is available.
+        if self._agent_runtime is not None:
+            try:
+                return self._agent_runtime.run(agent_id, action)
+            except Exception:
+                logger.exception("Immediate /agent dispatch failed for %s", agent_id)
         result = self._agent_manager.send_message(agent_id, action)
-        return str(result) if result else f"Message sent to agent '{agent_id}'."
+        return str(result) if result else f"Message queued for agent '{agent_id}'."
 
     # --------------------------------------------------------------
     # Chat handling
@@ -254,6 +321,110 @@ class ChannelBridge:
             query = (
                 f"Previous conversation:\n{context_str}\n\nCurrent message: {content}"
             )
+
+        def _preferred_binding(bindings: list[dict]) -> Optional[dict]:
+            """Pick the default shared-chat binding when more than one matches.
+
+            Current policy:
+            1. Explicit ``routing_mode == "primary"``
+            2. Agent whose org role is CEO / Chief Executive Officer
+            3. Top-level agent named ``My Assistant`` (case-insensitive)
+            4. Sole top-level agent (no manager)
+            5. Agent named ``My Assistant`` (case-insensitive)
+            6. No implicit preference
+            """
+            resolved: list[tuple[dict, dict]] = []
+            for binding in bindings:
+                agent_id = str(binding.get("agent_id", "")).strip()
+                if not agent_id or self._agent_manager is None:
+                    continue
+                try:
+                    agent = self._agent_manager.get_agent(agent_id)
+                except Exception:
+                    logger.exception("get_agent failed for %s", agent_id)
+                    continue
+                if agent:
+                    resolved.append((binding, agent))
+
+            for binding in bindings:
+                if str(binding.get("routing_mode", "")).strip().lower() == "primary":
+                    return binding
+
+            def _is_ceo(agent: dict) -> bool:
+                role = str(agent.get("org_role", "")).strip().casefold()
+                return role in {
+                    "ceo",
+                    "chief executive officer",
+                    "chief executive officer (ceo)",
+                }
+
+            ceo_bindings = [binding for binding, agent in resolved if _is_ceo(agent)]
+            if len(ceo_bindings) == 1:
+                return ceo_bindings[0]
+
+            top_level = [
+                (binding, agent)
+                for binding, agent in resolved
+                if not str(agent.get("manager_agent_id", "")).strip()
+            ]
+
+            for binding, agent in top_level:
+                if str(agent.get("name", "")).strip().casefold() == "my assistant":
+                    return binding
+
+            if len(top_level) == 1:
+                return top_level[0][0]
+
+            for binding, agent in resolved:
+                if str(agent.get("name", "")).strip().casefold() == "my assistant":
+                    return binding
+            return None
+
+        # Per-agent binding: if this channel/chat_id has a bound agent,
+        # route the message to that agent's runtime instead of the global
+        # default. Unmatched chats fall through to the existing path.
+        if self._agent_runtime is not None and self._agent_manager is not None:
+            try:
+                bindings = self._agent_manager.find_bindings_for_channel(
+                    channel_type, sender_id
+                )
+            except Exception:
+                logger.exception("find_bindings_for_channel failed")
+                bindings = []
+            if len(bindings) > 1:
+                preferred = _preferred_binding(bindings)
+                if preferred is None:
+                    agent_ids = ", ".join(
+                        sorted(
+                            str(binding.get("agent_id", ""))
+                            for binding in bindings
+                            if binding.get("agent_id")
+                        )
+                    )
+                    return (
+                        "Multiple agents are bound to this chat. "
+                        f"Use /agent <id> <message>. Bound agents: {agent_ids}"
+                    )
+                binding = preferred
+            else:
+                binding = bindings[0] if bindings else None
+            if binding:
+                agent_id = binding.get("agent_id")
+                if agent_id:
+                    try:
+                        response_text = self._agent_runtime.run(agent_id, content)
+                        formatted = self._format_response(
+                            sender_id, channel_type, response_text, max_length
+                        )
+                        self._session_store.append_message(
+                            sender_id, channel_type, "assistant", response_text
+                        )
+                        return formatted
+                    except Exception:
+                        logger.exception(
+                            "Bound agent %s failed; falling back to default",
+                            agent_id,
+                        )
 
         # Try DeepResearchAgent first
         if self._deep_research_agent is not None:

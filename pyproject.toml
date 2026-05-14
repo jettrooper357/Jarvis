@@ -73,7 +73,10 @@ memory-pdf = ["pdfplumber>=0.10"]
 memory-bm25 = ["rank-bm25>=0.2.2"]
 server = [
     "fastapi>=0.110",
-    "uvicorn>=0.30",
+    # `[standard]` pulls in websockets / wsproto / httptools / uvloop / watchfiles.
+    # Without it, /v1/speech/stream and other WebSocket routes 404 at the
+    # transport layer with no useful error message in the browser.
+    "uvicorn[standard]>=0.30",
     "pydantic>=2.0",
     "python-multipart>=0.0.9",
 ]
@@ -114,8 +117,27 @@ security-signing = ["cryptography>=43"]
 sandbox-wasm = ["wasmtime>=25"]
 sandbox-docker = ["docker>=7.0"]
 dashboard = ["textual>=0.80"]
-speech = ["faster-whisper>=1.0"]
+speech = ["faster-whisper>=1.0", "silero-vad>=5.1", "soundfile>=0.12"]
 speech-deepgram = ["deepgram-sdk>=3.0"]
+speech-clone = ["f5-tts>=0.3"]
+# Local on-device TTS via kokoro. Pinned to transformers 4.x because
+# transformers 5.x has a broken `is_offline_mode` import path against
+# modern huggingface_hub (see docs/user-guide/voice.md). The hf_hub
+# upper-bound matches what transformers 4.x requires at runtime, and is
+# also why this extra is incompatible with `inference-mlx` (mlx-lm pulls
+# transformers 5.x via huggingface_hub>=1.3 — declared in tool.uv.conflicts).
+#
+# en_core_web_sm is misaki's spaCy tokenizer model. spaCy normally
+# auto-downloads it at runtime, but in a uv-managed venv there's no `pip`
+# available and the auto-fallback to `uv pip install` fails when invoked
+# outside a project directory. Pin the model wheel directly so it lands
+# with the venv and TTS works on first call.
+speech-tts-kokoro = [
+    "kokoro>=0.9",
+    "transformers<5",
+    "huggingface_hub<1.0",
+    "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+]
 eval-wandb = ["wandb>=0.17"]
 eval-sheets = ["gspread>=6.0", "google-auth>=2.0"]
 mining-pearl-cpu = [
@@ -145,6 +167,12 @@ Issues = "https://github.com/open-jarvis/OpenJarvis/issues"
 
 [project.scripts]
 jarvis = "openjarvis.cli:main"
+
+[tool.hatch.metadata]
+# Required for the en_core_web_sm wheel URL in the `speech-tts-kokoro` extra:
+# spaCy ships language models as GitHub-hosted wheels (not on PyPI), so we
+# pin them via PEP 508 direct references, which hatchling rejects by default.
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/openjarvis"]
@@ -183,4 +211,23 @@ select = ["E", "F", "I", "W"]
 [dependency-groups]
 dev = [
     "maturin>=1.12.6",
+]
+
+[tool.uv]
+# F5-TTS pins numpy<=1.26.4, but vLLM (via opencv-python-headless) needs
+# numpy>=2. Mark them as mutually exclusive so uv resolves each in its own
+# lockfile split instead of failing the global lock.
+#
+# speech-tts-kokoro needs transformers<5 + huggingface_hub<1.0, but mlx-lm
+# (inference-mlx) transitively pulls transformers 5.x + hf_hub 1.x. Same
+# pattern: declare the conflict so uv splits the lock.
+conflicts = [
+    [
+        { extra = "inference-vllm" },
+        { extra = "speech-clone" },
+    ],
+    [
+        { extra = "inference-mlx" },
+        { extra = "speech-tts-kokoro" },
+    ],
 ]

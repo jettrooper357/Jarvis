@@ -6,6 +6,7 @@ import logging
 import uuid
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
@@ -48,7 +49,20 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     """Handle chat completion requests (streaming and non-streaming)."""
     engine = request.app.state.engine
     agent = getattr(request.app.state, "agent", None)
-    model = request_body.model
+    # Fall back to the server's configured default when the client omits or
+    # sends an empty `model`. The websocket handler does the same; without
+    # this, Ollama replies `400: model is required` and the chat UI errors
+    # out on first message when nothing has been selected in the sidebar.
+    model = request_body.model or getattr(request.app.state, "model", "") or ""
+    if not model:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No model specified in request and no default configured on "
+                "the server. Pass `model` in the request body or start the "
+                "server with --model."
+            ),
+        )
 
     # Inject memory context into messages before dispatching
     config = getattr(request.app.state, "config", None)
@@ -739,6 +753,121 @@ async def channel_status(request: Request):
     if bridge is None:
         return {"status": "not_configured"}
     return {"status": bridge.status().value}
+
+
+@router.get("/v1/channels/telegram/config")
+async def telegram_config_get():
+    """Return the saved Telegram bot config for the local UI."""
+    from openjarvis.channels.telegram import (
+        _load_allowed_chats_from_credentials_file,
+        _load_token_from_credentials_file,
+    )
+
+    token = _load_token_from_credentials_file()
+    return {
+        "has_token": bool(token),
+        "token_preview": f"{token[:6]}…{token[-4:]}" if token else "",
+        "bot_token": token or "",
+        "allowed_chat_ids": _load_allowed_chats_from_credentials_file(),
+    }
+
+
+@router.get("/v1/channels/telegram/health")
+async def telegram_health():
+    """Check whether the backend can reach the Telegram Bot API."""
+    from openjarvis.channels.telegram import _load_token_from_credentials_file
+
+    token = _load_token_from_credentials_file().strip()
+    if not token:
+        return {
+            "configured": False,
+            "status": "not_configured",
+            "message": "No Telegram bot token is saved yet.",
+        }
+
+    try:
+        response = httpx.get(
+            f"https://api.telegram.org/bot{token}/getMe",
+            timeout=8.0,
+        )
+    except httpx.RequestError as exc:
+        return {
+            "configured": True,
+            "status": "network_error",
+            "message": (
+                "The backend cannot reach api.telegram.org. "
+                "Telegram may be blocked by your VPN, firewall, proxy, or DNS."
+            ),
+            "detail": str(exc),
+        }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    if response.status_code == 401:
+        return {
+            "configured": True,
+            "status": "invalid_token",
+            "message": "Telegram rejected the saved bot token.",
+            "detail": str(payload.get("description") or response.text or "Unauthorized"),
+        }
+
+    if response.status_code >= 300:
+        return {
+            "configured": True,
+            "status": "telegram_error",
+            "message": "Telegram returned an error while validating the bot token.",
+            "detail": str(
+                payload.get("description")
+                or response.text
+                or f"HTTP {response.status_code}"
+            ),
+        }
+
+    if not payload.get("ok", False):
+        return {
+            "configured": True,
+            "status": "telegram_error",
+            "message": "Telegram did not confirm the bot connection.",
+            "detail": str(payload.get("description") or "Unknown Telegram error"),
+        }
+
+    result = payload.get("result") or {}
+    return {
+        "configured": True,
+        "status": "ok",
+        "message": "Telegram Bot API is reachable from this backend.",
+        "bot_username": result.get("username", ""),
+        "bot_id": result.get("id"),
+    }
+
+
+@router.post("/v1/channels/telegram/config")
+async def telegram_config_set(request: Request):
+    """Persist the Telegram bot_token (and optional allowed_chat_ids).
+
+    Writes to ``~/.openjarvis/connectors/telegram.json`` (mode 0o600). New
+    ``TelegramChannel`` instances will pick it up on next backend start; the
+    response surfaces a ``restart_required`` flag the UI can show.
+    """
+    from openjarvis.channels.telegram import save_credentials
+
+    body = await request.json()
+    bot_token = (body.get("bot_token") or "").strip()
+    allowed_chat_ids = (body.get("allowed_chat_ids") or "").strip()
+    if not bot_token:
+        raise HTTPException(status_code=400, detail="bot_token is required")
+
+    save_credentials(bot_token, allowed_chat_ids)
+    return {
+        "saved": True,
+        "token_preview": f"{bot_token[:6]}…{bot_token[-4:]}",
+        "bot_token": bot_token,
+        "allowed_chat_ids": allowed_chat_ids,
+        "restart_required": True,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,20 @@ import {
   Brain,
 } from 'lucide-react';
 import { useAppStore, type ThemeMode } from '../lib/store';
-import { checkHealth, fetchSpeechHealth, getMemoryStats } from '../lib/api';
+import {
+  checkHealth,
+  fetchSpeechHealth,
+  fetchSpeechVoices,
+  getMemoryStats,
+  synthesizeProbe,
+  createVoiceMix,
+  createVoiceClone,
+  deleteVoice,
+  type BuiltinVoice,
+  type CustomVoice,
+  type VoicesResponse,
+} from '../lib/api';
+import { VoiceCreator } from '../components/Settings/VoiceCreator';
 
 function OllamaModelList() {
   const [models, setModels] = useState<Array<{ name: string; size: number }>>([]);
@@ -120,7 +133,18 @@ export function SettingsPage() {
   const serverInfo = useAppStore((s) => s.serverInfo);
   const [healthy, setHealthy] = useState<boolean | null>(null);
   const [speechBackendAvailable, setSpeechBackendAvailable] = useState<boolean | null>(null);
+  const [ttsBackendName, setTtsBackendName] = useState<string | null>(null);
+  const [ttsAvailable, setTtsAvailable] = useState<boolean | null>(null);
+  const [ttsProbe, setTtsProbe] = useState<{ ok: boolean; reason?: string } | null>(null);
+  const [ttsProbing, setTtsProbing] = useState(false);
   const [saved, setSaved] = useState(false);
+
+  const [voices, setVoices] = useState<VoicesResponse>({ backend: null, clone_backend: null, builtin: [], custom: [] });
+  const [voiceCreatorOpen, setVoiceCreatorOpen] = useState(false);
+
+  const refreshVoices = () => {
+    fetchSpeechVoices().then(setVoices).catch(() => {});
+  };
 
   const [memoryStats, setMemoryStats] = useState<{ entries: number; backend: string } | null>(null);
   const [memoryEnabled, setMemoryEnabled] = useState(() => {
@@ -142,11 +166,19 @@ export function SettingsPage() {
   useEffect(() => {
     checkHealth().then(setHealthy);
     fetchSpeechHealth()
-      .then((h) => setSpeechBackendAvailable(h.available))
-      .catch(() => setSpeechBackendAvailable(false));
+      .then((h) => {
+        setSpeechBackendAvailable(h.available);
+        setTtsAvailable(!!h.tts_available);
+        setTtsBackendName(h.tts_backend ?? null);
+      })
+      .catch(() => {
+        setSpeechBackendAvailable(false);
+        setTtsAvailable(false);
+      });
     getMemoryStats()
       .then(setMemoryStats)
       .catch(() => setMemoryStats(null));
+    refreshVoices();
   }, []);
 
   const showSaved = () => {
@@ -508,6 +540,256 @@ export function SettingsPage() {
                 See the <a href="https://open-jarvis.github.io/OpenJarvis/user-guide/tools/" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-accent)' }}>documentation</a> for details.
               </div>
             )}
+            <SettingRow label="Real-time streaming" description="Stream the mic to the server so transcripts appear as you speak (auto-submits on silence)">
+              <button
+                onClick={() => { updateSettings({ speechStreaming: !settings.speechStreaming }); showSaved(); }}
+                className="relative w-11 h-6 rounded-full transition-colors cursor-pointer"
+                style={{
+                  background: settings.speechStreaming ? 'var(--color-accent)' : 'var(--color-bg-tertiary)',
+                }}
+              >
+                <span
+                  className="absolute top-0.5 left-0.5 w-5 h-5 rounded-full transition-transform bg-white"
+                  style={{
+                    transform: settings.speechStreaming ? 'translateX(20px)' : 'translateX(0)',
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
+                  }}
+                />
+              </button>
+            </SettingRow>
+            <SettingRow
+              label="Wake words"
+              description={
+                settings.wakeWords.length === 0
+                  ? 'Press mic to talk; leave blank for manual control'
+                  : `Mic stays open; messages must start with one of these phrases (${settings.wakeWords.length} configured)`
+              }
+            >
+              <textarea
+                value={settings.wakeWords.join('\n')}
+                onChange={(e) => {
+                  const list = e.target.value
+                    .split(/\r?\n/)
+                    .map((s) => s.trim())
+                    .filter(Boolean);
+                  updateSettings({ wakeWords: list });
+                  showSaved();
+                }}
+                placeholder={'Hey Jarvis\nJarvis\nOk Jarvis'}
+                rows={3}
+                className="text-sm px-2 py-1 rounded-lg outline-none w-56 resize-y"
+                style={{
+                  background: 'var(--color-bg-secondary)',
+                  color: 'var(--color-text)',
+                  border: '1px solid var(--color-border)',
+                  fontFamily: 'inherit',
+                }}
+              />
+            </SettingRow>
+            <SettingRow label="Text-to-Speech backend" description={ttsBackendName ? `Using ${ttsBackendName}` : 'No TTS backend configured'}>
+              <div className="flex items-center gap-2">
+                <span
+                  className="w-2 h-2 rounded-full"
+                  style={{
+                    background: ttsProbe?.ok ? 'var(--color-success)'
+                      : ttsProbe && !ttsProbe.ok ? 'var(--color-error)'
+                      : ttsBackendName ? 'var(--color-warning, #d97706)'
+                      : 'var(--color-text-tertiary)',
+                  }}
+                />
+                <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                  {ttsAvailable === null ? 'Checking...'
+                    : ttsProbe?.ok ? 'Available'
+                    : ttsProbe && !ttsProbe.ok ? 'Misconfigured'
+                    : ttsBackendName ? 'Loaded (test to verify)'
+                    : 'Not configured'}
+                </span>
+              </div>
+            </SettingRow>
+            <SettingRow label="Speak responses" description="Play assistant replies aloud as they stream (requires a working TTS backend)">
+              {(() => {
+                const ttsBlocked = !ttsBackendName || (ttsProbe && !ttsProbe.ok);
+                return (
+                  <button
+                    onClick={() => {
+                      if (ttsBlocked) return;
+                      updateSettings({ ttsAutoplay: !settings.ttsAutoplay }); showSaved();
+                    }}
+                    disabled={!!ttsBlocked}
+                    className="relative w-11 h-6 rounded-full transition-colors cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                    style={{
+                      background: settings.ttsAutoplay && !ttsBlocked ? 'var(--color-accent)' : 'var(--color-bg-tertiary)',
+                    }}
+                  >
+                    <span
+                      className="absolute top-0.5 left-0.5 w-5 h-5 rounded-full transition-transform bg-white"
+                      style={{
+                        transform: settings.ttsAutoplay && !ttsBlocked ? 'translateX(20px)' : 'translateX(0)',
+                        boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
+                      }}
+                    />
+                  </button>
+                );
+              })()}
+            </SettingRow>
+            {ttsBackendName && (
+              <SettingRow label="Voice" description={`${voices.builtin.length} built-in${voices.custom.length ? ` + ${voices.custom.length} custom` : ''}`}>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={settings.ttsVoice}
+                    onChange={(e) => { updateSettings({ ttsVoice: e.target.value }); showSaved(); }}
+                    className="text-sm px-2 py-1 rounded-lg outline-none cursor-pointer max-w-[14rem]"
+                    style={{
+                      background: 'var(--color-bg-secondary)',
+                      color: 'var(--color-text)',
+                      border: '1px solid var(--color-border)',
+                    }}
+                  >
+                    <option value="">Default</option>
+                    {voices.custom.length > 0 && (
+                      <optgroup label="Your voices">
+                        {voices.custom.map((v) => (
+                          <option key={v.id} value={v.id}>
+                            {v.kind === 'clone' ? '🎙 ' : '🎚 '}{v.name}
+                          </option>
+                        ))}
+                      </optgroup>
+                    )}
+                    {(() => {
+                      const langs: Record<string, BuiltinVoice[]> = {};
+                      for (const v of voices.builtin) {
+                        const k = v.lang || '?';
+                        (langs[k] ||= []).push(v);
+                      }
+                      const LANG_LABEL: Record<string, string> = {
+                        a: 'American English', b: 'British English', e: 'Spanish', f: 'French',
+                        h: 'Hindi', i: 'Italian', j: 'Japanese', p: 'Portuguese', z: 'Mandarin Chinese',
+                      };
+                      return Object.entries(langs).map(([lang, list]) => (
+                        <optgroup key={lang} label={LANG_LABEL[lang] || lang}>
+                          {list.map((v) => (
+                            <option key={v.id} value={v.id}>
+                              {v.name ? (v.gender === 'f' ? '♀ ' : v.gender === 'm' ? '♂ ' : '') + v.name : v.id}
+                            </option>
+                          ))}
+                        </optgroup>
+                      ));
+                    })()}
+                  </select>
+                </div>
+              </SettingRow>
+            )}
+            {ttsBackendName && (
+              <SettingRow label="Speed" description={`Playback rate (${settings.ttsSpeed.toFixed(2)}×)`}>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="range"
+                    min={0.5}
+                    max={2.0}
+                    step={0.05}
+                    value={settings.ttsSpeed}
+                    onChange={(e) => { updateSettings({ ttsSpeed: parseFloat(e.target.value) }); showSaved(); }}
+                    className="w-40 cursor-pointer"
+                    style={{ accentColor: 'var(--color-accent)' }}
+                  />
+                  <button
+                    onClick={() => { updateSettings({ ttsSpeed: 1.0 }); showSaved(); }}
+                    className="text-[10px] px-2 py-0.5 rounded cursor-pointer"
+                    style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text-tertiary)', border: '1px solid var(--color-border)' }}
+                    title="Reset to 1.00x"
+                  >
+                    Reset
+                  </button>
+                </div>
+              </SettingRow>
+            )}
+            {ttsBackendName && (
+              <SettingRow label="Custom voices" description="Mix existing voices or clone from a sample">
+                <button
+                  onClick={() => setVoiceCreatorOpen(true)}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer"
+                  style={{ background: 'var(--color-accent)', color: 'white' }}
+                >
+                  Create voice
+                </button>
+              </SettingRow>
+            )}
+            {voices.custom.length > 0 && (
+              <div className="mt-2 space-y-1.5">
+                {voices.custom.map((v) => (
+                  <div key={v.id} className="flex items-center justify-between px-3 py-2 rounded-lg text-xs"
+                    style={{ background: 'var(--color-bg-tertiary)' }}>
+                    <div className="flex items-center gap-2">
+                      <span style={{ color: 'var(--color-text)' }}>{v.kind === 'clone' ? '🎙' : '🎚'} {v.name}</span>
+                      <span style={{ color: 'var(--color-text-tertiary)' }}>
+                        {v.kind === 'mix' ? v.kokoro_voice : (v.has_audio ? 'cloned' : 'audio missing')}
+                      </span>
+                    </div>
+                    <button
+                      onClick={async () => {
+                        try {
+                          await deleteVoice(v.id);
+                          if (settings.ttsVoice === v.id) updateSettings({ ttsVoice: '' });
+                          refreshVoices();
+                        } catch {}
+                      }}
+                      className="cursor-pointer hover:opacity-70"
+                      style={{ color: 'var(--color-error)' }}
+                      aria-label="Delete voice"
+                      title="Delete voice"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            {ttsBackendName && (
+              <SettingRow label="Test voice" description="Synthesize a short phrase using the selected voice">
+                <button
+                  disabled={ttsProbing}
+                  onClick={async () => {
+                    setTtsProbing(true);
+                    setTtsProbe(null);
+                    const result = await synthesizeProbe('Hello, this is a test.', settings.ttsVoice, settings.ttsSpeed);
+                    setTtsProbe({ ok: result.ok, reason: result.reason });
+                    if (result.ok && result.blob) {
+                      try {
+                        const url = URL.createObjectURL(result.blob);
+                        const audio = new Audio(url);
+                        audio.onended = () => URL.revokeObjectURL(url);
+                        await audio.play();
+                      } catch {}
+                    }
+                    setTtsProbing(false);
+                  }}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+                  style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)' }}
+                >
+                  {ttsProbing ? 'Synthesizing...' : 'Test'}
+                </button>
+              </SettingRow>
+            )}
+            {ttsProbe && !ttsProbe.ok && (
+              <div className="text-xs mt-2 px-1 leading-relaxed" style={{ color: 'var(--color-text-tertiary)' }}>
+                <strong style={{ color: 'var(--color-error)' }}>TTS produced no audio.</strong>{' '}
+                {ttsBackendName === 'kokoro' ? (
+                  <>
+                    Kokoro is installed but its phonemizer requires the <code>espeak-ng</code> system binary.
+                    Install with <code>sudo apt install espeak-ng</code> (Linux/WSL), <code>brew install espeak</code> (macOS),
+                    or via the <a href="https://github.com/espeak-ng/espeak-ng/releases" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-accent)' }}>espeak-ng installer</a> (Windows), then restart the server.
+                  </>
+                ) : (
+                  <>Detail: {ttsProbe.reason || 'empty audio response'}</>
+                )}
+              </div>
+            )}
+            {!ttsBackendName && ttsAvailable !== null && (
+              <div className="text-xs mt-2 px-1" style={{ color: 'var(--color-text-tertiary)' }}>
+                No TTS backend loaded. Install kokoro with <code>uv pip install kokoro</code> for local synthesis,
+                or set <code>CARTESIA_API_KEY</code>/<code>OPENAI_API_KEY</code> for cloud TTS.
+              </div>
+            )}
           </Section>
 
           {/* Data */}
@@ -582,6 +864,13 @@ export function SettingsPage() {
           </Section>
         </div>
       </div>
+      <VoiceCreator
+        open={voiceCreatorOpen}
+        onClose={() => setVoiceCreatorOpen(false)}
+        builtin={voices.builtin}
+        cloneSupported={!!voices.clone_backend}
+        onCreated={refreshVoices}
+      />
     </div>
   );
 }

@@ -18,6 +18,7 @@ export interface CachedConnector {
   display_name: string;
   connected: boolean;
   chunks: number;
+  auth_type?: 'oauth' | 'local' | 'bridge' | 'filesystem';
 }
 
 export interface AgentEvent {
@@ -30,6 +31,7 @@ export interface AgentEvent {
 
 const CONVERSATIONS_KEY = 'openjarvis-conversations';
 const SETTINGS_KEY = 'openjarvis-settings';
+const SELECTED_MODEL_KEY = 'openjarvis-selected-model';
 const OPTIN_KEY = 'openjarvis-optin';
 const OPTIN_NAME_KEY = 'openjarvis-display-name';
 const OPTIN_EMAIL_KEY = 'openjarvis-email';
@@ -73,6 +75,11 @@ interface Settings {
   temperature: number;
   maxTokens: number;
   speechEnabled: boolean;
+  speechStreaming: boolean;
+  ttsAutoplay: boolean;
+  ttsVoice: string;
+  ttsSpeed: number;
+  wakeWords: string[];
 }
 
 function loadSettings(): Settings {
@@ -85,6 +92,11 @@ function loadSettings(): Settings {
     temperature: 0.7,
     maxTokens: 4096,
     speechEnabled: false,
+    speechStreaming: true,
+    ttsAutoplay: false,
+    ttsVoice: '',
+    ttsSpeed: 1.0,
+    wakeWords: [],
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
@@ -230,7 +242,9 @@ export const useAppStore = create<AppState>((set, get) => {
 
     models: [],
     modelsLoading: true,
-    selectedModel: '',
+    // Restore last user choice on cold start; App.tsx validates it against the
+    // fetched model list and falls back to `m[0].id` if the stored id is gone.
+    selectedModel: (() => { try { return localStorage.getItem(SELECTED_MODEL_KEY) || ''; } catch { return ''; } })(),
     serverInfo: null,
     savings: null,
 
@@ -410,7 +424,10 @@ export const useAppStore = create<AppState>((set, get) => {
 
     setModels: (models: ModelInfo[]) => set({ models }),
     setModelsLoading: (loading: boolean) => set({ modelsLoading: loading }),
-    setSelectedModel: (model: string) => set({ selectedModel: model }),
+    setSelectedModel: (model: string) => {
+      try { localStorage.setItem(SELECTED_MODEL_KEY, model); } catch {}
+      set({ selectedModel: model });
+    },
     setServerInfo: (info: ServerInfo | null) => set({ serverInfo: info }),
     setSavings: (data: SavingsData | null) => set({ savings: data }),
 

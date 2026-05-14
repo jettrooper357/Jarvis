@@ -18,19 +18,45 @@ your machine and the frontend connects via `localhost`.
 
 ### One-command setup
 
-```bash
-git clone https://github.com/open-jarvis/OpenJarvis.git
-cd OpenJarvis
-./scripts/quickstart.sh
-```
+=== "macOS / Linux"
 
-The script handles everything:
+    ```bash
+    git clone https://github.com/open-jarvis/OpenJarvis.git
+    cd OpenJarvis
+    ./scripts/quickstart.sh
+    ```
 
-1. Checks for Python 3.10+ and Node.js 18+
-2. Installs Ollama if not present and pulls a starter model
-3. Installs Python and frontend dependencies
-4. Starts the backend API server and frontend dev server
-5. Opens `http://localhost:5173` in your browser
+    The script handles everything:
+
+    1. Checks for Python 3.10+ and Node.js 18+
+    2. Installs `espeak-ng` (system dep for local TTS)
+    3. Installs Ollama if not present and pulls a starter model
+    4. Installs Python and frontend dependencies (`speech` + `speech-tts-kokoro` extras)
+    5. Starts the backend API server and frontend dev server
+    6. Opens `http://localhost:5173` in your browser
+
+=== "Windows"
+
+    ```batch
+    git clone https://github.com/open-jarvis/OpenJarvis.git
+    cd OpenJarvis
+    start.bat
+    ```
+
+    The launcher handles everything inside WSL:
+
+    1. Verifies WSL + a default Linux distro
+    2. Verifies Node.js + npm on Windows
+    3. Installs `uv` inside WSL if missing
+    4. Installs `espeak-ng` inside WSL if missing (system dep for local TTS)
+    5. Runs `uv sync` with the `speech` + `speech-tts-kokoro` extras
+    6. Spawns the backend in one console window and the frontend in another
+
+    Pre-requisites the script can't install for you:
+
+    - WSL2 + Ubuntu: `wsl --install -d Ubuntu` from an admin PowerShell
+    - Node.js 18+: <https://nodejs.org>
+    - Ollama (only if you're using the default `ollama` engine): <https://ollama.com>
 
 ### Manual setup
 

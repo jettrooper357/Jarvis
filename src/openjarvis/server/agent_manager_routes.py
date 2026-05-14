@@ -23,12 +23,16 @@ class CreateAgentRequest(BaseModel):
     agent_type: str = "monitor_operative"
     config: Optional[Dict[str, Any]] = None
     template_id: Optional[str] = None
+    org_role: Optional[str] = None
+    manager_agent_id: Optional[str] = None
 
 
 class UpdateAgentRequest(BaseModel):
     name: Optional[str] = None
     agent_type: Optional[str] = None
     config: Optional[Dict[str, Any]] = None
+    org_role: Optional[str] = None
+    manager_agent_id: Optional[str] = None
 
 
 class CreateTaskRequest(BaseModel):
@@ -402,6 +406,9 @@ def _build_deep_research_tools(
     engine: Any,
     model: str,
     knowledge_db_path: str = "",
+    *,
+    include_delegation_tools: bool = False,
+    execution_context: Any = None,
 ) -> list:
     """Build the 4 DeepResearch tools from a KnowledgeStore.
 
@@ -414,24 +421,47 @@ def _build_deep_research_tools(
 
         knowledge_db_path = str(DEFAULT_CONFIG_DIR / "knowledge.db")
 
-    if not Path(knowledge_db_path).exists():
-        return []
+    tools = []
+    if Path(knowledge_db_path).exists():
+        from openjarvis.connectors.retriever import TwoStageRetriever
+        from openjarvis.connectors.store import KnowledgeStore
+        from openjarvis.tools.knowledge_search import KnowledgeSearchTool
+        from openjarvis.tools.knowledge_sql import KnowledgeSQLTool
+        from openjarvis.tools.scan_chunks import ScanChunksTool
+        from openjarvis.tools.think import ThinkTool
 
-    from openjarvis.connectors.retriever import TwoStageRetriever
-    from openjarvis.connectors.store import KnowledgeStore
-    from openjarvis.tools.knowledge_search import KnowledgeSearchTool
-    from openjarvis.tools.knowledge_sql import KnowledgeSQLTool
-    from openjarvis.tools.scan_chunks import ScanChunksTool
-    from openjarvis.tools.think import ThinkTool
+        store = KnowledgeStore(knowledge_db_path)
+        retriever = TwoStageRetriever(store)
+        tools.extend(
+            [
+                KnowledgeSearchTool(retriever=retriever),
+                KnowledgeSQLTool(store=store),
+                ScanChunksTool(store=store, engine=engine, model=model),
+                ThinkTool(),
+            ]
+        )
+    if include_delegation_tools:
+        try:
+            from openjarvis.server.managed_agent_runtime import _build_tool_instances
 
-    store = KnowledgeStore(knowledge_db_path)
-    retriever = TwoStageRetriever(store)
-    return [
-        KnowledgeSearchTool(retriever=retriever),
-        KnowledgeSQLTool(store=store),
-        ScanChunksTool(store=store, engine=engine, model=model),
-        ThinkTool(),
-    ]
+            tools.extend(
+                _build_tool_instances(
+                    (
+                        "managed_agent_directory",
+                        "managed_agent_delegate",
+                        "managed_agent_message",
+                        "managed_agent_assign_task",
+                        "managed_agent_list_tasks",
+                        "managed_agent_update_task",
+                    ),
+                    engine=engine,
+                    model=model,
+                    execution_context=execution_context,
+                )
+            )
+        except Exception:
+            logger.exception("Failed to add managed-agent delegation tools")
+    return tools
 
 
 def _merge_tool_call_fragments(
@@ -460,6 +490,31 @@ def _merge_tool_call_fragments(
             entry["function"]["name"] += fn["name"]
         if fn.get("arguments"):
             entry["function"]["arguments"] += fn["arguments"]
+
+
+def _effective_agent_tool_names(agent_record: Dict[str, Any]) -> List[str]:
+    config = agent_record.get("config", {}) or {}
+    names: List[Any] = []
+    for entry in config.get("tools") or []:
+        if isinstance(entry, dict):
+            names.append(entry)
+            continue
+        if isinstance(entry, str):
+            cleaned = entry.strip()
+            if cleaned and cleaned not in names:
+                names.append(cleaned)
+    if str(agent_record.get("name", "")).strip().casefold() == "my assistant":
+        for tool_name in (
+            "managed_agent_directory",
+            "managed_agent_delegate",
+            "managed_agent_message",
+            "managed_agent_assign_task",
+            "managed_agent_list_tasks",
+            "managed_agent_update_task",
+        ):
+            if tool_name not in names:
+                names.append(tool_name)
+    return names
 
 
 def _get_mcp_tools(app_state: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -632,10 +687,24 @@ async def _stream_managed_agent(
     import uuid
 
     from openjarvis.core.types import Message, Role
+    from openjarvis.server.managed_agent_runtime import (
+        ManagedAgentExecutionContext,
+        ManagedAgentRuntime,
+        use_managed_agent_context,
+    )
 
     agent_id = agent_record["id"]
     config = agent_record.get("config", {})
-    model = config.get("model", getattr(engine, "_model", ""))
+    # Fall back to the server's configured default model when the agent
+    # template/record doesn't pin a specific one. Without the final
+    # app_state.model fallback, an unconfigured agent sends model="" to
+    # Ollama and gets back `400: model is required`.
+    model = (
+        config.get("model")
+        or getattr(engine, "_model", "")
+        or getattr(app_state, "model", "")
+        or ""
+    )
     system_prompt = config.get("system_prompt")
     temperature = config.get("temperature", 0.7)
     max_tokens = config.get("max_tokens", 1024)
@@ -648,10 +717,25 @@ async def _stream_managed_agent(
 
     # Resolve agent type and class for DeepResearch tool wiring
     agent_type = agent_record.get("agent_type", "")
+    managed_runtime = ManagedAgentRuntime(
+        manager,
+        engine,
+        bus=bus,
+        default_model=getattr(app_state, "model", "") if app_state is not None else "",
+    )
+    runtime_context = ManagedAgentExecutionContext(
+        runtime=managed_runtime,
+        manager=manager,
+        engine=engine,
+        current_agent_id=agent_id,
+        visited_agent_ids=(),
+    )
     if agent_type == "deep_research":
         dr_tools = _build_deep_research_tools(
             engine=engine,
             model=model,
+            include_delegation_tools=True,
+            execution_context=runtime_context,
         )
         # Store on app_state so streaming loop can access them
         if app_state is not None and dr_tools:
@@ -781,7 +865,8 @@ async def _stream_managed_agent(
                 def _run_agent():
                     agent_metadata = {}
                     try:
-                        result = dr_agent.run(user_content)
+                        with use_managed_agent_context(runtime_context):
+                            result = dr_agent.run(user_content)
                         content = result.content or "No results found."
                         agent_metadata = result.metadata or {}
                     except Exception as exc:
@@ -956,7 +1041,7 @@ async def _stream_managed_agent(
     # Template stores tool names as strings; convert to OpenAI function specs
     # so the engine can actually bind them to the model.
     stream_kwargs: Dict[str, Any] = {}
-    resolved_tools = _resolve_tool_specs(config.get("tools"))
+    resolved_tools = _resolve_tool_specs(_effective_agent_tool_names(agent_record))
     if resolved_tools:
         stream_kwargs["tools"] = resolved_tools
 
@@ -1175,7 +1260,17 @@ async def _stream_managed_agent(
 
                             tool_cls = ToolRegistry.get(tool_name)
                             if tool_cls is not None:
-                                tool_instance = tool_cls()
+                                if tool_name in (
+                                    "managed_agent_directory",
+                                    "managed_agent_delegate",
+                                    "managed_agent_message",
+                                    "managed_agent_assign_task",
+                                    "managed_agent_list_tasks",
+                                    "managed_agent_update_task",
+                                ):
+                                    tool_instance = tool_cls(context=runtime_context)
+                                else:
+                                    tool_instance = tool_cls()
                                 # Tools the user explicitly added to this
                                 # agent's toolkit are considered pre-approved —
                                 # selecting them in the wizard is the
@@ -1190,13 +1285,14 @@ async def _stream_managed_agent(
                                     interactive=True,
                                     confirm_callback=lambda _prompt: True,
                                 )
-                                result = executor.execute(
-                                    StubToolCall(
-                                        id=tc["id"],
-                                        name=tool_name,
-                                        arguments=tool_args,
-                                    ),
-                                )
+                                with use_managed_agent_context(runtime_context):
+                                    result = executor.execute(
+                                        StubToolCall(
+                                            id=tc["id"],
+                                            name=tool_name,
+                                            arguments=tool_args,
+                                        ),
+                                    )
                                 tool_result_content = result.content
                             else:
                                 logger.warning(
@@ -1319,14 +1415,25 @@ def create_agent_manager_router(
 
     @agents_router.post("")
     async def create_agent(req: CreateAgentRequest, request: Request):
-        if req.template_id:
-            agent = manager.create_from_template(
-                req.template_id, req.name, overrides=req.config
-            )
-        else:
-            agent = manager.create_agent(
-                name=req.name, agent_type=req.agent_type, config=req.config
-            )
+        try:
+            if req.template_id:
+                agent = manager.create_from_template(
+                    req.template_id,
+                    req.name,
+                    overrides=req.config,
+                    org_role=req.org_role or "",
+                    manager_agent_id=req.manager_agent_id,
+                )
+            else:
+                agent = manager.create_agent(
+                    name=req.name,
+                    agent_type=req.agent_type,
+                    config=req.config,
+                    org_role=req.org_role or "",
+                    manager_agent_id=req.manager_agent_id,
+                )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         # Register with scheduler if cron/interval
         scheduler = getattr(request.app.state, "agent_scheduler", None)
@@ -1348,13 +1455,24 @@ def create_agent_manager_router(
         if not manager.get_agent(agent_id):
             raise HTTPException(status_code=404, detail="Agent not found")
         kwargs: Dict[str, Any] = {}
+        if hasattr(req, "model_fields_set"):
+            fields_set = req.model_fields_set
+        else:
+            fields_set = getattr(req, "__fields_set__", set())
         if req.name is not None:
             kwargs["name"] = req.name
         if req.agent_type is not None:
             kwargs["agent_type"] = req.agent_type
         if req.config is not None:
             kwargs["config"] = req.config
-        return manager.update_agent(agent_id, **kwargs)
+        if req.org_role is not None:
+            kwargs["org_role"] = req.org_role
+        if "manager_agent_id" in fields_set:
+            kwargs["manager_agent_id"] = req.manager_agent_id
+        try:
+            return manager.update_agent(agent_id, **kwargs)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @agents_router.delete("/{agent_id}")
     async def delete_agent(agent_id: str):
@@ -1527,7 +1645,11 @@ def create_agent_manager_router(
                                 _build_deep_research_tools,
                             )
 
-                            tools = _build_deep_research_tools(engine=engine, model="")
+                            tools = _build_deep_research_tools(
+                                engine=engine,
+                                model="",
+                                include_delegation_tools=True,
+                            )
                             if tools:
                                 from openjarvis.agents.deep_research import (
                                     DeepResearchAgent,
@@ -1535,7 +1657,10 @@ def create_agent_manager_router(
 
                                 agent_inst = DeepResearchAgent(
                                     engine=engine,
-                                    model=getattr(engine, "_model", ""),
+                                    model=(
+                                        getattr(engine, "_model", "")
+                                        or getattr(request.app.state, "model", "")
+                                    ),
                                     tools=tools,
                                     interactive=True,
                                     confirm_callback=lambda _prompt: True,
@@ -1581,7 +1706,10 @@ def create_agent_manager_router(
                     # Create or update the channel bridge
                     bridge = getattr(request.app.state, "channel_bridge", None)
                     if bridge and hasattr(bridge, "_channels"):
-                        bridge._channels["sendblue"] = sb_channel
+                        if hasattr(bridge, "add_channel"):
+                            bridge.add_channel("sendblue", sb_channel)
+                        else:
+                            bridge._channels["sendblue"] = sb_channel
                     else:
                         # Create a new ChannelBridge with DeepResearch
                         from openjarvis.server.channel_bridge import (

@@ -19,12 +19,21 @@ import { getBase, isTauri } from '../lib/api';
 import {
   Database, MessageSquare, Loader2, Brain, Search, FolderOpen, FileText,
   Mail, Hash, MessageCircle, CalendarDays, Contact, StickyNote, BookText,
-  Package, Upload, Link2, PhoneCall,
+  Package, Upload, Link2, PhoneCall, AlertTriangle, RefreshCw, CheckCircle2,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { SOURCE_CATALOG } from '../types/connectors';
 import type { ConnectRequest } from '../types/connectors';
-import { listConnectors, connectSource, getSyncStatus, triggerSync } from '../lib/connectors-api';
+import {
+  listConnectors,
+  connectSource,
+  getSyncStatus,
+  triggerSync,
+  saveOAuthClient,
+  fetchTelegramConfig,
+  saveTelegramConfig,
+  fetchTelegramHealth,
+} from '../lib/connectors-api';
 import type { SyncStatus } from '../types/connectors';
 
 // ---------------------------------------------------------------------------
@@ -489,6 +498,187 @@ function SyncStatusDisplay({
   );
 }
 
+// ---------------------------------------------------------------------------
+// Re-authorize an already-connected OAuth source (kicks off the consent flow)
+// ---------------------------------------------------------------------------
+
+function OAuthReauthorize({
+  connectorId,
+  displayName,
+  onDone,
+}: {
+  connectorId: string;
+  displayName: string;
+  onDone: () => void;
+}) {
+  const [waiting, setWaiting] = useState(false);
+
+  const start = () => {
+    const url = `${getBase()}/v1/connectors/${encodeURIComponent(connectorId)}/oauth/start`;
+    window.open(url, '_blank', 'width=600,height=700');
+    setWaiting(true);
+    const startedAt = Date.now();
+    const interval = setInterval(async () => {
+      try {
+        const info = await fetch(`${getBase()}/v1/connectors/${encodeURIComponent(connectorId)}`).then((r) => r.json());
+        if (info.connected) {
+          // OAuth flow signals completion by the connector flipping to connected
+          // *with* fresh tokens. We can't directly observe scopes, but the next
+          // sync attempt will surface a 403 again if scopes were unchecked.
+          clearInterval(interval);
+          setWaiting(false);
+          onDone();
+        }
+      } catch { /* ignore polling errors */ }
+      if (Date.now() - startedAt > 180_000) {
+        clearInterval(interval);
+        setWaiting(false);
+      }
+    }, 2000);
+  };
+
+  return (
+    <div style={{ borderTop: '1px solid var(--color-border)', padding: 12 }}>
+      <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 10 }}>
+        Re-authorize {displayName}. Google will open in a new window — be sure to
+        leave every box checked (especially anything mentioning Gmail) so the new
+        access token carries the right scopes.
+      </div>
+      {waiting ? (
+        <div style={{ fontSize: 12, color: 'var(--color-accent)' }}>
+          Waiting for authorization… complete it in the popup, then this card refreshes.
+        </div>
+      ) : (
+        <button
+          onClick={start}
+          style={{
+            fontSize: 12, padding: '6px 14px',
+            background: 'var(--color-accent-purple)',
+            color: 'var(--color-on-accent)',
+            border: 'none', borderRadius: 4,
+            cursor: 'pointer', fontWeight: 600,
+          }}
+        >
+          Re-authorize with Google
+        </button>
+      )}
+    </div>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// Paste-the-Google-OAuth-client-JSON form
+// ---------------------------------------------------------------------------
+
+function GoogleOAuthClientForm() {
+  const [open, setOpen] = useState(false);
+  const [raw, setRaw] = useState('');
+  const [status, setStatus] = useState<
+    { kind: 'idle' }
+    | { kind: 'saving' }
+    | { kind: 'ok'; preview: string }
+    | { kind: 'err'; msg: string }
+  >({ kind: 'idle' });
+
+  const submit = async () => {
+    setStatus({ kind: 'saving' });
+    let payload: unknown;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      setStatus({ kind: 'err', msg: 'Not valid JSON. Paste the full contents of client_secret_*.json.' });
+      return;
+    }
+    try {
+      const res = await saveOAuthClient('google', payload);
+      setStatus({ kind: 'ok', preview: res.client_id_preview });
+      setRaw('');
+    } catch (err: any) {
+      setStatus({ kind: 'err', msg: err.message || 'Save failed' });
+    }
+  };
+
+  return (
+    <section
+      className="hud-panel"
+      style={{ padding: '12px 16px' }}
+    >
+      <button
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          width: '100%',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          background: 'transparent', border: 'none', cursor: 'pointer',
+          padding: 0,
+        }}
+      >
+        <div style={{ textAlign: 'left' }}>
+          <div className="hud-label" style={{ marginBottom: 2 }}>
+            Google OAuth client credentials
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>
+            Paste your <code>client_secret_*.json</code> here so every Google connector
+            (Gmail / Drive / Calendar / Tasks / Contacts) can use it.
+          </div>
+        </div>
+        <span style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>
+          {open ? '–' : '+'}
+        </span>
+      </button>
+
+      {open && (
+        <div style={{ marginTop: 10 }}>
+          <textarea
+            value={raw}
+            onChange={(e) => setRaw(e.target.value)}
+            placeholder={'{\n  "installed": {\n    "client_id": "...apps.googleusercontent.com",\n    "client_secret": "..."\n  }\n}'}
+            rows={6}
+            style={{
+              width: '100%',
+              background: 'var(--color-bg-secondary)',
+              border: '1px solid var(--color-border)',
+              borderRadius: 4, color: 'var(--color-text)',
+              fontSize: 11, padding: '8px 10px',
+              fontFamily: 'monospace',
+              boxSizing: 'border-box',
+              resize: 'vertical',
+            }}
+          />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
+            <button
+              onClick={submit}
+              disabled={status.kind === 'saving' || !raw.trim()}
+              style={{
+                fontSize: 12, padding: '6px 16px',
+                background: status.kind === 'saving' || !raw.trim()
+                  ? 'var(--color-disabled-bg)'
+                  : 'var(--color-accent-purple)',
+                color: 'var(--color-on-accent)',
+                border: 'none', borderRadius: 4, cursor: 'pointer',
+                fontWeight: 600,
+              }}
+            >
+              {status.kind === 'saving' ? 'Saving…' : 'Save'}
+            </button>
+            {status.kind === 'ok' && (
+              <span style={{ fontSize: 11, color: 'var(--color-success)' }}>
+                Saved. client_id = {status.preview}. Click Reconnect on a Google connector to use it.
+              </span>
+            )}
+            {status.kind === 'err' && (
+              <span style={{ fontSize: 11, color: 'var(--color-error)' }}>
+                {status.msg}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+
 function DataSourcesSection() {
   const cachedConnectors = useAppStore((s) => s.cachedConnectors);
   const setCachedConnectors = useAppStore((s) => s.setCachedConnectors);
@@ -507,6 +697,7 @@ function DataSourcesSection() {
             display_name: c.display_name,
             connected: c.connected,
             chunks: (c as any).chunks || 0,
+            auth_type: c.auth_type,
           })),
         ),
       )
@@ -633,6 +824,8 @@ function DataSourcesSection() {
 
   return (
     <div className="flex flex-col gap-5">
+      <GoogleOAuthClientForm />
+
       {/* Connected sources */}
       {connected.length > 0 && (
         <section>
@@ -688,6 +881,9 @@ function DataSourcesSection() {
                     {isReconnecting ? 'Cancel' : 'Reconnect'}
                   </button>
                 </div>
+                {isReconnecting && c.auth_type === 'oauth' && !meta?.steps && (
+                  <OAuthReauthorize connectorId={c.connector_id} displayName={c.display_name} onDone={() => { setExpandedId(null); loadConnectors(); loadSyncStatuses(); }} />
+                )}
                 {isReconnecting && meta?.steps && (
                   <div style={{ borderTop: '1px solid var(--color-border)', padding: 12 }}>
                     <div style={{ fontSize: 12, color: 'var(--color-warning)', marginBottom: 8 }}>
@@ -926,6 +1122,27 @@ const MESSAGING_CHANNELS: MessagingChannelConfig[] = [
     ],
     activeLabel: () => 'Connected to Slack',
     howToUse: () => 'Open Slack and DM @OpenJarvis to talk to your agent.',
+  },
+  {
+    type: 'telegram',
+    name: 'Telegram',
+    icon: '✈',
+    description: 'DM this agent on Telegram via a shared bot',
+    setupSteps: [
+      '1. Create one Telegram bot via @BotFather (use the same bot for every agent).',
+      '2. Put its token in ~/.openjarvis/config.toml under [channels.telegram] bot_token = "..." and restart the server.',
+      '3. Open Telegram, talk to your bot once (any message), then visit @userinfobot or @getmyid_bot to read your numeric chat ID.',
+      '4. Paste that chat ID below. You can dedicate that chat to this agent, or reuse the same chat for multiple agents and target one explicitly with /agent <id> <message>.',
+    ],
+    fields: [
+      { key: 'channel', label: 'Telegram Chat ID', placeholder: '123456789', type: 'text', required: true },
+    ],
+    activeLabel: (cfg) =>
+      cfg.channel ? `Chat ID ${String(cfg.channel)}` : 'Telegram connected',
+    howToUse: (cfg) =>
+      cfg.channel
+        ? `Message your bot from chat ${String(cfg.channel)}. If this chat is shared across agents, use /agent <id> <message> to route to a specific one.`
+        : 'Message your bot from the bound chat. If that chat is shared across agents, use /agent <id> <message> to target one.',
   },
 ];
 
@@ -1259,6 +1476,286 @@ function SendBlueSection({
   );
 }
 
+// ---------------------------------------------------------------------------
+// Global Telegram bot config (shared by every agent's chat-ID binding)
+// ---------------------------------------------------------------------------
+
+function TelegramBotConfigForm() {
+  const [hasToken, setHasToken] = useState(false);
+  const [tokenPreview, setTokenPreview] = useState('');
+  const [botToken, setBotToken] = useState('');
+  const [showBotToken, setShowBotToken] = useState(false);
+  const [allowedChatIds, setAllowedChatIds] = useState('');
+  const [health, setHealth] = useState<
+    { kind: 'idle' }
+    | { kind: 'checking' }
+    | { kind: 'ok'; msg: string; botUsername?: string }
+    | { kind: 'err'; msg: string; detail?: string }
+  >({ kind: 'idle' });
+  const [status, setStatus] = useState<
+    { kind: 'idle' }
+    | { kind: 'saving' }
+    | { kind: 'ok'; restart: boolean }
+    | { kind: 'err'; msg: string }
+  >({ kind: 'idle' });
+
+  const checkHealth = useCallback(async () => {
+    setHealth({ kind: 'checking' });
+    try {
+      const result = await fetchTelegramHealth();
+      if (result.status === 'ok') {
+        setHealth({
+          kind: 'ok',
+          msg: result.message,
+          botUsername: result.bot_username || undefined,
+        });
+        return;
+      }
+      if (result.status === 'not_configured') {
+        setHealth({ kind: 'idle' });
+        return;
+      }
+      setHealth({
+        kind: 'err',
+        msg: result.message,
+        detail: result.detail,
+      });
+    } catch (err: any) {
+      setHealth({
+        kind: 'err',
+        msg: err?.message || 'Failed to check Telegram connectivity.',
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchTelegramConfig()
+      .then((cfg) => {
+        setHasToken(cfg.has_token);
+        setTokenPreview(cfg.token_preview);
+        setBotToken(cfg.bot_token || '');
+        setAllowedChatIds(cfg.allowed_chat_ids || '');
+        if (cfg.has_token) {
+          checkHealth().catch(() => {});
+        } else {
+          setHealth({ kind: 'idle' });
+        }
+      })
+      .catch(() => {});
+  }, [checkHealth]);
+
+  const submit = async () => {
+    const token = botToken.trim();
+    if (!token) {
+      setStatus({ kind: 'err', msg: 'Bot token is required.' });
+      return;
+    }
+    setStatus({ kind: 'saving' });
+    try {
+      const res = await saveTelegramConfig(token, allowedChatIds.trim());
+      setHasToken(true);
+      setTokenPreview(res.token_preview);
+      setBotToken(res.bot_token || token);
+      setStatus({ kind: 'ok', restart: res.restart_required });
+      await checkHealth();
+    } catch (err: any) {
+      setStatus({ kind: 'err', msg: err.message || 'Save failed' });
+    }
+  };
+
+  return (
+    <section
+      style={{
+        background: 'var(--color-bg-secondary)',
+        border: hasToken
+          ? '1px solid color-mix(in srgb, var(--color-success) 22%, transparent)'
+          : '1px dashed var(--color-border)',
+        borderRadius: 8,
+        padding: '14px 16px',
+        marginBottom: 12,
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+        <span style={{ fontSize: 18 }}>✈</span>
+        <div style={{ flex: 1, fontWeight: 600, fontSize: 13, color: 'var(--color-text)' }}>
+          Telegram bot
+        </div>
+        {hasToken && (
+          <span
+            style={{
+              fontSize: 10, padding: '2px 8px',
+              borderRadius: 999,
+              background: 'color-mix(in srgb, var(--color-success) 18%, transparent)',
+              color: 'var(--color-success)',
+            }}
+          >
+            Saved · {tokenPreview}
+          </span>
+        )}
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginBottom: 10 }}>
+        One bot, many agents. Set the token once here; per-agent chat IDs go in the cards below.
+        Get a token from <code>@BotFather</code> on Telegram.
+      </div>
+
+      {health.kind === 'err' && (
+        <div
+          style={{
+            display: 'flex',
+            gap: 10,
+            alignItems: 'flex-start',
+            padding: '10px 12px',
+            borderRadius: 6,
+            marginBottom: 10,
+            background: 'color-mix(in srgb, var(--color-warning) 12%, var(--color-bg))',
+            border: '1px solid color-mix(in srgb, var(--color-warning) 26%, transparent)',
+            color: 'var(--color-text)',
+          }}
+        >
+          <AlertTriangle size={15} style={{ color: 'var(--color-warning)', flexShrink: 0, marginTop: 1 }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 2, color: 'var(--color-warning)' }}>
+              Telegram connection issue
+            </div>
+            <div style={{ fontSize: 11, lineHeight: 1.5 }}>
+              {health.msg}
+            </div>
+            {health.detail && (
+              <div style={{ fontSize: 10, marginTop: 4, color: 'var(--color-text-tertiary)', wordBreak: 'break-word' }}>
+                {health.detail}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {health.kind === 'ok' && (
+        <div
+          style={{
+            display: 'flex',
+            gap: 10,
+            alignItems: 'flex-start',
+            padding: '10px 12px',
+            borderRadius: 6,
+            marginBottom: 10,
+            background: 'color-mix(in srgb, var(--color-success) 10%, var(--color-bg))',
+            border: '1px solid color-mix(in srgb, var(--color-success) 22%, transparent)',
+            color: 'var(--color-text)',
+          }}
+        >
+          <CheckCircle2 size={15} style={{ color: 'var(--color-success)', flexShrink: 0, marginTop: 1 }} />
+          <div style={{ fontSize: 11, lineHeight: 1.5 }}>
+            {health.msg}
+            {health.botUsername ? ` Connected as @${health.botUsername}.` : ''}
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 3 }}>
+        <label style={{ display: 'block', fontSize: 11, color: 'var(--color-text-secondary)', fontWeight: 500 }}>
+          Bot Token {hasToken ? '' : '*'}
+        </label>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {hasToken && (
+            <button
+              type="button"
+              onClick={() => checkHealth().catch(() => {})}
+              disabled={health.kind === 'checking'}
+              style={{
+                border: 'none',
+                background: 'transparent',
+                color: 'var(--color-accent)',
+                fontSize: 11,
+                fontWeight: 600,
+                cursor: health.kind === 'checking' ? 'default' : 'pointer',
+                padding: 0,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 4,
+                opacity: health.kind === 'checking' ? 0.7 : 1,
+              }}
+            >
+              <RefreshCw size={11} className={health.kind === 'checking' ? 'animate-spin' : ''} />
+              {health.kind === 'checking' ? 'Checking…' : 'Check connection'}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setShowBotToken((value) => !value)}
+            style={{
+              border: 'none',
+              background: 'transparent',
+              color: 'var(--color-accent)',
+              fontSize: 11,
+              fontWeight: 600,
+              cursor: 'pointer',
+              padding: 0,
+            }}
+          >
+            {showBotToken ? 'Hide' : 'Show'}
+          </button>
+        </div>
+      </div>
+      <input
+        type={showBotToken ? 'text' : 'password'}
+        value={botToken}
+        onChange={(e) => setBotToken(e.target.value)}
+        placeholder={hasToken ? 'Paste a new token to replace the current one' : '1234567890:AA…'}
+        style={{
+          width: '100%', padding: '7px 10px',
+          background: 'var(--color-bg)',
+          border: '1px solid var(--color-border)',
+          borderRadius: 4, color: 'var(--color-text)',
+          fontSize: 12, marginBottom: 10, boxSizing: 'border-box',
+        }}
+      />
+
+      <label style={{ display: 'block', fontSize: 11, color: 'var(--color-text-secondary)', marginBottom: 3, fontWeight: 500 }}>
+        Allowed Chat IDs (optional)
+      </label>
+      <input
+        type="text"
+        value={allowedChatIds}
+        onChange={(e) => setAllowedChatIds(e.target.value)}
+        placeholder="Comma-separated chat IDs. Leave empty to allow all."
+        style={{
+          width: '100%', padding: '7px 10px',
+          background: 'var(--color-bg)',
+          border: '1px solid var(--color-border)',
+          borderRadius: 4, color: 'var(--color-text)',
+          fontSize: 12, marginBottom: 10, boxSizing: 'border-box',
+        }}
+      />
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <button
+          onClick={submit}
+          disabled={status.kind === 'saving'}
+          style={{
+            fontSize: 12, padding: '7px 18px',
+            background: status.kind === 'saving' ? 'var(--color-disabled-bg)' : 'var(--color-accent-purple)',
+            color: 'var(--color-on-accent)', border: 'none',
+            borderRadius: 4, cursor: 'pointer', fontWeight: 600,
+          }}
+        >
+          {status.kind === 'saving' ? 'Saving…' : hasToken ? 'Update' : 'Save'}
+        </button>
+        {status.kind === 'ok' && (
+          <span style={{ fontSize: 11, color: 'var(--color-success)' }}>
+            Saved.{status.restart ? ' Restart the backend to activate the bot.' : ''}
+          </span>
+        )}
+        {status.kind === 'err' && (
+          <span style={{ fontSize: 11, color: 'var(--color-error)' }}>
+            {status.msg}
+          </span>
+        )}
+      </div>
+    </section>
+  );
+}
+
+
 function MessagingSection({ agentId }: { agentId: string }) {
   const [bindings, setBindings] = useState<ChannelBinding[]>([]);
   const [setupType, setSetupType] = useState<string | null>(null);
@@ -1308,6 +1805,9 @@ function MessagingSection({ agentId }: { agentId: string }) {
 
   return (
     <div>
+      {/* Global Telegram bot config (shared by all agents) */}
+      <TelegramBotConfigForm />
+
       {/* SendBlue */}
       <SendBlueSection
         agentId={agentId}

@@ -248,6 +248,131 @@ export interface SpeechHealth {
   available: boolean;
   backend?: string;
   reason?: string;
+  tts_available?: boolean;
+  tts_backend?: string | null;
+}
+
+export interface BuiltinVoice {
+  id: string;
+  lang?: string;
+  gender?: string;
+  name?: string;
+}
+
+export interface CustomVoice {
+  id: string;
+  name: string;
+  kind: 'mix' | 'clone';
+  created_at: number;
+  kokoro_voice?: string;
+  has_audio?: boolean;
+  ref_text?: string;
+}
+
+export interface VoicesResponse {
+  backend: string | null;
+  clone_backend: string | null;
+  builtin: BuiltinVoice[];
+  custom: CustomVoice[];
+}
+
+export async function fetchSpeechVoices(): Promise<VoicesResponse> {
+  const empty: VoicesResponse = { backend: null, clone_backend: null, builtin: [], custom: [] };
+  try {
+    const res = await fetch(`${getBase()}/v1/speech/voices`);
+    if (!res.ok) return empty;
+    const data = await res.json();
+    // Tolerate the old shape ({voices: string[], backend}) for any caller
+    // that hasn't been rebuilt yet.
+    if (Array.isArray(data.voices)) {
+      return {
+        backend: data.backend ?? null,
+        clone_backend: null,
+        builtin: (data.voices as string[]).map((id) => ({ id })),
+        custom: [],
+      };
+    }
+    return {
+      backend: data.backend ?? null,
+      clone_backend: data.clone_backend ?? null,
+      builtin: data.builtin ?? [],
+      custom: data.custom ?? [],
+    };
+  } catch {
+    return empty;
+  }
+}
+
+export async function createVoiceMix(
+  name: string,
+  voiceIds: string[],
+): Promise<CustomVoice> {
+  const res = await fetch(`${getBase()}/v1/speech/voices/mix`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, voice_ids: voiceIds }),
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`mix failed: ${res.status} ${detail}`);
+  }
+  return res.json();
+}
+
+export async function createVoiceClone(
+  name: string,
+  audio: Blob,
+  refText: string = '',
+): Promise<CustomVoice> {
+  const form = new FormData();
+  form.append('name', name);
+  form.append('ref_text', refText);
+  form.append('file', audio, 'reference.wav');
+  const res = await fetch(`${getBase()}/v1/speech/voices/clone`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`clone failed: ${res.status} ${detail}`);
+  }
+  return res.json();
+}
+
+export async function deleteVoice(voiceId: string): Promise<void> {
+  const res = await fetch(`${getBase()}/v1/speech/voices/${encodeURIComponent(voiceId)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`delete failed: ${res.status} ${detail}`);
+  }
+}
+
+export async function synthesizeProbe(
+  text = 'Hello.',
+  voiceId = '',
+  speed = 1.0,
+): Promise<{ ok: boolean; bytes: number; reason?: string; blob?: Blob }> {
+  try {
+    const res = await fetch(`${getBase()}/v1/speech/synthesize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, output_format: 'wav', voice_id: voiceId, speed }),
+    });
+    if (!res.ok) {
+      let detail = '';
+      try {
+        const j = await res.json();
+        detail = j?.detail || '';
+      } catch {}
+      return { ok: false, bytes: 0, reason: detail || `HTTP ${res.status}` };
+    }
+    const blob = await res.blob();
+    return { ok: blob.size > 1024, bytes: blob.size, blob };
+  } catch (err) {
+    return { ok: false, bytes: 0, reason: (err as Error).message };
+  }
 }
 
 export async function transcribeAudio(audioBlob: Blob, filename = 'recording.webm'): Promise<TranscriptionResult> {
@@ -293,6 +418,8 @@ export interface ManagedAgent {
   id: string;
   name: string;
   agent_type: string;
+  org_role?: string;
+  manager_agent_id?: string | null;
   config: Record<string, unknown>;
   status: 'idle' | 'running' | 'paused' | 'error' | 'archived' | 'needs_attention' | 'budget_exceeded' | 'stalled';
   summary_memory: string;
@@ -319,6 +446,7 @@ export interface ManagedAgent {
 export interface AgentTask {
   id: string;
   agent_id: string;
+  assigned_by_agent_id?: string | null;
   description: string;
   status: 'pending' | 'active' | 'completed' | 'failed';
   progress: Record<string, unknown>;
@@ -381,6 +509,8 @@ export async function createManagedAgent(body: {
   agent_type?: string;
   template_id?: string;
   config?: Record<string, unknown>;
+  org_role?: string;
+  manager_agent_id?: string | null;
 }): Promise<ManagedAgent> {
   const res = await fetch(`${getBase()}/v1/managed-agents`, {
     method: 'POST',
@@ -393,7 +523,13 @@ export async function createManagedAgent(body: {
 
 export async function updateManagedAgent(
   agentId: string,
-  body: Partial<{ name: string; agent_type: string; config: Record<string, unknown> }>,
+  body: Partial<{
+    name: string;
+    agent_type: string;
+    config: Record<string, unknown>;
+    org_role: string;
+    manager_agent_id: string | null;
+  }>,
 ): Promise<ManagedAgent> {
   const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}`, {
     method: 'PATCH',

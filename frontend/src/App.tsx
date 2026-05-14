@@ -59,7 +59,10 @@ export default function App() {
     fetchModels()
       .then((m) => {
         setModels(m);
-        if (!selectedModel && m.length > 0) setSelectedModel(m[0].id);
+        if (m.length === 0) return;
+        // If a stored selection is no longer installed, fall back to first.
+        const stillExists = selectedModel && m.some((entry) => entry.id === selectedModel);
+        if (!stillExists) setSelectedModel(m[0].id);
       })
       .catch(() => setModels([]))
       .finally(() => setModelsLoading(false));

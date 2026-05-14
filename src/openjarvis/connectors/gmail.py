@@ -18,6 +18,7 @@ from openjarvis.connectors._stubs import BaseConnector, Document, SyncStatus
 from openjarvis.connectors.oauth import (
     GOOGLE_ALL_SCOPES,
     build_google_auth_url,
+    call_with_token_refresh,
     delete_tokens,
     load_tokens,
     resolve_google_credentials,
@@ -249,8 +250,14 @@ class GmailConnector(BaseConnector):
         if not tokens:
             return
 
-        token: str = tokens.get("token", tokens.get("access_token", ""))
-        if not token:
+        # Read the current access_token fresh on each API call so that a
+        # mid-loop refresh (triggered by call_with_token_refresh on 401)
+        # is picked up by subsequent calls without re-loading manually.
+        def _current_token() -> str:
+            t = load_tokens(self._credentials_path) or {}
+            return t.get("access_token") or t.get("token") or ""
+
+        if not _current_token():
             return
 
         query = "category:primary"
@@ -263,8 +270,11 @@ class GmailConnector(BaseConnector):
         synced = 0
 
         while True:
-            list_resp = _gmail_api_list_messages(
-                token, page_token=page_token, query=query
+            list_resp = call_with_token_refresh(
+                self._credentials_path,
+                lambda: _gmail_api_list_messages(
+                    _current_token(), page_token=page_token, query=query
+                ),
             )
             messages: List[Dict[str, Any]] = list_resp.get("messages", [])
 
@@ -273,7 +283,10 @@ class GmailConnector(BaseConnector):
                 if not msg_id:
                     continue
 
-                msg = _gmail_api_get_message(token, msg_id)
+                msg = call_with_token_refresh(
+                    self._credentials_path,
+                    lambda mid=msg_id: _gmail_api_get_message(_current_token(), mid),
+                )
                 payload: Dict[str, Any] = msg.get("payload", {})
                 headers: List[Dict[str, str]] = payload.get("headers", [])
 

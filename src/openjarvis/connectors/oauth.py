@@ -272,6 +272,91 @@ def delete_tokens(path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Token refresh (used when an access_token expires after ~1 hour)
+# ---------------------------------------------------------------------------
+
+
+def refresh_google_token(tokens: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """POST to Google's token endpoint with ``grant_type=refresh_token``.
+
+    The refresh response usually omits ``refresh_token`` (the original
+    stays valid for ~6 months of inactivity), so we preserve the input's
+    refresh_token. ``client_id`` / ``client_secret`` are read from *tokens*
+    — :func:`save_tokens` persists them alongside the access tokens
+    specifically so refresh works without re-reading a separate client
+    credentials file.
+
+    Returns the merged new-tokens dict on success, or ``None`` on any
+    failure (network, revoked grant, missing refresh_token).
+    """
+    import httpx
+
+    refresh_token = tokens.get("refresh_token")
+    client_id = tokens.get("client_id")
+    client_secret = tokens.get("client_secret")
+    if not (refresh_token and client_id and client_secret):
+        return None
+    try:
+        resp = httpx.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        new = resp.json()
+    except Exception:
+        return None
+    merged = dict(tokens)
+    if new.get("access_token"):
+        merged["access_token"] = new["access_token"]
+    if new.get("token_type"):
+        merged["token_type"] = new["token_type"]
+    if new.get("expires_in"):
+        merged["expires_in"] = new["expires_in"]
+    if new.get("refresh_token"):
+        merged["refresh_token"] = new["refresh_token"]
+    return merged
+
+
+def call_with_token_refresh(credentials_path: str, fn: Any) -> Any:
+    """Run a Google API callable with automatic refresh-on-401.
+
+    *fn* is a zero-arg callable that reads the access_token from
+    ``load_tokens(credentials_path)`` internally and performs the request
+    (typically by calling an existing ``_api_*`` helper that raises on
+    non-2xx). If *fn* raises an HTTP 401, this helper:
+
+      1. Loads the current tokens
+      2. Calls :func:`refresh_google_token` with them
+      3. Saves the new tokens via :func:`save_tokens`
+      4. Calls *fn* once more (which now reads the refreshed access_token)
+
+    Anything other than a 401 (or a 401 with no recoverable refresh) is
+    re-raised unchanged.
+    """
+    import httpx
+
+    try:
+        return fn()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 401:
+            raise
+        tokens = load_tokens(credentials_path)
+        if not tokens:
+            raise
+        new_tokens = refresh_google_token(tokens)
+        if not new_tokens:
+            raise
+        save_tokens(credentials_path, new_tokens)
+        return fn()
+
+
+# ---------------------------------------------------------------------------
 # Token exchange & full OAuth flow
 # ---------------------------------------------------------------------------
 
