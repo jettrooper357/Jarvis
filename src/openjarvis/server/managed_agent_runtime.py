@@ -7,10 +7,12 @@ import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence
 
-from openjarvis.core.registry import ToolRegistry
+from openjarvis.agents.capabilities import (
+    build_agent_tool_instances,
+    effective_agent_tool_names as _effective_capability_tool_names,
+)
 from openjarvis.core.events import EventType
 from openjarvis.core.types import Message, Role, ToolCall, ToolResult
 from openjarvis.tools._stubs import ToolExecutor
@@ -19,17 +21,6 @@ if TYPE_CHECKING:
     from openjarvis.tools._stubs import BaseTool
 
 logger = logging.getLogger(__name__)
-
-_AUTO_COLLABORATION_TOOLS = (
-    "managed_agent_directory",
-    "managed_agent_delegate",
-    "managed_agent_message",
-    "managed_agent_assign_task",
-    "managed_agent_list_tasks",
-    "managed_agent_update_task",
-    "managed_agent_inspect",
-)
-_KNOWLEDGE_TOOL_NAMES = ("knowledge_search", "knowledge_sql", "scan_chunks", "think")
 
 
 @dataclass(frozen=True)
@@ -87,102 +78,13 @@ def _response_content(result: Any) -> str:
 
 
 def _effective_tool_names(agent_record: Dict[str, Any]) -> List[str]:
-    config = agent_record.get("config", {}) or {}
-    raw_tools = config.get("tools") or []
-    names: List[str] = []
-    for entry in raw_tools:
-        if isinstance(entry, str):
-            cleaned = entry.strip()
-            if cleaned and cleaned not in names:
-                names.append(cleaned)
-    agent_name = str(agent_record.get("name", "")).strip().casefold()
-    if agent_name or agent_record.get("id"):
-        for tool_name in _AUTO_COLLABORATION_TOOLS:
-            if tool_name not in names:
-                names.append(tool_name)
-    return names
+    return _effective_capability_tool_names(agent_record)
 
 
-def _build_knowledge_tools(engine: Any, model: str) -> Dict[str, BaseTool]:
-    """Instantiate the knowledge/search tools used by deep-research agents."""
-    from openjarvis.connectors.retriever import TwoStageRetriever
-    from openjarvis.connectors.store import KnowledgeStore
-    from openjarvis.core.config import DEFAULT_CONFIG_DIR
-    from openjarvis.tools.knowledge_search import KnowledgeSearchTool
-    from openjarvis.tools.knowledge_sql import KnowledgeSQLTool
-    from openjarvis.tools.scan_chunks import ScanChunksTool
-    from openjarvis.tools.think import ThinkTool
+def _should_enable_knowledge(agent_record: Dict[str, Any]) -> bool:
+    from openjarvis.agents.capabilities import should_enable_agent_knowledge
 
-    knowledge_db_path = DEFAULT_CONFIG_DIR / "knowledge.db"
-    if not Path(knowledge_db_path).exists():
-        return {"think": ThinkTool()}
-
-    store = KnowledgeStore(str(knowledge_db_path))
-    retriever = TwoStageRetriever(store)
-    return {
-        "knowledge_search": KnowledgeSearchTool(retriever=retriever),
-        "knowledge_sql": KnowledgeSQLTool(store=store),
-        "scan_chunks": ScanChunksTool(store=store, engine=engine, model=model),
-        "think": ThinkTool(),
-    }
-
-
-def _build_tool_instances(
-    tool_names: Sequence[str],
-    *,
-    engine: Any,
-    model: str,
-    execution_context: ManagedAgentExecutionContext | None = None,
-) -> List[BaseTool]:
-    """Instantiate tools for a managed-agent turn."""
-    import importlib
-    import sys
-
-    import openjarvis.tools  # noqa: F401
-
-    names = [name for name in tool_names if name]
-    if not names:
-        return []
-
-    missing = [name for name in names if not ToolRegistry.contains(name)]
-    if missing:
-        for module_name in list(sys.modules):
-            if module_name.startswith("openjarvis.tools.") and not module_name.endswith(
-                "_stubs"
-            ):
-                try:
-                    importlib.reload(sys.modules[module_name])
-                except Exception:
-                    logger.exception("Failed to reload tool module %s", module_name)
-
-    knowledge_instances: Dict[str, BaseTool] = {}
-    if any(name in _KNOWLEDGE_TOOL_NAMES for name in names):
-        try:
-            knowledge_instances = _build_knowledge_tools(engine, model)
-        except Exception:
-            logger.exception("Failed to build knowledge tools")
-
-    instances: List[BaseTool] = []
-    seen: set[str] = set()
-    for tool_name in names:
-        if tool_name in seen:
-            continue
-        seen.add(tool_name)
-        if tool_name in knowledge_instances:
-            instances.append(knowledge_instances[tool_name])
-            continue
-        if not ToolRegistry.contains(tool_name):
-            logger.warning("Tool '%s' is not registered", tool_name)
-            continue
-        tool_cls = ToolRegistry.get(tool_name)
-        try:
-            if tool_name in _AUTO_COLLABORATION_TOOLS:
-                instances.append(tool_cls(context=execution_context))
-            else:
-                instances.append(tool_cls())
-        except Exception:
-            logger.exception("Failed to instantiate tool %s", tool_name)
-    return instances
+    return should_enable_agent_knowledge(agent_record)
 
 
 class ManagedAgentRuntime:
@@ -339,15 +241,14 @@ class ManagedAgentRuntime:
         from openjarvis.agents.deep_research import DeepResearchAgent
 
         config = agent_record.get("config", {}) or {}
-        tool_names = list(_KNOWLEDGE_TOOL_NAMES)
-        for extra_name in _effective_tool_names(agent_record):
-            if extra_name not in tool_names:
-                tool_names.append(extra_name)
-        tools = _build_tool_instances(
-            tool_names,
+        tools = build_agent_tool_instances(
+            agent_record,
             engine=self._engine,
             model=model,
+            bus=self._bus,
             execution_context=execution_context,
+            interactive=True,
+            confirm_callback=lambda _prompt: True,
         )
         collected_tool_calls: List[Dict[str, Any]] = []
 
@@ -392,12 +293,14 @@ class ManagedAgentRuntime:
         execution_context: ManagedAgentExecutionContext,
     ) -> tuple[str, List[Dict[str, Any]]]:
         config = agent_record.get("config", {}) or {}
-        tool_names = _effective_tool_names(agent_record)
-        tool_instances = _build_tool_instances(
-            tool_names,
+        tool_instances = build_agent_tool_instances(
+            agent_record,
             engine=self._engine,
             model=model,
+            bus=self._bus,
             execution_context=execution_context,
+            interactive=True,
+            confirm_callback=lambda _prompt: True,
         )
         tool_specs = [tool.to_openai_function() for tool in tool_instances]
         tool_map = {tool.spec.name: tool for tool in tool_instances}

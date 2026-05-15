@@ -12,7 +12,10 @@ from fastapi.staticfiles import StaticFiles
 
 from openjarvis.server.api_routes import include_all_routes
 from openjarvis.server.comparison import comparison_router
-from openjarvis.server.connectors_router import create_connectors_router
+from openjarvis.server.connectors_router import (
+    create_connectors_router,
+    start_connector_autosync_loop,
+)
 from openjarvis.server.dashboard import dashboard_router
 from openjarvis.server.digest_routes import create_digest_router
 from openjarvis.server.routes import router
@@ -258,6 +261,11 @@ def create_app(
         import asyncio
         import inspect
         import threading
+
+        try:
+            start_connector_autosync_loop()
+        except Exception:
+            logger.exception("Failed to start connector autosync loop")
 
         def _warm() -> None:
             sb = getattr(app.state, "speech_backend", None)

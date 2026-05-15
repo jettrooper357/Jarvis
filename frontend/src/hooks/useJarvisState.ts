@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../lib/store';
 import { checkHealth } from '../lib/api';
+import { resolveModelSelection } from '../lib/models';
 
 export type JarvisState = 'offline' | 'idle' | 'thinking';
 
@@ -38,6 +39,8 @@ function formatCount(n: number): string {
 export function useJarvisState(): JarvisStatus {
   const isStreaming = useAppStore((s) => s.streamState.isStreaming);
   const serverInfo = useAppStore((s) => s.serverInfo);
+  const models = useAppStore((s) => s.models);
+  const defaultModel = useAppStore((s) => s.settings.defaultModel);
   const savings = useAppStore((s) => s.savings);
   const selectedModel = useAppStore((s) => s.selectedModel);
   const displayName = useAppStore((s) => s.optInDisplayName);
@@ -70,7 +73,12 @@ export function useJarvisState(): JarvisStatus {
   const state: JarvisState = offline ? 'offline' : isStreaming ? 'thinking' : 'idle';
   const label = offline ? 'OFFLINE' : isStreaming ? 'THINKING' : 'ONLINE';
 
-  const model = serverInfo?.model || selectedModel || 'no model';
+  const model = resolveModelSelection({
+    selectedModel,
+    defaultModel,
+    serverModel: serverInfo?.model || '',
+    models,
+  }) || 'no model';
   const totalTokens = savings?.total_tokens ?? 0;
   const totalCalls = savings?.total_calls ?? 0;
 

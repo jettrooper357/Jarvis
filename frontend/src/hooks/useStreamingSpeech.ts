@@ -42,6 +42,7 @@ export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
   const ctxRef = useRef<AudioContext | null>(null);
   const nodeRef = useRef<AudioWorkletNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const transcribingTimeoutRef = useRef<number | null>(null);
   const onFinalRef = useRef(opts.onFinal);
   onFinalRef.current = opts.onFinal;
   const onSpeechStartRef = useRef(opts.onSpeechStart);
@@ -54,6 +55,10 @@ export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
   }, []);
 
   const cleanup = useCallback(() => {
+    if (transcribingTimeoutRef.current !== null) {
+      window.clearTimeout(transcribingTimeoutRef.current);
+      transcribingTimeoutRef.current = null;
+    }
     try {
       nodeRef.current?.disconnect();
     } catch {}
@@ -127,22 +132,46 @@ export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
       try {
         const msg = JSON.parse(ev.data);
         if (msg.type === 'speech_start') {
+          if (transcribingTimeoutRef.current !== null) {
+            window.clearTimeout(transcribingTimeoutRef.current);
+            transcribingTimeoutRef.current = null;
+          }
           setState('listening');
           onSpeechStartRef.current?.();
         } else if (msg.type === 'partial' && msg.text) {
           setInterim(msg.text);
           setState('listening');
         } else if (msg.type === 'final' && msg.text) {
+          if (transcribingTimeoutRef.current !== null) {
+            window.clearTimeout(transcribingTimeoutRef.current);
+            transcribingTimeoutRef.current = null;
+          }
           setInterim('');
+          setState(wsRef.current?.readyState === WebSocket.OPEN ? 'listening' : 'idle');
           onFinalRef.current?.(msg.text);
         } else if (msg.type === 'speech_end') {
           setState('transcribing');
+          if (transcribingTimeoutRef.current !== null) {
+            window.clearTimeout(transcribingTimeoutRef.current);
+          }
+          transcribingTimeoutRef.current = window.setTimeout(() => {
+            transcribingTimeoutRef.current = null;
+            setState(wsRef.current?.readyState === WebSocket.OPEN ? 'listening' : 'idle');
+          }, 1500);
         } else if (msg.type === 'error') {
+          if (transcribingTimeoutRef.current !== null) {
+            window.clearTimeout(transcribingTimeoutRef.current);
+            transcribingTimeoutRef.current = null;
+          }
           setError(msg.detail || 'Streaming error');
         }
       } catch {}
     };
     ws.onclose = () => {
+      if (transcribingTimeoutRef.current !== null) {
+        window.clearTimeout(transcribingTimeoutRef.current);
+        transcribingTimeoutRef.current = null;
+      }
       setState('idle');
     };
 

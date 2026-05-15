@@ -421,6 +421,13 @@ export interface ManagedAgent {
   org_role?: string;
   manager_agent_id?: string | null;
   config: Record<string, unknown>;
+  template_id?: string;
+  configured_tools?: string[];
+  configured_skills?: string[];
+  effective_skills?: string[];
+  auto_tools?: string[];
+  effective_tools?: string[];
+  knowledge_enabled?: boolean;
   status: 'idle' | 'running' | 'paused' | 'error' | 'archived' | 'needs_attention' | 'budget_exceeded' | 'stalled';
   summary_memory: string;
   created_at: number;
@@ -468,8 +475,24 @@ export interface AgentTemplate {
   name: string;
   description: string;
   source: 'built-in' | 'user';
+  editable?: boolean;
   agent_type: string;
   [key: string]: unknown;
+}
+
+export interface InstalledSkill {
+  name: string;
+  description?: string;
+  source?: 'built-in' | 'user' | 'workspace';
+  editable?: boolean;
+}
+
+export interface TemplateDocument extends AgentTemplate {
+  content: string;
+}
+
+export interface SkillDocument extends InstalledSkill {
+  content: string;
 }
 
 export interface PersistedToolCall {
@@ -684,6 +707,135 @@ export async function fetchTemplates(): Promise<AgentTemplate[]> {
   if (!res.ok) throw new Error(`Failed: ${res.status}`);
   const data = await res.json();
   return data.templates || [];
+}
+
+export async function fetchTemplateDocument(templateId: string): Promise<TemplateDocument> {
+  const res = await fetch(`${getBase()}/v1/templates/${encodeURIComponent(templateId)}`);
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export async function createTemplateDocument(content: string): Promise<TemplateDocument> {
+  const res = await fetch(`${getBase()}/v1/templates`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export async function updateTemplateDocument(templateId: string, content: string): Promise<TemplateDocument> {
+  const res = await fetch(`${getBase()}/v1/templates/${encodeURIComponent(templateId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export async function deleteTemplateDocument(templateId: string): Promise<void> {
+  const res = await fetch(`${getBase()}/v1/templates/${encodeURIComponent(templateId)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+}
+
+export async function fetchSkills(): Promise<InstalledSkill[]> {
+  const res = await fetch(`${getBase()}/v1/skills`);
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  const data = await res.json();
+  return data.skills || [];
+}
+
+export async function fetchSkillDocument(skillName: string): Promise<SkillDocument> {
+  const res = await fetch(`${getBase()}/v1/skills/${encodeURIComponent(skillName)}`);
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export async function createSkillDocument(content: string): Promise<SkillDocument> {
+  const res = await fetch(`${getBase()}/v1/skills`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export async function updateSkillDocument(skillName: string, content: string): Promise<SkillDocument> {
+  const res = await fetch(`${getBase()}/v1/skills/${encodeURIComponent(skillName)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export async function deleteSkillDocument(skillName: string): Promise<void> {
+  const res = await fetch(`${getBase()}/v1/skills/${encodeURIComponent(skillName)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+}
+
+export interface RemoteSkill {
+  name: string;
+  category: string;
+  description: string;
+  source: string;
+}
+
+export interface SkillInstallResult {
+  success: boolean;
+  skipped: boolean;
+  name: string;
+  source: string;
+  target_path: string;
+  translated_tools: string[];
+  untranslated_tools: string[];
+  scripts_imported: boolean;
+  warnings: string[];
+}
+
+export async function browseRemoteSkills(params: {
+  source: string;
+  query?: string;
+  category?: string;
+  url?: string;
+}): Promise<{ skills: RemoteSkill[]; total: number }> {
+  const qs = new URLSearchParams({ source: params.source });
+  if (params.query) qs.set('query', params.query);
+  if (params.category) qs.set('category', params.category);
+  if (params.url) qs.set('url', params.url);
+  const res = await fetch(`${getBase()}/v1/skills/browse?${qs.toString()}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(body.detail || `Failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function installRemoteSkill(body: {
+  source: string;
+  name: string;
+  url?: string;
+  with_scripts?: boolean;
+  force?: boolean;
+}): Promise<SkillInstallResult> {
+  const res = await fetch(`${getBase()}/v1/skills/install`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(errBody.detail || `Failed: ${res.status}`);
+  }
+  return res.json();
 }
 
 export async function runManagedAgent(agentId: string): Promise<void> {

@@ -73,8 +73,12 @@ class OllamaEngine(InferenceEngine):
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
-                "num_ctx": kwargs.get("num_ctx", 8192),
+                "num_ctx": kwargs.get("num_ctx", 2048),
             },
+            # Keep the model resident between turns. On a CPU-only box the
+            # cold reload (multi-GB read from disk) is the single biggest
+            # interactive-latency source; -1 = never auto-unload.
+            "keep_alive": kwargs.get("keep_alive", -1),
         }
         # Disable extended thinking by default (Qwen3.5 etc.).
         # When enabled, thinking tokens consume the entire budget and
@@ -189,37 +193,45 @@ class OllamaEngine(InferenceEngine):
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
-                "num_ctx": kwargs.get("num_ctx", 8192),
+                "num_ctx": kwargs.get("num_ctx", 2048),
             },
+            # Keep the model resident between turns. On a CPU-only box the
+            # cold reload (multi-GB read from disk) is the single biggest
+            # interactive-latency source; -1 = never auto-unload.
+            "keep_alive": kwargs.get("keep_alive", -1),
         }
         try:
-            with self._client.stream("POST", "/api/chat", json=payload) as resp:
-                resp.raise_for_status()
-                for line in resp.iter_lines():
-                    if not line.strip():
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    content = chunk.get("message", {}).get("content", "")
-                    if content:
-                        yield content
-                    if chunk.get("done", False):
-                        reported_prompt = chunk.get("prompt_eval_count", 0)
-                        est_prompt = estimate_prompt_tokens(messages)
-                        full_prompt = max(reported_prompt, est_prompt)
-                        evaluated = (
-                            reported_prompt if reported_prompt > 0 else full_prompt
-                        )
-                        comp = chunk.get("eval_count", 0)
-                        self._last_stream_usage = {
-                            "prompt_tokens": full_prompt,
-                            "prompt_tokens_evaluated": evaluated,
-                            "completion_tokens": comp,
-                            "total_tokens": full_prompt + comp,
-                        }
-                        break
+            async with httpx.AsyncClient(
+                base_url=self._host,
+                timeout=self._client.timeout,
+            ) as client:
+                async with client.stream("POST", "/api/chat", json=payload) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        content = chunk.get("message", {}).get("content", "")
+                        if content:
+                            yield content
+                        if chunk.get("done", False):
+                            reported_prompt = chunk.get("prompt_eval_count", 0)
+                            est_prompt = estimate_prompt_tokens(messages)
+                            full_prompt = max(reported_prompt, est_prompt)
+                            evaluated = (
+                                reported_prompt if reported_prompt > 0 else full_prompt
+                            )
+                            comp = chunk.get("eval_count", 0)
+                            self._last_stream_usage = {
+                                "prompt_tokens": full_prompt,
+                                "prompt_tokens_evaluated": evaluated,
+                                "completion_tokens": comp,
+                                "total_tokens": full_prompt + comp,
+                            }
+                            break
         except (httpx.ConnectError, httpx.TimeoutException) as exc:
             raise EngineConnectionError(
                 f"Ollama not reachable at {self._host}"
@@ -260,8 +272,12 @@ class OllamaEngine(InferenceEngine):
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
-                "num_ctx": kwargs.get("num_ctx", 8192),
+                "num_ctx": kwargs.get("num_ctx", 2048),
             },
+            # Keep the model resident between turns. On a CPU-only box the
+            # cold reload (multi-GB read from disk) is the single biggest
+            # interactive-latency source; -1 = never auto-unload.
+            "keep_alive": kwargs.get("keep_alive", -1),
         }
         if "think" not in kwargs:
             payload["think"] = False
@@ -286,82 +302,86 @@ class OllamaEngine(InferenceEngine):
     ) -> AsyncIterator[StreamChunk]:
         """Execute the streaming request and yield parsed StreamChunks."""
         try:
-            with self._client.stream("POST", "/api/chat", json=payload) as resp:
-                if resp.status_code == 400 and retry_without_tools:
-                    # Model doesn't support tools — retry without them.
-                    payload.pop("tools", None)
-                    async for c in self._run_stream(
-                        payload, messages, retry_without_tools=False
-                    ):
-                        yield c
-                    return
-                resp.raise_for_status()
+            async with httpx.AsyncClient(
+                base_url=self._host,
+                timeout=self._client.timeout,
+            ) as client:
+                async with client.stream("POST", "/api/chat", json=payload) as resp:
+                    if resp.status_code == 400 and retry_without_tools:
+                        # Model doesn't support tools — retry without them.
+                        payload.pop("tools", None)
+                        async for c in self._run_stream(
+                            payload, messages, retry_without_tools=False
+                        ):
+                            yield c
+                        return
+                    resp.raise_for_status()
 
-                finish_reason: str | None = None
-                for line in resp.iter_lines():
-                    if not line.strip():
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+                    finish_reason: str | None = None
+                    async for line in resp.aiter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
 
-                    message = chunk.get("message", {}) or {}
-                    content = message.get("content", "")
-                    raw_tool_calls = message.get("tool_calls") or []
+                        message = chunk.get("message", {}) or {}
+                        content = message.get("content", "")
+                        raw_tool_calls = message.get("tool_calls") or []
 
-                    if content:
-                        yield StreamChunk(content=content)
+                        if content:
+                            yield StreamChunk(content=content)
 
-                    if raw_tool_calls:
-                        # Ollama emits fully-formed tool_calls in a single
-                        # chunk (not fragmented). Convert to the
-                        # OpenAI-delta fragment shape that agent_manager_routes
-                        # expects in _merge_tool_call_fragments.
-                        fragments: List[Dict[str, Any]] = []
-                        for i, tc in enumerate(raw_tool_calls):
-                            fn = tc.get("function", {}) or {}
-                            raw_args = fn.get("arguments", "{}")
-                            args_str = (
-                                json.dumps(raw_args)
-                                if isinstance(raw_args, dict)
-                                else str(raw_args)
+                        if raw_tool_calls:
+                            # Ollama emits fully-formed tool_calls in a single
+                            # chunk (not fragmented). Convert to the
+                            # OpenAI-delta fragment shape that agent_manager_routes
+                            # expects in _merge_tool_call_fragments.
+                            fragments: List[Dict[str, Any]] = []
+                            for i, tc in enumerate(raw_tool_calls):
+                                fn = tc.get("function", {}) or {}
+                                raw_args = fn.get("arguments", "{}")
+                                args_str = (
+                                    json.dumps(raw_args)
+                                    if isinstance(raw_args, dict)
+                                    else str(raw_args)
+                                )
+                                fragments.append(
+                                    {
+                                        "index": i,
+                                        "id": tc.get("id", f"call_{i}"),
+                                        "type": "function",
+                                        "function": {
+                                            "name": fn.get("name", ""),
+                                            "arguments": args_str,
+                                        },
+                                    }
+                                )
+                            yield StreamChunk(tool_calls=fragments)
+                            finish_reason = "tool_calls"
+
+                        if chunk.get("done", False):
+                            reported_prompt = chunk.get("prompt_eval_count", 0)
+                            est_prompt = estimate_prompt_tokens(messages)
+                            full_prompt = max(reported_prompt, est_prompt)
+                            evaluated = (
+                                reported_prompt if reported_prompt > 0 else full_prompt
                             )
-                            fragments.append(
-                                {
-                                    "index": i,
-                                    "id": tc.get("id", f"call_{i}"),
-                                    "type": "function",
-                                    "function": {
-                                        "name": fn.get("name", ""),
-                                        "arguments": args_str,
-                                    },
-                                }
+                            comp = chunk.get("eval_count", 0)
+                            self._last_stream_usage = {
+                                "prompt_tokens": full_prompt,
+                                "prompt_tokens_evaluated": evaluated,
+                                "completion_tokens": comp,
+                                "total_tokens": full_prompt + comp,
+                            }
+                            if finish_reason is None:
+                                finish_reason = chunk.get("done_reason") or "stop"
+                            yield StreamChunk(
+                                finish_reason=finish_reason,
+                                usage=dict(self._last_stream_usage),
                             )
-                        yield StreamChunk(tool_calls=fragments)
-                        finish_reason = "tool_calls"
-
-                    if chunk.get("done", False):
-                        reported_prompt = chunk.get("prompt_eval_count", 0)
-                        est_prompt = estimate_prompt_tokens(messages)
-                        full_prompt = max(reported_prompt, est_prompt)
-                        evaluated = (
-                            reported_prompt if reported_prompt > 0 else full_prompt
-                        )
-                        comp = chunk.get("eval_count", 0)
-                        self._last_stream_usage = {
-                            "prompt_tokens": full_prompt,
-                            "prompt_tokens_evaluated": evaluated,
-                            "completion_tokens": comp,
-                            "total_tokens": full_prompt + comp,
-                        }
-                        if finish_reason is None:
-                            finish_reason = chunk.get("done_reason") or "stop"
-                        yield StreamChunk(
-                            finish_reason=finish_reason,
-                            usage=dict(self._last_stream_usage),
-                        )
-                        break
+                            break
         except (httpx.ConnectError, httpx.TimeoutException) as exc:
             raise EngineConnectionError(
                 f"Ollama not reachable at {self._host}"

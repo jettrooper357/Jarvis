@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any, Dict, Optional
 
@@ -17,6 +20,10 @@ except ImportError:  # pragma: no cover - optional server dependency
 
 # Module-level cache of connector instances (keyed by connector_id).
 _instances: Dict[str, Any] = {}
+_sync_threads: Dict[str, Any] = {}
+_sync_state: Dict[str, Dict[str, Any]] = {}
+_autosync_thread: Any = None
+_autosync_started = False
 
 
 def _ensure_connectors_registered() -> None:
@@ -55,6 +62,164 @@ def _ensure_connectors_registered() -> None:
                     importlib.reload(sys.modules[mod_name])
                 except Exception:
                     pass
+
+
+def _get_or_create_connector_instance(connector_id: str) -> Any:
+    from openjarvis.core.registry import ConnectorRegistry
+
+    if connector_id not in _instances:
+        cls = ConnectorRegistry.get(connector_id)
+        _instances[connector_id] = cls()
+    return _instances[connector_id]
+
+
+def _load_connector_checkpoint(connector_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        from openjarvis.connectors.pipeline import IngestionPipeline
+        from openjarvis.connectors.store import KnowledgeStore
+        from openjarvis.connectors.sync_engine import SyncEngine
+
+        with KnowledgeStore() as store:
+            pipeline = IngestionPipeline(store)
+            engine = SyncEngine(pipeline)
+            return engine.get_checkpoint(connector_id)
+    except Exception:
+        logger.debug("Failed to load checkpoint for %s", connector_id, exc_info=True)
+        return None
+
+
+def _connector_should_sync(connector_id: str, *, min_interval_seconds: int) -> bool:
+    checkpoint = _load_connector_checkpoint(connector_id)
+    if not checkpoint or not checkpoint.get("last_sync"):
+        return True
+    try:
+        last_sync = datetime.fromisoformat(str(checkpoint["last_sync"]))
+    except (TypeError, ValueError):
+        return True
+    if last_sync.tzinfo is None:
+        last_sync = last_sync.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - last_sync >= timedelta(
+        seconds=min_interval_seconds
+    )
+
+
+def trigger_connector_sync(connector_id: str) -> Dict[str, Any]:
+    """Start a connector sync in the background if the connector is connected."""
+    from openjarvis.core.registry import ConnectorRegistry
+
+    _ensure_connectors_registered()
+    if not ConnectorRegistry.contains(connector_id):
+        raise KeyError(f"Connector '{connector_id}' not found")
+
+    inst = _get_or_create_connector_instance(connector_id)
+    if not inst.is_connected():
+        raise RuntimeError(f"Connector '{connector_id}' is not connected")
+
+    existing = _sync_threads.get(connector_id)
+    if existing and existing.is_alive():
+        return {
+            "connector_id": connector_id,
+            "status": "already_syncing",
+        }
+
+    _sync_state[connector_id] = {"state": "syncing", "error": None}
+
+    def _run_sync() -> None:
+        try:
+            from openjarvis.connectors.pipeline import IngestionPipeline
+            from openjarvis.connectors.store import KnowledgeStore
+            from openjarvis.connectors.sync_engine import SyncEngine
+
+            with KnowledgeStore() as store:
+                pipeline = IngestionPipeline(store)
+                engine = SyncEngine(pipeline)
+                engine.sync(inst)
+            logger.info("Sync completed for %s", connector_id)
+            _sync_state[connector_id] = {"state": "complete", "error": None}
+        except Exception as exc:
+            error_msg = str(exc)
+            if "401" in error_msg or "Unauthorized" in error_msg:
+                error_msg = "Authentication failed — credentials may have expired."
+            elif "403" in error_msg or "Forbidden" in error_msg:
+                error_msg = "Permission denied — check API scopes."
+            elif "429" in error_msg or "Too Many Requests" in error_msg:
+                error_msg = "Rate limited — wait a minute and try again."
+            elif "timeout" in error_msg.lower():
+                error_msg = "Connection timed out."
+            logger.error("Sync failed for %s: %s", connector_id, error_msg)
+            _sync_state[connector_id] = {"state": "error", "error": error_msg}
+
+    t = threading.Thread(target=_run_sync, daemon=True)
+    t.start()
+    _sync_threads[connector_id] = t
+    return {
+        "connector_id": connector_id,
+        "status": "started",
+    }
+
+
+def trigger_all_connected_connector_syncs(
+    *,
+    min_interval_seconds: int = 24 * 60 * 60,
+) -> Dict[str, int]:
+    """Best-effort sync of every connected connector that is due for refresh."""
+    from openjarvis.core.registry import ConnectorRegistry
+
+    _ensure_connectors_registered()
+    started = 0
+    skipped = 0
+    for connector_id in ConnectorRegistry.keys():
+        try:
+            inst = _get_or_create_connector_instance(connector_id)
+            if not inst.is_connected():
+                skipped += 1
+                continue
+            if not _connector_should_sync(
+                connector_id,
+                min_interval_seconds=min_interval_seconds,
+            ):
+                skipped += 1
+                continue
+            result = trigger_connector_sync(connector_id)
+            if result.get("status") == "started":
+                started += 1
+            else:
+                skipped += 1
+        except Exception:
+            logger.debug(
+                "Skipping connector autosync for %s",
+                connector_id,
+                exc_info=True,
+            )
+            skipped += 1
+    return {"started": started, "skipped": skipped}
+
+
+def start_connector_autosync_loop(*, interval_seconds: int = 24 * 60 * 60) -> None:
+    """Start a single background loop that refreshes connected connectors daily."""
+    global _autosync_started, _autosync_thread
+
+    if _autosync_started:
+        return
+    _autosync_started = True
+
+    def _loop() -> None:
+        while True:
+            try:
+                summary = trigger_all_connected_connector_syncs(
+                    min_interval_seconds=interval_seconds
+                )
+                logger.info(
+                    "Connector autosync pass complete: started=%d skipped=%d",
+                    summary["started"],
+                    summary["skipped"],
+                )
+            except Exception:
+                logger.exception("Connector autosync pass failed")
+            time.sleep(interval_seconds)
+
+    _autosync_thread = threading.Thread(target=_loop, daemon=True)
+    _autosync_thread.start()
 
 
 # ---------------------------------------------------------------------------
@@ -105,10 +270,7 @@ def create_connectors_router():
 
     def _get_or_create(connector_id: str) -> Any:
         """Return a cached connector instance, creating it if needed."""
-        if connector_id not in _instances:
-            cls = ConnectorRegistry.get(connector_id)
-            _instances[connector_id] = cls()
-        return _instances[connector_id]
+        return _get_or_create_connector_instance(connector_id)
 
     def _clear_cached_provider_instances(provider: Any) -> None:
         """Drop cached connector instances covered by an OAuth provider."""
@@ -510,72 +672,21 @@ def create_connectors_router():
             )
         )
 
-    # Track background sync state per connector
-    _sync_threads: Dict[str, Any] = {}
-    _sync_state: Dict[str, Dict[str, Any]] = {}  # {connector_id: {state, error}}
-
     @router.post("/{connector_id}/sync")
     def trigger_sync(connector_id: str) -> Dict[str, Any]:
         """Trigger a sync in the background and return immediately."""
-        import threading
-
         _ensure_connectors_registered()
         if not ConnectorRegistry.contains(connector_id):
             raise HTTPException(
                 status_code=404,
                 detail=f"Connector '{connector_id}' not found",
             )
-        inst = _get_or_create(connector_id)
-        if not inst.is_connected():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Connector '{connector_id}' is not connected",
-            )
-
-        # If already syncing, don't start another
-        existing = _sync_threads.get(connector_id)
-        if existing and existing.is_alive():
-            return {
-                "connector_id": connector_id,
-                "status": "already_syncing",
-            }
-
-        # Mark as syncing immediately so the UI picks it up
-        _sync_state[connector_id] = {"state": "syncing", "error": None}
-
-        def _run_sync() -> None:
-            try:
-                from openjarvis.connectors.pipeline import IngestionPipeline
-                from openjarvis.connectors.store import KnowledgeStore
-                from openjarvis.connectors.sync_engine import SyncEngine
-
-                with KnowledgeStore() as store:
-                    pipeline = IngestionPipeline(store=store)
-                    engine = SyncEngine(pipeline=pipeline)
-                    engine.sync(inst)
-                logger.info("Sync completed for %s", connector_id)
-                _sync_state[connector_id] = {"state": "complete", "error": None}
-            except Exception as exc:
-                error_msg = str(exc)
-                if "401" in error_msg or "Unauthorized" in error_msg:
-                    error_msg = "Authentication failed — credentials may have expired."
-                elif "403" in error_msg or "Forbidden" in error_msg:
-                    error_msg = "Permission denied — check API scopes."
-                elif "429" in error_msg or "Too Many Requests" in error_msg:
-                    error_msg = "Rate limited — wait a minute and try again."
-                elif "timeout" in error_msg.lower():
-                    error_msg = "Connection timed out."
-                logger.error("Sync failed for %s: %s", connector_id, error_msg)
-                _sync_state[connector_id] = {"state": "error", "error": error_msg}
-
-        t = threading.Thread(target=_run_sync, daemon=True)
-        t.start()
-        _sync_threads[connector_id] = t
-
-        return {
-            "connector_id": connector_id,
-            "status": "started",
-        }
+        try:
+            return trigger_connector_sync(connector_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @router.get("/{connector_id}/sync")
     async def sync_status(connector_id: str):

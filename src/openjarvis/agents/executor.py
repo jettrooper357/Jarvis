@@ -6,6 +6,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from openjarvis.agents.capabilities import build_agent_tool_instances
 from openjarvis.agents._stubs import AgentResult
 from openjarvis.agents.errors import (
     AgentTickError,
@@ -22,16 +23,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
-_AUTO_COLLABORATION_TOOLS = (
-    "managed_agent_directory",
-    "managed_agent_delegate",
-    "managed_agent_message",
-    "managed_agent_assign_task",
-    "managed_agent_list_tasks",
-    "managed_agent_update_task",
-    "managed_agent_inspect",
-)
-
 
 def _format_open_task(task: dict[str, Any]) -> str:
     parts = [
@@ -351,44 +342,31 @@ class AgentExecutor:
             except Exception:
                 pass  # Fall back to configured model
 
-        # Resolve tools from config via ToolRegistry
-        tool_names = config.get("tools", [])
-        if isinstance(tool_names, str):
-            tool_names = [t.strip() for t in tool_names.split(",") if t.strip()]
-        else:
-            tool_names = list(tool_names)
-        for tool_name in _AUTO_COLLABORATION_TOOLS:
-            if tool_name not in tool_names:
-                tool_names.append(tool_name)
-
         tool_instances: list[Any] = []
-        if tool_names:
-            try:
-                from openjarvis.server.agent_manager_routes import (
-                    _ensure_registries_populated,
-                )
-
-                _ensure_registries_populated()
-            except ImportError:
-                pass
-            from openjarvis.core.registry import ToolRegistry
-
-            for tname in tool_names:
-                if ToolRegistry.contains(tname):
-                    try:
-                        tool_cls = ToolRegistry.get(tname)
-                        tool = tool_cls()
-                        self._inject_tool_deps(tool)
-                        tool_instances.append(tool)
-                    except Exception:
-                        logger.warning("Failed to instantiate tool %s", tname)
-            if tool_instances:
-                logger.info(
-                    "Agent %s: resolved %d/%d tools",
-                    agent["name"],
-                    len(tool_instances),
-                    len(tool_names),
-                )
+        try:
+            tool_instances = build_agent_tool_instances(
+                agent,
+                engine=engine,
+                model=model,
+                bus=self._bus,
+                capability_policy=(
+                    getattr(self._system, "capability_policy", None)
+                    if self._system
+                    else None
+                ),
+                interactive=True,
+                confirm_callback=lambda _prompt: True,
+                inject_tool=self._inject_tool_deps,
+            )
+        except Exception:
+            logger.exception("Failed to resolve tools for agent %s", agent["name"])
+            tool_instances = []
+        if tool_instances:
+            logger.info(
+                "Agent %s: resolved %d tools",
+                agent["name"],
+                len(tool_instances),
+            )
 
         # Construct agent instance
         agent_kwargs: dict[str, Any] = {}

@@ -10,19 +10,24 @@
  * obviously didn't speak.
  *
  * If `wakeWords` is empty, the input passes through unchanged so manual mic
- * use behaves exactly as before.
+ * use behaves exactly as before. No built-in wake phrases are applied.
  */
 
 function normalize(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+export function getEffectiveWakeWords(wakeWords: string[]): string[] {
+  return (wakeWords || []).map((word) => word.trim()).filter(Boolean);
+}
+
 export function matchWakeWord(transcript: string, wakeWords: string[]): string | null {
-  if (!wakeWords || wakeWords.length === 0) return transcript;
+  const effectiveWakeWords = getEffectiveWakeWords(wakeWords);
+  if (effectiveWakeWords.length === 0) return transcript;
   const normT = normalize(transcript);
   if (!normT) return null;
 
-  for (const w of wakeWords) {
+  for (const w of effectiveWakeWords) {
     const normW = normalize(w);
     if (!normW) continue;
     if (normT === normW) return '';

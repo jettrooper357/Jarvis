@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -44,6 +45,201 @@ def _to_messages(chat_messages) -> list[Message]:
     return messages
 
 
+def _count_tokens(text: str) -> int:
+    """Cheap token estimate used for prompt-side context budgeting."""
+    return len(text.split())
+
+
+def _looks_like_news_query(query: str) -> bool:
+    q = query.casefold()
+    return any(
+        term in q
+        for term in (
+            " news",
+            "news ",
+            "headline",
+            "headlines",
+            "current events",
+            "rss",
+            "feed",
+            "feeds",
+            "hacker news",
+            "hn ",
+        )
+    ) or q == "news"
+
+
+_CONNECTOR_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "for",
+    "from",
+    "give",
+    "headline",
+    "headlines",
+    "how",
+    "i",
+    "latest",
+    "me",
+    "news",
+    "of",
+    "on",
+    "recent",
+    "rss",
+    "show",
+    "tell",
+    "the",
+    "to",
+    "what",
+    "with",
+}
+
+
+def _connector_query_candidates(query: str) -> list[str]:
+    cleaned = re.sub(r"[^a-zA-Z0-9\s]+", " ", query.casefold())
+    tokens = [token for token in cleaned.split() if token and token not in _CONNECTOR_STOP_WORDS]
+    candidates: list[str] = []
+    if tokens:
+        focused = " ".join(tokens)
+        if focused not in candidates:
+            candidates.append(focused)
+    broad = re.sub(r"\s+", " ", cleaned).strip()
+    if broad and broad not in candidates:
+        candidates.append(broad)
+    return candidates or [query.strip()]
+
+
+def _recent_connector_results(store: Any, *, max_results: int = 5) -> list[Any]:
+    rows = store._conn.execute(
+        """
+        SELECT content, source, metadata
+        FROM knowledge_chunks
+        WHERE source IN ('news_rss', 'hackernews')
+        ORDER BY
+            CASE WHEN timestamp != '' THEN timestamp END DESC,
+            created_at DESC
+        LIMIT ?
+        """,
+        (max_results,),
+    ).fetchall()
+    from openjarvis.tools.storage._stubs import RetrievalResult
+    import json
+
+    results = []
+    for row in rows:
+        metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+        results.append(
+            RetrievalResult(
+                content=row["content"],
+                score=0.0,
+                source=row["source"],
+                metadata=metadata,
+            )
+        )
+    return results
+
+
+def _inject_connector_knowledge_context(
+    query: str,
+    messages: list[Message],
+    *,
+    max_results: int = 5,
+    max_context_tokens: int = 1200,
+) -> list[Message]:
+    """Prepend synced connector knowledge from ``knowledge.db`` when available."""
+    from pathlib import Path
+
+    from openjarvis.connectors.store import KnowledgeStore
+    from openjarvis.core.config import DEFAULT_CONFIG_DIR
+    from openjarvis.core.types import Role
+    from openjarvis.tools.storage._stubs import RetrievalResult
+
+    knowledge_db = DEFAULT_CONFIG_DIR / "knowledge.db"
+    if not Path(knowledge_db).exists():
+        return messages
+
+    results: list[RetrievalResult] = []
+    try:
+        with KnowledgeStore(str(knowledge_db)) as store:
+            search_queries = _connector_query_candidates(query)
+            if _looks_like_news_query(query):
+                for search_query in search_queries:
+                    for source in ("news_rss", "hackernews"):
+                        results.extend(
+                            store.retrieve(
+                                search_query,
+                                top_k=max(2, max_results // 2),
+                                source=source,
+                            )
+                        )
+                    if results:
+                        break
+            if not results:
+                for search_query in search_queries:
+                    results = store.retrieve(search_query, top_k=max_results)
+                    if results:
+                        break
+            if not results and _looks_like_news_query(query):
+                results = _recent_connector_results(store, max_results=max_results)
+    except Exception:
+        logging.getLogger("openjarvis.server").debug(
+            "Connector knowledge lookup failed",
+            exc_info=True,
+        )
+        return messages
+
+    if not results:
+        return messages
+
+    seen: set[str] = set()
+    chosen: list[RetrievalResult] = []
+    total_tokens = 0
+    for result in sorted(results, key=lambda r: getattr(r, "score", 0.0), reverse=True):
+        meta = getattr(result, "metadata", {}) or {}
+        dedupe_key = str(
+            meta.get("chunk_id")
+            or meta.get("doc_id")
+            or f"{result.source}:{meta.get('title', '')}:{result.content[:120]}"
+        )
+        if dedupe_key in seen:
+            continue
+        token_count = _count_tokens(result.content)
+        if chosen and total_tokens + token_count > max_context_tokens:
+            break
+        chosen.append(result)
+        seen.add(dedupe_key)
+        total_tokens += token_count
+        if len(chosen) >= max_results:
+            break
+
+    if not chosen:
+        return messages
+
+    context_lines = []
+    for idx, result in enumerate(chosen, start=1):
+        meta = getattr(result, "metadata", {}) or {}
+        title = str(meta.get("title", "") or "").strip()
+        url = str(meta.get("url", "") or "").strip()
+        source = result.source or str(meta.get("source", "") or "").strip()
+        label_parts = [part for part in (source, title, url) if part]
+        label = " | ".join(label_parts) if label_parts else f"result {idx}"
+        context_lines.append(f"{idx}. [{label}] {result.content}")
+
+    context_message = Message(
+        role=Role.SYSTEM,
+        content=(
+            "The following recent context was retrieved from synced connector data. "
+            "Use it directly when answering questions about latest news or synced feeds. "
+            "If the retrieved items do not actually cover the requested topic, say that clearly "
+            "and summarize only what is present in the synced feeds.\n\n"
+            + "\n\n".join(context_lines)
+        ),
+    )
+    return [context_message] + list(messages)
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(request_body: ChatCompletionRequest, request: Request):
     """Handle chat completion requests (streaming and non-streaming)."""
@@ -64,6 +260,12 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             ),
         )
 
+    query_text = ""
+    for m in reversed(request_body.messages):
+        if m.role == "user" and m.content:
+            query_text = m.content
+            break
+
     # Inject memory context into messages before dispatching
     config = getattr(request.app.state, "config", None)
     memory_backend = getattr(request.app.state, "memory_backend", None)
@@ -71,67 +273,76 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         config is not None
         and memory_backend is not None
         and config.agent.context_from_memory
-        and request_body.messages
+        and query_text
     ):
         try:
             from openjarvis.tools.storage.context import ContextConfig, inject_context
 
-            # Extract query from the last user message
-            query_text = ""
-            for m in reversed(request_body.messages):
-                if m.role == "user" and m.content:
-                    query_text = m.content
-                    break
+            messages = _to_messages(request_body.messages)
+            ctx_cfg = ContextConfig(
+                top_k=config.memory.context_top_k,
+                min_score=config.memory.context_min_score,
+                max_context_tokens=config.memory.context_max_tokens,
+            )
+            enriched = inject_context(
+                query_text,
+                messages,
+                memory_backend,
+                config=ctx_cfg,
+            )
+            # Rebuild request messages from enriched Message objects
+            if len(enriched) > len(messages):
+                from openjarvis.server.models import ChatMessage
 
-            if query_text:
-                messages = _to_messages(request_body.messages)
-                ctx_cfg = ContextConfig(
-                    top_k=config.memory.context_top_k,
-                    min_score=config.memory.context_min_score,
-                    max_context_tokens=config.memory.context_max_tokens,
-                )
-                enriched = inject_context(
-                    query_text,
-                    messages,
-                    memory_backend,
-                    config=ctx_cfg,
-                )
-                # Rebuild request messages from enriched Message objects
-                if len(enriched) > len(messages):
-                    from openjarvis.server.models import ChatMessage
-
-                    new_msgs = []
-                    for msg in enriched:
-                        new_msgs.append(
-                            ChatMessage(
-                                role=msg.role.value,
-                                content=msg.content,
-                                name=msg.name,
-                                tool_call_id=getattr(msg, "tool_call_id", None),
-                            )
-                        )
-                    request_body.messages = new_msgs
+                request_body.messages = [
+                    ChatMessage(
+                        role=msg.role.value,
+                        content=msg.content,
+                        name=msg.name,
+                        tool_call_id=getattr(msg, "tool_call_id", None),
+                    )
+                    for msg in enriched
+                ]
         except Exception:
             logging.getLogger("openjarvis.server").debug(
                 "Memory context injection failed",
                 exc_info=True,
             )
 
+    if query_text:
+        try:
+            from openjarvis.server.models import ChatMessage
+
+            enriched = _inject_connector_knowledge_context(
+                query_text,
+                _to_messages(request_body.messages),
+            )
+            if len(enriched) > len(request_body.messages):
+                request_body.messages = [
+                    ChatMessage(
+                        role=msg.role.value,
+                        content=msg.content,
+                        name=msg.name,
+                        tool_call_id=getattr(msg, "tool_call_id", None),
+                    )
+                    for msg in enriched
+                ]
+        except Exception:
+            logging.getLogger("openjarvis.server").debug(
+                "Connector knowledge injection failed",
+                exc_info=True,
+            )
+
     # Run complexity analysis on the last user message
     complexity_info = None
-    query_text_for_complexity = ""
-    for m in reversed(request_body.messages):
-        if m.role == "user" and m.content:
-            query_text_for_complexity = m.content
-            break
-    if query_text_for_complexity:
+    if query_text:
         try:
             from openjarvis.learning.routing.complexity import (
                 adjust_tokens_for_model,
                 score_complexity,
             )
 
-            cr = score_complexity(query_text_for_complexity)
+            cr = score_complexity(query_text)
             suggested = adjust_tokens_for_model(
                 cr.suggested_max_tokens,
                 model,

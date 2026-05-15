@@ -179,6 +179,60 @@ jarvis skill sources
 jarvis skill update
 ```
 
+## Managing Skills from the Web UI
+
+When the API server is running (`jarvis serve`) the desktop/web app exposes a
+**Library** page (sidebar → **Library**, route `/library`) that mirrors the
+CLI for users who prefer a GUI. It has two tabs:
+
+- **Skills** — every installed skill (built-in, workspace, user) with its
+  source and description.
+- **Presets** — agent presets (templates).
+
+### Create / edit / delete definitions
+
+- **New skill / New preset** opens a TOML editor pre-filled with a scaffold.
+- The pencil icon edits an existing item; **user** items are editable, while
+  **built-in** and **workspace** items open read-only (the backend rejects
+  writes to them — see [Name Precedence](#name-precedence)).
+- The trash icon deletes a user item (with confirmation).
+
+These actions write to `~/.openjarvis/skills/<name>/` and
+`~/.openjarvis/templates/`, exactly like hand-editing the files.
+
+### Download skills from public sources
+
+The **Download** button on the Skills tab opens an installer that wraps the
+same resolver/importer machinery as `jarvis skill install`:
+
+1. Pick a **Source** — Hermes Agent (~150 skills), OpenClaw (~13,700 community
+   skills), or a **GitHub repository** (requires the repo URL).
+2. **Browse** lists the installable skills. An optional filter matches against
+   name, description, and category. The first fetch from a source clones its
+   repository and can take a while; subsequent calls reuse the cache.
+3. **Install** imports a single skill into `~/.openjarvis/skills/`. Two options
+   match the CLI flags: *Include scripts/* (security-sensitive — off by
+   default, same as omitting `--with-scripts`) and *Overwrite if installed*
+   (equivalent to `--force`).
+
+Newly installed skills appear in the list immediately and become assignable to
+agents from the **Capability Inspector** (see
+[Agents](agents.md)). Trust tiers and capability enforcement
+(see [Security & Trust](#security-trust)) apply identically to UI-installed
+skills.
+
+### REST endpoints
+
+The Library page is a thin client over these routes (useful for scripting):
+
+| Method & path | Purpose |
+|---|---|
+| `GET /v1/skills` | List installed skills |
+| `POST /v1/skills` · `PUT /v1/skills/{name}` · `DELETE /v1/skills/{name}` | Create / edit / delete a skill definition |
+| `GET /v1/skills/browse?source=&query=&category=&url=` | Sync a source and list installable skills |
+| `POST /v1/skills/install` | Install one skill — body: `{source, name, url?, with_scripts?, force?}` |
+| `GET /v1/templates` · `POST` · `PUT/{id}` · `DELETE/{id}` | Preset definition CRUD |
+
 ## How Agents Use Skills
 
 ### Skill Catalog in the System Prompt

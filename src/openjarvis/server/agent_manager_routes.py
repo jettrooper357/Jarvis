@@ -6,6 +6,20 @@ import logging
 import re as _re
 from typing import Any, Dict, List, Optional, Tuple
 
+from openjarvis.agents.capabilities import (
+    AUTO_COLLABORATION_TOOLS,
+    configured_agent_tool_names as _configured_capability_tool_names,
+    configured_agent_skill_names as _configured_capability_skill_names,
+    effective_agent_tool_names as _effective_capability_tool_names,
+    enrich_agent_record as _enrich_capability_record,
+    build_agent_tool_instances,
+)
+from openjarvis.agents.library import (
+    delete_template,
+    get_template_document,
+    parse_template_content,
+    save_template_document,
+)
 from openjarvis.agents.manager import AgentManager
 
 try:
@@ -33,6 +47,10 @@ class UpdateAgentRequest(BaseModel):
     config: Optional[Dict[str, Any]] = None
     org_role: Optional[str] = None
     manager_agent_id: Optional[str] = None
+
+
+class TemplateDocumentRequest(BaseModel):
+    content: str
 
 
 class CreateTaskRequest(BaseModel):
@@ -494,28 +512,21 @@ def _merge_tool_call_fragments(
 
 
 def _effective_agent_tool_names(agent_record: Dict[str, Any]) -> List[str]:
-    config = agent_record.get("config", {}) or {}
-    names: List[Any] = []
-    for entry in config.get("tools") or []:
-        if isinstance(entry, dict):
-            names.append(entry)
-            continue
-        if isinstance(entry, str):
-            cleaned = entry.strip()
-            if cleaned and cleaned not in names:
-                names.append(cleaned)
-    for tool_name in (
-        "managed_agent_directory",
-        "managed_agent_delegate",
-        "managed_agent_message",
-        "managed_agent_assign_task",
-        "managed_agent_list_tasks",
-        "managed_agent_update_task",
-        "managed_agent_inspect",
-    ):
-        if tool_name not in names:
-            names.append(tool_name)
-    return names
+    return _effective_capability_tool_names(agent_record)
+
+
+def _should_enable_agent_knowledge(agent_record: Dict[str, Any]) -> bool:
+    from openjarvis.agents.capabilities import should_enable_agent_knowledge
+
+    return should_enable_agent_knowledge(agent_record)
+
+
+def _configured_agent_tool_names(agent_record: Dict[str, Any]) -> List[str]:
+    return _configured_capability_tool_names(agent_record)
+
+
+def _enrich_agent_record(agent_record: Dict[str, Any]) -> Dict[str, Any]:
+    return _enrich_capability_record(agent_record)
 
 
 def _fallback_response_from_tool_calls(tool_calls: List[Dict[str, Any]]) -> str:
@@ -745,13 +756,17 @@ async def _stream_managed_agent(
         current_agent_id=agent_id,
         visited_agent_ids=(),
     )
+    agent_tools = build_agent_tool_instances(
+        agent_record,
+        engine=engine,
+        model=model,
+        bus=bus,
+        execution_context=runtime_context,
+        interactive=True,
+        confirm_callback=lambda _prompt: True,
+    )
     if agent_type == "deep_research":
-        dr_tools = _build_deep_research_tools(
-            engine=engine,
-            model=model,
-            include_delegation_tools=True,
-            execution_context=runtime_context,
-        )
+        dr_tools = agent_tools
         # Store on app_state so streaming loop can access them
         if app_state is not None and dr_tools:
             app_state._dr_tools = dr_tools
@@ -1056,7 +1071,8 @@ async def _stream_managed_agent(
     # Template stores tool names as strings; convert to OpenAI function specs
     # so the engine can actually bind them to the model.
     stream_kwargs: Dict[str, Any] = {}
-    resolved_tools = _resolve_tool_specs(_effective_agent_tool_names(agent_record))
+    resolved_tools = [tool.to_openai_function() for tool in agent_tools]
+    tool_instances_by_name = {tool.spec.name: tool for tool in agent_tools}
     if resolved_tools:
         stream_kwargs["tools"] = resolved_tools
 
@@ -1264,8 +1280,6 @@ async def _stream_managed_agent(
                             result = mcp_adapter.execute(**parsed_args)
                             tool_result_content = result.content
                         else:
-                            # Try to use ToolExecutor if tools are configured
-                            from openjarvis.core.registry import ToolRegistry
                             from openjarvis.tools._stubs import (
                                 ToolCall as StubToolCall,
                             )
@@ -1273,20 +1287,8 @@ async def _stream_managed_agent(
                                 ToolExecutor,
                             )
 
-                            tool_cls = ToolRegistry.get(tool_name)
-                            if tool_cls is not None:
-                                if tool_name in (
-                                    "managed_agent_directory",
-                                    "managed_agent_delegate",
-                                    "managed_agent_message",
-                                    "managed_agent_assign_task",
-                                    "managed_agent_list_tasks",
-                                    "managed_agent_update_task",
-                                    "managed_agent_inspect",
-                                ):
-                                    tool_instance = tool_cls(context=runtime_context)
-                                else:
-                                    tool_instance = tool_cls()
+                            tool_instance = tool_instances_by_name.get(tool_name)
+                            if tool_instance is not None:
                                 # Tools the user explicitly added to this
                                 # agent's toolkit are considered pre-approved —
                                 # selecting them in the wizard is the
@@ -1312,7 +1314,7 @@ async def _stream_managed_agent(
                                 tool_result_content = result.content
                             else:
                                 logger.warning(
-                                    "Tool '%s' not found in registry or MCP adapters",
+                                    "Tool '%s' not found in agent tool set or MCP adapters",
                                     tool_name,
                                 )
                         tool_succeeded = True
@@ -1447,7 +1449,7 @@ def create_agent_manager_router(
 
     @agents_router.get("")
     async def list_agents():
-        return {"agents": manager.list_agents()}
+        return {"agents": [_enrich_agent_record(agent) for agent in manager.list_agents()]}
 
     @agents_router.post("")
     async def create_agent(req: CreateAgentRequest, request: Request):
@@ -1477,14 +1479,14 @@ def create_agent_manager_router(
         if scheduler and sched_type in ("cron", "interval"):
             scheduler.register_agent(agent["id"])
 
-        return agent
+        return _enrich_agent_record(agent)
 
     @agents_router.get("/{agent_id}")
     async def get_agent(agent_id: str):
         agent = manager.get_agent(agent_id)
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
-        return agent
+        return _enrich_agent_record(agent)
 
     @agents_router.patch("/{agent_id}")
     async def update_agent(agent_id: str, req: UpdateAgentRequest):
@@ -1506,7 +1508,7 @@ def create_agent_manager_router(
         if "manager_agent_id" in fields_set:
             kwargs["manager_agent_id"] = req.manager_agent_id
         try:
-            return manager.update_agent(agent_id, **kwargs)
+            return _enrich_agent_record(manager.update_agent(agent_id, **kwargs))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -2085,6 +2087,48 @@ def create_agent_manager_router(
     @templates_router.get("")
     async def list_templates():
         return {"templates": AgentManager.list_templates()}
+
+    @templates_router.get("/{template_id}")
+    async def get_template(template_id: str):
+        try:
+            return get_template_document(template_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @templates_router.post("")
+    async def create_template(req: TemplateDocumentRequest):
+        try:
+            return save_template_document(req.content)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @templates_router.put("/{template_id}")
+    async def update_template(template_id: str, req: TemplateDocumentRequest):
+        try:
+            parsed = parse_template_content(req.content)
+            if str(parsed.get("id", "")) != str(template_id):
+                raise ValueError("Template id in content must match the URL")
+            return save_template_document(req.content)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @templates_router.delete("/{template_id}")
+    async def remove_template(template_id: str):
+        try:
+            delete_template(template_id)
+            return {"deleted": True, "id": template_id}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @templates_router.post("/{template_id}/instantiate")
     async def instantiate_template(template_id: str, req: CreateAgentRequest):

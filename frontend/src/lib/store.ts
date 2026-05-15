@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { resolveModelSelection } from './models';
 import type {
   Conversation,
   ChatMessage,
@@ -92,7 +93,9 @@ function loadSettings(): Settings {
     defaultModel: '',
     defaultAgent: '',
     temperature: 0.7,
-    maxTokens: 4096,
+    // Caps Ollama num_predict. 4096 made CPU voice replies run for ~minutes;
+    // 768 keeps interactive answers snappy. Raise via Settings for long-form.
+    maxTokens: 768,
     speechEnabled: false,
     speechStreaming: true,
     ttsAutoplay: false,
@@ -308,12 +311,18 @@ export const useAppStore = create<AppState>((set, get) => {
 
     createConversation: (model?: string) => {
       const store = loadConversations();
+      const resolvedModel = resolveModelSelection({
+        selectedModel: model || get().selectedModel,
+        defaultModel: get().settings.defaultModel,
+        serverModel: get().serverInfo?.model || '',
+        models: get().models,
+      });
       const conv: Conversation = {
         id: generateId(),
         title: 'New chat',
         createdAt: Date.now(),
         updatedAt: Date.now(),
-        model: model || get().selectedModel || 'default',
+        model: resolvedModel || 'default',
         messages: [],
       };
       store.conversations[conv.id] = conv;

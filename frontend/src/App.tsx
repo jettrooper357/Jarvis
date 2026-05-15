@@ -7,12 +7,14 @@ import { SettingsPage } from './pages/SettingsPage';
 import { GetStartedPage } from './pages/GetStartedPage';
 import { AgentsPage } from './pages/AgentsPage';
 import { DataSourcesPage } from './pages/DataSourcesPage';
+import { LibraryPage } from './pages/LibraryPage';
 import { LogsPage } from './pages/LogsPage';
 import { CommandPalette } from './components/CommandPalette';
 import { SetupScreen } from './components/SetupScreen';
 import { Toaster } from './components/ui/sonner';
 import { useAppStore } from './lib/store';
 import { fetchModels, fetchServerInfo, fetchSavings, submitSavings, isTauri } from './lib/api';
+import { resolveModelSelection } from './lib/models';
 import { OptInModal } from './components/OptInModal';
 
 export default function App() {
@@ -60,9 +62,14 @@ export default function App() {
       .then((m) => {
         setModels(m);
         if (m.length === 0) return;
-        // If a stored selection is no longer installed, fall back to first.
-        const stillExists = selectedModel && m.some((entry) => entry.id === selectedModel);
-        if (!stillExists) setSelectedModel(m[0].id);
+        const resolvedModel = resolveModelSelection({
+          selectedModel,
+          defaultModel: settings.defaultModel,
+          models: m,
+        });
+        if (resolvedModel && resolvedModel !== selectedModel) {
+          setSelectedModel(resolvedModel);
+        }
       })
       .catch(() => setModels([]))
       .finally(() => setModelsLoading(false));
@@ -180,6 +187,7 @@ export default function App() {
           <Route path="get-started" element={<GetStartedPage />} />
           <Route path="data-sources" element={<DataSourcesPage />} />
           <Route path="agents" element={<AgentsPage />} />
+          <Route path="library" element={<LibraryPage />} />
           <Route path="logs" element={<LogsPage />} />
         </Route>
       </Routes>

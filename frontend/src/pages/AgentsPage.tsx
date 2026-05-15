@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
+import { useNavigate } from 'react-router';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { toast } from 'sonner';
@@ -23,6 +24,7 @@ import {
   fetchAgentTraces,
   fetchManagedAgent,
   fetchAvailableTools,
+  fetchSkills,
   saveToolCredentials,
   fetchModels,
   updateManagedAgent,
@@ -32,7 +34,7 @@ import {
   sendblueTest,
   sendblueHealth,
 } from '../lib/api';
-import type { AgentTask, ChannelBinding, AgentTemplate, AgentMessage, ManagedAgent, LearningLogEntry, AgentTrace, ToolInfo } from '../lib/api';
+import type { AgentTask, ChannelBinding, AgentTemplate, AgentMessage, ManagedAgent, LearningLogEntry, AgentTrace, ToolInfo, InstalledSkill } from '../lib/api';
 import { useAgentEvents } from '../lib/useAgentEvents';
 import {
   Plus,
@@ -430,6 +432,39 @@ function getOrgRoots(agents: ManagedAgent[]): ManagedAgent[] {
   return agents
     .filter((agent) => !agent.manager_agent_id || !knownIds.has(agent.manager_agent_id))
     .sort(compareAgentsForOrg);
+}
+
+const TEMPLATE_METADATA_KEYS = new Set(['id', 'name', 'description', 'source', 'editable']);
+
+function applyTemplateConfig(
+  currentConfig: Record<string, unknown>,
+  template: AgentTemplate | undefined,
+  selectedSkills: string[],
+): { config: Record<string, unknown>; agentType?: string } {
+  const nextConfig: Record<string, unknown> = { ...currentConfig, skills: selectedSkills };
+  if (!template) {
+    delete nextConfig.template_id;
+    return { config: nextConfig };
+  }
+
+  const templateConfig: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(template)) {
+    if (!TEMPLATE_METADATA_KEYS.has(key)) {
+      templateConfig[key] = value;
+    }
+  }
+
+  const mergedConfig = {
+    ...currentConfig,
+    ...templateConfig,
+    template_id: template.id,
+    skills: selectedSkills,
+  };
+
+  return {
+    config: mergedConfig,
+    agentType: typeof template.agent_type === 'string' ? template.agent_type : undefined,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1908,6 +1943,254 @@ function AgentConfigGrid({ agent, onAgentUpdated }: { agent: ManagedAgent; onAge
           <span style={{ color: 'var(--color-text)' }}>{value}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+function AgentPresetToolsSection({
+  agent,
+  templates,
+  skills,
+  onAgentUpdated,
+  onOpenLibrary,
+}: {
+  agent: ManagedAgent;
+  templates: AgentTemplate[];
+  skills: InstalledSkill[];
+  onAgentUpdated: () => void;
+  onOpenLibrary: () => void;
+}) {
+  const configuredTools = Array.isArray(agent.configured_tools)
+    ? agent.configured_tools
+    : Array.isArray(agent.config?.tools)
+      ? (agent.config.tools as unknown[]).filter((tool): tool is string => typeof tool === 'string')
+      : [];
+  const configuredSkills = Array.isArray(agent.configured_skills)
+    ? agent.configured_skills
+    : Array.isArray(agent.config?.skills)
+      ? (agent.config.skills as unknown[]).filter((skill): skill is string => typeof skill === 'string')
+      : [];
+  const autoTools = Array.isArray(agent.auto_tools) ? agent.auto_tools : [];
+  const effectiveTools = Array.isArray(agent.effective_tools)
+    ? agent.effective_tools
+    : [...configuredTools, ...autoTools.filter((tool) => !configuredTools.includes(tool))];
+  const effectiveSkills = Array.isArray(agent.effective_skills)
+    ? agent.effective_skills
+    : configuredSkills;
+  const templateId =
+    agent.template_id ||
+    (typeof agent.config?.template_id === 'string' ? agent.config.template_id : '');
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [presetId, setPresetId] = useState(templateId);
+  const [selectedSkills, setSelectedSkills] = useState<string[]>(configuredSkills);
+  const templateName = templateId
+    ? (templates.find((tpl) => tpl.id === templateId)?.name || templateId)
+    : 'Custom';
+
+  useEffect(() => {
+    setEditing(false);
+    setSaving(false);
+    setPresetId(templateId);
+    setSelectedSkills(configuredSkills);
+  }, [agent.id, templateId, configuredSkills.join('|')]);
+
+  const renderBadgeGroup = (label: string, items: string[]) => (
+    <div>
+      <div className="text-xs mb-1" style={{ color: 'var(--color-text-tertiary)' }}>
+        {label}
+      </div>
+      {items.length > 0 ? (
+        <div className="flex flex-wrap gap-1.5">
+          {items.map((item) => (
+            <span
+              key={`${label}-${item}`}
+              className="px-2 py-0.5 rounded text-xs font-mono"
+              style={{
+                background: 'var(--color-bg)',
+                border: '1px solid var(--color-border)',
+                color: 'var(--color-text-secondary)',
+              }}
+            >
+              {item}
+            </span>
+          ))}
+        </div>
+      ) : (
+        <div className="text-sm" style={{ color: 'var(--color-text)' }}>None</div>
+      )}
+    </div>
+  );
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      const chosenTemplate = templates.find((tpl) => tpl.id === presetId);
+      const applied = applyTemplateConfig(
+        (agent.config || {}) as Record<string, unknown>,
+        chosenTemplate,
+        selectedSkills,
+      );
+      if (!presetId) {
+        delete applied.config.template_id;
+      }
+      const body: Parameters<typeof updateManagedAgent>[1] = {
+        config: applied.config,
+      };
+      if (presetId && applied.agentType) {
+        body.agent_type = applied.agentType;
+      }
+      await updateManagedAgent(agent.id, body);
+      setEditing(false);
+      onAgentUpdated();
+      toast.success('Capabilities updated');
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to update capabilities');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function toggleSkill(skillName: string) {
+    setSelectedSkills((current) =>
+      current.includes(skillName)
+        ? current.filter((entry) => entry !== skillName)
+        : [...current, skillName],
+    );
+  }
+
+  return (
+    <div
+      className="p-3 rounded-lg space-y-3"
+      style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+            Capability Inspector
+          </h3>
+          <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+            Assign only the preset and skills this agent should carry, then inspect the final runtime tool set.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={onOpenLibrary}
+            className="px-3 py-1.5 rounded-lg text-xs cursor-pointer"
+            style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}
+          >
+            Library
+          </button>
+          {editing ? (
+            <>
+              <button
+                onClick={() => {
+                  setEditing(false);
+                  setPresetId(templateId);
+                  setSelectedSkills(configuredSkills);
+                }}
+                className="px-3 py-1.5 rounded-lg text-xs cursor-pointer"
+                style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSave}
+                disabled={saving}
+                className="px-3 py-1.5 rounded-lg text-xs cursor-pointer disabled:opacity-50"
+                style={{ background: 'var(--color-accent)', color: 'var(--color-on-accent)' }}
+              >
+                {saving ? 'Saving...' : 'Save'}
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={() => setEditing(true)}
+              className="px-3 py-1.5 rounded-lg text-xs cursor-pointer"
+              style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}
+            >
+              Edit
+            </button>
+          )}
+        </div>
+      </div>
+      {editing && (
+        <div className="space-y-3 p-3 rounded-lg" style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)' }}>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-sm">
+              <div className="text-xs mb-1" style={{ color: 'var(--color-text-tertiary)' }}>Preset</div>
+              <select
+                value={presetId}
+                onChange={(e) => setPresetId(e.target.value)}
+                className="w-full px-3 py-2 rounded-lg text-sm"
+                style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+              >
+                <option value="">Custom / Keep current config</option>
+                {templates.map((template) => (
+                  <option key={template.id} value={template.id}>
+                    {template.name} ({template.source})
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="text-xs self-end" style={{ color: 'var(--color-text-tertiary)' }}>
+              Applying a preset updates this agent&apos;s stored config with that preset&apos;s defaults, then keeps the selected skill list agent-specific.
+            </div>
+          </div>
+          <div>
+            <div className="text-xs mb-2" style={{ color: 'var(--color-text-tertiary)' }}>
+              Assigned skills
+            </div>
+            {skills.length > 0 ? (
+              <div className="grid grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
+                {skills.map((skill) => (
+                  <label
+                    key={skill.name}
+                    className="flex items-start gap-2 p-2 rounded-lg cursor-pointer"
+                    style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedSkills.includes(skill.name)}
+                      onChange={() => toggleSkill(skill.name)}
+                    />
+                    <span>
+                      <span className="block text-sm" style={{ color: 'var(--color-text)' }}>
+                        {skill.name}
+                      </span>
+                      <span className="block text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                        {skill.source || 'built-in'}{skill.description ? ` • ${skill.description}` : ''}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            ) : (
+              <div className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+                No installed skills found.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+      <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+        <div>
+          <div className="text-xs mb-1" style={{ color: 'var(--color-text-tertiary)' }}>Preset</div>
+          <div style={{ color: 'var(--color-text)' }}>{templateName}</div>
+        </div>
+        <div>
+          <div className="text-xs mb-1" style={{ color: 'var(--color-text-tertiary)' }}>Knowledge Access</div>
+          <div style={{ color: 'var(--color-text)' }}>
+            {agent.knowledge_enabled ? 'On' : 'Off'}
+          </div>
+        </div>
+      </div>
+      {renderBadgeGroup('Installed global skills', skills.map((skill) => skill.name))}
+      {renderBadgeGroup('Assigned skills', configuredSkills)}
+      {renderBadgeGroup('Effective skills', effectiveSkills)}
+      {renderBadgeGroup('Configured tools', configuredTools)}
+      {renderBadgeGroup('Auto-enabled tools', autoTools)}
+      {renderBadgeGroup('Effective tools', effectiveTools)}
     </div>
   );
 }
@@ -4187,6 +4470,7 @@ function LogsTab({ agentId }: { agentId: string }) {
 // ---------------------------------------------------------------------------
 
 export function AgentsPage() {
+  const navigate = useNavigate();
   const managedAgents = useAppStore((s) => s.managedAgents);
   const setManagedAgents = useAppStore((s) => s.setManagedAgents);
   const selectedAgentId = useAppStore((s) => s.selectedAgentId);
@@ -4197,8 +4481,14 @@ export function AgentsPage() {
   const [tasks, setTasks] = useState<AgentTask[]>([]);
   const [channels, setChannels] = useState<ChannelBinding[]>([]);
   const [templates, setTemplates] = useState<AgentTemplate[]>([]);
+  const [skills, setSkills] = useState<InstalledSkill[]>([]);
   const [showWizard, setShowWizard] = useState(false);
   const [detailTab, setDetailTab] = useState<'overview' | 'interact' | 'channels' | 'messaging' | 'tasks' | 'memory' | 'learning' | 'logs'>('interact');
+
+  const refreshLibrary = useCallback(() => {
+    fetchTemplates().then(setTemplates).catch(() => {});
+    fetchSkills().then(setSkills).catch(() => setSkills([]));
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -4217,8 +4507,8 @@ export function AgentsPage() {
 
   useEffect(() => {
     refresh();
-    fetchTemplates().then(setTemplates).catch(() => {});
-  }, [refresh]);
+    refreshLibrary();
+  }, [refresh, refreshLibrary]);
 
   const selectedAgent = managedAgents.find((a) => a.id === selectedAgentId);
 
@@ -4475,6 +4765,14 @@ export function AgentsPage() {
               agent={selectedAgent}
               managedAgents={managedAgents}
               onAgentUpdated={refresh}
+            />
+
+            <AgentPresetToolsSection
+              agent={selectedAgent}
+              templates={templates}
+              skills={skills}
+              onAgentUpdated={refresh}
+              onOpenLibrary={() => navigate('/library')}
             />
 
             {/* Hint for deep research agents */}

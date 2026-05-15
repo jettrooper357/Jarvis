@@ -24,6 +24,19 @@ except ImportError:  # pragma: no cover — optional dep
 
 # silero-vad's 16kHz frame size. Anything else needs resampling.
 _VAD_FRAME_SAMPLES = 512
+_CACHED_VAD_MODEL = None
+
+
+def _get_vad_model():
+    global _CACHED_VAD_MODEL
+    if load_silero_vad is None:
+        raise ImportError(
+            "silero-vad is not installed. "
+            "Install with: uv sync --extra speech"
+        )
+    if _CACHED_VAD_MODEL is None:
+        _CACHED_VAD_MODEL = load_silero_vad(onnx=False)
+    return _CACHED_VAD_MODEL
 
 
 @dataclass(slots=True)
@@ -51,7 +64,7 @@ class SileroVAD:
                 "silero-vad is not installed. "
                 "Install with: uv sync --extra speech"
             )
-        self._model = load_silero_vad(onnx=False)
+        self._model = _get_vad_model()
         self._iter = VADIterator(
             self._model,
             threshold=threshold,

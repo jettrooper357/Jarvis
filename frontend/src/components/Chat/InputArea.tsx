@@ -1,13 +1,14 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Send, Square, Paperclip } from 'lucide-react';
+import { Send, Square } from 'lucide-react';
 import { useAppStore, generateId } from '../../lib/store';
 import { streamChat } from '../../lib/sse';
 import { fetchSavings, getBase } from '../../lib/api';
+import { resolveModelSelection } from '../../lib/models';
 import { MicButton } from './MicButton';
 import { useSpeech } from '../../hooks/useSpeech';
 import { useStreamingSpeech } from '../../hooks/useStreamingSpeech';
 import { useTTSPlayer } from '../../hooks/useTTSPlayer';
-import { matchWakeWord } from '../../lib/wakeWord';
+import { getEffectiveWakeWords, matchWakeWord } from '../../lib/wakeWord';
 import type { ChatMessage, ToolCallInfo, TokenUsage, MessageTelemetry } from '../../types';
 
 type ApiMessage = { role: string; content: string };
@@ -40,14 +41,18 @@ function buildContextMessages(messages: ChatMessage[], limit: number): ApiMessag
 
 export function InputArea() {
   const [input, setInput] = useState('');
+  const [wakeAwaitingCommand, setWakeAwaitingCommand] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wakeAwaitingCommandRef = useRef(false);
+  const wakeTimeoutRef = useRef<number | null>(null);
 
   const activeId = useAppStore((s) => s.activeId);
   const selectedModel = useAppStore((s) => s.selectedModel);
-  const streamState = useAppStore((s) => s.streamState);
-  const messages = useAppStore((s) => s.messages);
+  const models = useAppStore((s) => s.models);
+  const isStreaming = useAppStore((s) => s.streamState.isStreaming);
+  const defaultModel = useAppStore((s) => s.settings.defaultModel);
   const speechEnabled = useAppStore((s) => s.settings.speechEnabled);
   const speechStreaming = useAppStore((s) => s.settings.speechStreaming);
   const ttsAutoplay = useAppStore((s) => s.settings.ttsAutoplay);
@@ -58,20 +63,54 @@ export function InputArea() {
   const temperature = useAppStore((s) => s.settings.temperature);
   const createConversation = useAppStore((s) => s.createConversation);
   const addMessage = useAppStore((s) => s.addMessage);
-  const updateLastAssistant = useAppStore((s) => s.updateLastAssistant);
   const setStreamState = useAppStore((s) => s.setStreamState);
   const resetStream = useAppStore((s) => s.resetStream);
   const modelLoading = useAppStore((s) => s.modelLoading);
+  const serverModel = useAppStore((s) => s.serverInfo?.model || '');
+  const effectiveWakeWords = getEffectiveWakeWords(wakeWords);
 
   const { state: speechState, available: speechAvailable, startRecording, stopRecording } = useSpeech();
   const sendRef = useRef<((override?: string) => Promise<void>) | null>(null);
+  const clearWakeAwaitingCommand = useCallback(() => {
+    if (wakeTimeoutRef.current !== null) {
+      window.clearTimeout(wakeTimeoutRef.current);
+      wakeTimeoutRef.current = null;
+    }
+    wakeAwaitingCommandRef.current = false;
+    setWakeAwaitingCommand(false);
+  }, []);
+  const armWakeAwaitingCommand = useCallback(() => {
+    if (wakeTimeoutRef.current !== null) {
+      window.clearTimeout(wakeTimeoutRef.current);
+    }
+    wakeAwaitingCommandRef.current = true;
+    setWakeAwaitingCommand(true);
+    wakeTimeoutRef.current = window.setTimeout(() => {
+      wakeTimeoutRef.current = null;
+      wakeAwaitingCommandRef.current = false;
+      setWakeAwaitingCommand(false);
+    }, 8000);
+  }, []);
   // tts is declared before `streaming` so the barge-in callback can reference it.
   const tts = useTTSPlayer({ voiceId: ttsVoice, speed: ttsSpeed });
   const streaming = useStreamingSpeech({
     onFinal: (text) => {
+      const spoken = text.trim();
+      if (!spoken) return;
       const filtered = matchWakeWord(text, wakeWords);
-      if (filtered === null) return;
-      if (filtered.trim()) sendRef.current?.(filtered);
+      if (filtered === null) {
+        if (wakeAwaitingCommandRef.current) {
+          clearWakeAwaitingCommand();
+          sendRef.current?.(spoken);
+        }
+        return;
+      }
+      clearWakeAwaitingCommand();
+      if (filtered.trim()) {
+        sendRef.current?.(filtered);
+        return;
+      }
+      armWakeAwaitingCommand();
     },
     // Barge-in: the moment VAD hears the user, cut the assistant off.
     onSpeechStart: () => tts.stop(),
@@ -81,7 +120,7 @@ export function InputArea() {
   // continuously so the user can speak to the chat hands-free. The streaming
   // hook's onFinal already drops non-matching utterances, so passing nothing
   // through happens silently. Only auto-start when speech is fully wired up.
-  const hasWakeWords = wakeWords.length > 0;
+  const hasWakeWords = effectiveWakeWords.length > 0;
   useEffect(() => {
     if (!hasWakeWords) return;
     if (!speechEnabled || !speechStreaming) return;
@@ -95,7 +134,7 @@ export function InputArea() {
   // This prevents errors from trying to continue a stream with a stale model.
   const prevModelRef = useRef(selectedModel);
   useEffect(() => {
-    if (prevModelRef.current !== selectedModel && streamState.isStreaming) {
+    if (prevModelRef.current !== selectedModel && isStreaming) {
       abortRef.current?.abort();
       if (timerRef.current) {
         clearInterval(timerRef.current);
@@ -105,14 +144,14 @@ export function InputArea() {
       abortRef.current = null;
     }
     prevModelRef.current = selectedModel;
-  }, [selectedModel, streamState.isStreaming, resetStream]);
+  }, [selectedModel, isStreaming, resetStream]);
 
   const effectiveMicAvailable = speechStreaming ? streaming.available : speechAvailable;
-  const micDisabled = !speechEnabled || !effectiveMicAvailable || streamState.isStreaming;
+  const micDisabled = !speechEnabled || !effectiveMicAvailable || isStreaming;
   const micReason: 'not-enabled' | 'no-backend' | 'streaming' | undefined =
     !speechEnabled ? 'not-enabled'
     : !effectiveMicAvailable ? 'no-backend'
-    : streamState.isStreaming ? 'streaming'
+    : isStreaming ? 'streaming'
     : undefined;
 
   const micState: 'idle' | 'recording' | 'transcribing' = speechStreaming
@@ -150,6 +189,13 @@ export function InputArea() {
     el.style.height = Math.min(el.scrollHeight, 200) + 'px';
   }, [input]);
 
+  useEffect(() => () => {
+    if (wakeTimeoutRef.current !== null) {
+      window.clearTimeout(wakeTimeoutRef.current);
+      wakeTimeoutRef.current = null;
+    }
+  }, []);
+
   const stopStreaming = useCallback(() => {
     abortRef.current?.abort();
     if (timerRef.current) {
@@ -161,14 +207,31 @@ export function InputArea() {
 
   const sendMessage = useCallback(async (override?: string) => {
     const content = (override ?? input).trim();
-    if (!content || streamState.isStreaming) return;
+    if (!content || isStreaming) return;
+
+    const effectiveModel = resolveModelSelection({
+      selectedModel,
+      defaultModel,
+      serverModel,
+      models,
+    });
+    if (!effectiveModel) {
+      useAppStore.getState().addLogEntry({
+        timestamp: Date.now(),
+        level: 'error',
+        category: 'chat',
+        message: 'Cannot send message: no model is selected or installed.',
+      });
+      return;
+    }
 
     if (override === undefined) setInput('');
     if (ttsAutoplay) tts.stop();
+    clearWakeAwaitingCommand();
 
     let convId = activeId;
     if (!convId) {
-      convId = createConversation(selectedModel);
+      convId = createConversation(effectiveModel);
     }
 
     const userMsg: ChatMessage = {
@@ -186,19 +249,11 @@ export function InputArea() {
     const contextLimit = useAppStore.getState().settings.contextMaxMessages;
     const apiMessages = buildContextMessages(currentMessages, contextLimit);
 
-    const assistantMsg: ChatMessage = {
-      id: generateId(),
-      role: 'assistant',
-      content: '',
-      timestamp: Date.now(),
-    };
-    addMessage(convId, assistantMsg);
-
     // Start streaming
     const startTime = Date.now();
     const timer = setInterval(() => {
       setStreamState({ elapsedMs: Date.now() - startTime });
-    }, 100);
+    }, 250);
     timerRef.current = timer;
 
     const controller = new AbortController();
@@ -208,7 +263,7 @@ export function InputArea() {
     let usage: TokenUsage | undefined;
     let complexity: { score: number; tier: string; suggested_max_tokens: number } | undefined;
     const toolCalls: ToolCallInfo[] = [];
-    let lastFlush = 0;
+    let lastDraftFlush = 0;
     let ttftMs: number | undefined;
 
     setStreamState({
@@ -222,12 +277,12 @@ export function InputArea() {
       timestamp: Date.now(),
       level: 'info',
       category: 'chat',
-      message: `Request: "${content.slice(0, 80)}${content.length > 80 ? '...' : ''}" → ${selectedModel}`,
+      message: `Request: "${content.slice(0, 80)}${content.length > 80 ? '...' : ''}" -> ${effectiveModel}`,
     });
 
     try {
       for await (const sseEvent of streamChat(
-        { model: selectedModel, messages: apiMessages, stream: true, temperature, max_tokens: maxTokens },
+        { model: effectiveModel, messages: apiMessages, stream: true, temperature, max_tokens: maxTokens },
         controller.signal,
       )) {
         const eventName = sseEvent.event;
@@ -238,7 +293,7 @@ export function InputArea() {
           setStreamState({ phase: 'Generating...' });
           useAppStore.getState().addLogEntry({
             timestamp: Date.now(), level: 'info', category: 'chat',
-            message: `Generating with ${selectedModel}...`,
+            message: `Generating with ${effectiveModel}...`,
           });
         } else if (eventName === 'tool_call_start') {
           try {
@@ -254,7 +309,6 @@ export function InputArea() {
               phase: `Calling ${data.tool}...`,
               activeToolCalls: [...toolCalls],
             });
-            updateLastAssistant(convId, accumulatedContent, [...toolCalls]);
             useAppStore.getState().addLogEntry({
               timestamp: Date.now(), level: 'info', category: 'tool',
               message: `Calling ${data.tool}(${data.arguments || ''})`,
@@ -275,7 +329,6 @@ export function InputArea() {
               phase: 'Generating...',
               activeToolCalls: [...toolCalls],
             });
-            updateLastAssistant(convId, accumulatedContent, [...toolCalls]);
           } catch {}
         } else {
           try {
@@ -286,18 +339,12 @@ export function InputArea() {
             if (delta?.content) {
               if (!ttftMs) ttftMs = Date.now() - startTime;
               accumulatedContent += delta.content;
-              setStreamState({ content: accumulatedContent, phase: '' });
-              if (ttsAutoplay) tts.feedToken(delta.content);
-
               const now = Date.now();
-              if (now - lastFlush >= 80) {
-                updateLastAssistant(
-                  convId,
-                  accumulatedContent,
-                  toolCalls.length > 0 ? [...toolCalls] : undefined,
-                );
-                lastFlush = now;
+              if (now - lastDraftFlush >= 50) {
+                setStreamState({ content: accumulatedContent, phase: '' });
+                lastDraftFlush = now;
               }
+              if (ttsAutoplay) tts.feedToken(delta.content);
             }
             if (data.choices?.[0]?.finish_reason === 'stop') break;
           } catch {}
@@ -320,12 +367,13 @@ export function InputArea() {
       if (!accumulatedContent) {
         accumulatedContent = 'No response was generated. Please try again.';
       }
+      setStreamState({ content: accumulatedContent });
       const totalMs = Date.now() - startTime;
       const _CLOUD_PREFIXES = ['gpt-', 'o1-', 'o3-', 'o4-', 'claude-', 'gemini-', 'openrouter/', 'MiniMax-', 'chatgpt-'];
-      const engineLabel = _CLOUD_PREFIXES.some(p => selectedModel.startsWith(p)) ? 'cloud' : 'ollama';
+      const engineLabel = _CLOUD_PREFIXES.some(p => effectiveModel.startsWith(p)) ? 'cloud' : 'ollama';
       const telemetry: MessageTelemetry = {
         engine: engineLabel,
-        model_id: selectedModel,
+        model_id: effectiveModel,
         total_ms: totalMs,
         ttft_ms: ttftMs,
         tokens_per_sec: usage?.completion_tokens
@@ -349,14 +397,17 @@ export function InputArea() {
         // Not a digest response or server unavailable — skip
       }
 
-      updateLastAssistant(
-        convId,
-        accumulatedContent,
-        toolCalls.length > 0 ? toolCalls : undefined,
+      const assistantMsg: ChatMessage = {
+        id: generateId(),
+        role: 'assistant',
+        content: accumulatedContent,
+        timestamp: Date.now(),
+        toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
         usage,
         telemetry,
-        audioMeta,
-      );
+        audio: audioMeta,
+      };
+      addMessage(convId, assistantMsg);
       if (ttsAutoplay) tts.flush();
       if (timerRef.current) {
         clearInterval(timerRef.current);
@@ -377,16 +428,19 @@ export function InputArea() {
     input,
     activeId,
     selectedModel,
-    streamState.isStreaming,
+    models,
+    defaultModel,
+    serverModel,
+    isStreaming,
     createConversation,
     addMessage,
-    updateLastAssistant,
     setStreamState,
     resetStream,
     ttsAutoplay,
     tts,
     temperature,
     maxTokens,
+    clearWakeAwaitingCommand,
   ]);
 
   useEffect(() => {
@@ -412,7 +466,19 @@ export function InputArea() {
 
   return (
     <div className="px-4 pb-4 pt-2" style={{ maxWidth: 'var(--chat-max-width)', margin: '0 auto', width: '100%' }}>
-      {speechStreaming && (streaming.isListening || streaming.interim) && (
+      {wakeAwaitingCommand && streaming.state === 'listening' && (
+        <div
+          className="mb-2 px-3 py-2 rounded-xl text-sm italic"
+          style={{
+            background: 'var(--color-bg-tertiary)',
+            color: 'var(--color-text-secondary)',
+            border: '1px solid var(--color-input-border)',
+          }}
+        >
+          Wake word heard. Listening for your command...
+        </div>
+      )}
+      {speechStreaming && (streaming.isListening || streaming.interim) && !wakeAwaitingCommand && (
         <div
           className="mb-2 px-3 py-2 rounded-xl text-sm italic"
           style={{
@@ -424,7 +490,7 @@ export function InputArea() {
           {streaming.interim ||
             (streaming.state === 'listening'
               ? hasWakeWords
-                ? `Listening for "${wakeWords[0]}"…`
+                ? `Listening for "${effectiveWakeWords[0]}"...`
                 : 'Listening…'
               : 'Transcribing…')}
         </div>
@@ -454,9 +520,9 @@ export function InputArea() {
           rows={1}
           className="flex-1 bg-transparent outline-none resize-none text-sm leading-relaxed"
           style={{ color: 'var(--color-text)', maxHeight: '200px' }}
-          disabled={streamState.isStreaming || modelLoading}
+          disabled={isStreaming || modelLoading}
         />
-        {streamState.isStreaming ? (
+        {isStreaming ? (
           <button
             onClick={stopStreaming}
             className="p-2 rounded-xl transition-colors shrink-0 cursor-pointer"

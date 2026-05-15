@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { memo, useState, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeKatex from 'rehype-katex';
@@ -122,7 +122,7 @@ function CopyMessageButton({ content }: { content: string }) {
   );
 }
 
-export function MessageBubble({ message }: Props) {
+function MessageBubbleInner({ message }: Props) {
   const isUser = message.role === 'user';
 
   if (isUser) {
@@ -184,3 +184,5 @@ export function MessageBubble({ message }: Props) {
     </div>
   );
 }
+
+export const MessageBubble = memo(MessageBubbleInner);

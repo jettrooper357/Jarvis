@@ -45,7 +45,7 @@ class StreamingTranscriber:
         backend: FasterWhisperBackend,
         *,
         vad_threshold: float = 0.5,
-        min_silence_ms: int = 700,
+        min_silence_ms: int = 400,
         language: Optional[str] = None,
     ) -> None:
         self._backend = backend

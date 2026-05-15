@@ -10,6 +10,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Library page** in the web/desktop UI (sidebar → Library, `/library`) for
+  managing skill and preset definitions (create / edit / delete via a TOML
+  editor) and downloading skills from Hermes Agent, OpenClaw, or any GitHub
+  repo without the CLI. Backed by new REST endpoints
+  `GET /v1/skills/browse` and `POST /v1/skills/install`, which reuse the same
+  resolver/importer machinery as `jarvis skill install`. The Capability
+  Inspector's previously inert "Library" button now opens this page.
 - AI stack support for evaluating other agentic frameworks via subprocess.
   New `evals/backends/external/` subpackage wraps Hermes Agent and OpenClaw
   as one-shot subprocess backends behind the existing `InferenceBackend`

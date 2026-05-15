@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,20 @@ class OptimizeRunRequest(BaseModel):
     max_trials: int = 20
     optimizer_model: str = "claude-sonnet-4-6"
     max_samples: int = 50
+
+
+class SkillDocumentRequest(BaseModel):
+    content: str
+
+
+class SkillInstallRequest(BaseModel):
+    """Install a skill from a remote source (mirrors ``jarvis skill install``)."""
+
+    source: str
+    name: str = ""
+    url: str = ""
+    with_scripts: bool = False
+    force: bool = False
 
 
 # ---- Agent routes ----
@@ -412,33 +427,206 @@ skills_router = APIRouter(prefix="/v1/skills", tags=["skills"])
 async def list_skills(request: Request):
     """List installed skills."""
     try:
-        from openjarvis.core.registry import SkillRegistry
+        from openjarvis.agents.library import list_skills
 
-        skills = []
-        for key in sorted(SkillRegistry.keys()):
-            skills.append({"name": key})
-        return {"skills": skills}
+        return {"skills": list_skills()}
     except Exception as exc:
         logger.warning("Failed to list skills: %s", exc)
         return {"skills": []}
 
 
-@skills_router.post("")
-async def install_skill(request: Request):
-    """Install a skill (placeholder)."""
+def _build_skill_resolver(source: str, url: str = ""):
+    """Return a source resolver instance (no Click dependency).
+
+    Mirrors ``openjarvis.cli.skill_cmd._get_resolver`` but raises plain
+    ``ValueError`` so the HTTP layer can translate to a 400.
+    """
+    source = (source or "").strip().lower()
+    if source == "hermes":
+        from openjarvis.skills.sources.hermes import HermesResolver
+
+        return HermesResolver()
+    if source == "openclaw":
+        from openjarvis.skills.sources.openclaw import OpenClawResolver
+
+        return OpenClawResolver()
+    if source == "github":
+        if not url:
+            raise ValueError("github source requires a repository url")
+        from pathlib import Path
+
+        from openjarvis.skills.sources.github import GitHubResolver
+
+        cache = Path(
+            "~/.openjarvis/skill-cache/github/" + url.rstrip("/").rsplit("/", 1)[-1]
+        ).expanduser()
+        return GitHubResolver(cache_root=cache, repo_url=url)
+    raise ValueError(
+        f"Unknown source {source!r} (expected hermes, openclaw, or github)"
+    )
+
+
+@skills_router.get("/browse")
+async def browse_skills(
+    source: str,
+    query: str = "",
+    category: str = "",
+    url: str = "",
+):
+    """Sync a remote source and return matching installable skills.
+
+    The first call to a source clones its repository and can take a while
+    (OpenClaw in particular is large).
+    """
+    try:
+        resolver = _build_skill_resolver(source, url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        await run_in_threadpool(resolver.sync)
+        available = await run_in_threadpool(resolver.list_skills)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Failed to sync source: {exc}"
+        ) from exc
+
+    q = (query or "").strip().lower()
+    cat = (category or "").strip()
+    results = []
+    for s in available:
+        if cat and s.category != cat:
+            continue
+        haystack = f"{s.name or ''} {s.description or ''} {s.category or ''}".lower()
+        if q and q not in haystack:
+            continue
+        results.append(
+            {
+                "name": s.name,
+                "category": s.category or "",
+                "description": s.description or "",
+                "source": source,
+            }
+        )
+    results.sort(key=lambda r: (r["category"], r["name"]))
+    return {"skills": results[:500], "total": len(results)}
+
+
+@skills_router.post("/install")
+async def install_skill(req: SkillInstallRequest):
+    """Install a single skill from a remote source."""
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="A skill name is required")
+    try:
+        resolver = _build_skill_resolver(req.source, req.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def _do_install():
+        resolver.sync()
+        if "/" in name:
+            category, _, skill_name = name.partition("/")
+            matches = [
+                s
+                for s in resolver.list_skills()
+                if s.name == skill_name and s.category == category
+            ]
+        else:
+            matches = [s for s in resolver.list_skills() if s.name == name]
+        if not matches:
+            raise FileNotFoundError(
+                f"No skill named '{name}' found in source '{req.source}'"
+            )
+        from openjarvis.skills.importer import SkillImporter
+        from openjarvis.skills.parser import SkillParser
+        from openjarvis.skills.tool_translator import ToolTranslator
+
+        importer = SkillImporter(
+            parser=SkillParser(), tool_translator=ToolTranslator()
+        )
+        return importer.import_skill(
+            matches[0], with_scripts=req.with_scripts, force=req.force
+        )
+
+    try:
+        result = await run_in_threadpool(_do_install)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Install failed: {exc}"
+        ) from exc
+
+    if not result.success:
+        raise HTTPException(
+            status_code=400,
+            detail="; ".join(result.warnings or ["unknown error"]),
+        )
     return {
-        "status": "not_implemented",
-        "message": "Use TOML files in ~/.openjarvis/skills/",
+        "success": True,
+        "skipped": result.skipped,
+        "name": name,
+        "source": req.source,
+        "target_path": str(result.target_path) if result.target_path else "",
+        "translated_tools": result.translated_tools,
+        "untranslated_tools": result.untranslated_tools,
+        "scripts_imported": result.scripts_imported,
+        "warnings": result.warnings,
     }
+
+
+@skills_router.post("")
+async def save_skill(req: SkillDocumentRequest):
+    try:
+        from openjarvis.agents.library import save_skill_document
+
+        return save_skill_document(req.content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@skills_router.get("/{skill_name}")
+async def get_skill(skill_name: str):
+    try:
+        from openjarvis.agents.library import get_skill_document
+
+        return get_skill_document(skill_name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@skills_router.put("/{skill_name}")
+async def update_skill(skill_name: str, req: SkillDocumentRequest):
+    try:
+        from openjarvis.agents.library import parse_skill_content, save_skill_document
+
+        parsed = parse_skill_content(req.content)
+        if str(parsed.get("name", "")) != str(skill_name):
+            raise ValueError("Skill name in content must match the URL")
+        return save_skill_document(req.content)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @skills_router.delete("/{skill_name}")
 async def remove_skill(skill_name: str, request: Request):
-    """Remove a skill (placeholder)."""
-    return {
-        "status": "not_implemented",
-        "message": "Skill removal not yet supported via API",
-    }
+    try:
+        from openjarvis.agents.library import delete_skill
+
+        delete_skill(skill_name)
+        return {"deleted": True, "name": skill_name}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ---- Sessions routes ----
@@ -746,6 +934,8 @@ speech_router = APIRouter(prefix="/v1/speech", tags=["speech"])
 @speech_router.post("/transcribe")
 async def transcribe_speech(request: Request):
     """Transcribe uploaded audio to text."""
+    import asyncio
+
     backend = getattr(request.app.state, "speech_backend", None)
     if backend is None:
         raise HTTPException(status_code=501, detail="Speech backend not configured")
@@ -762,7 +952,12 @@ async def transcribe_speech(request: Request):
     filename = getattr(audio_file, "filename", "audio.wav")
     ext = filename.rsplit(".", 1)[-1] if "." in filename else "wav"
 
-    result = backend.transcribe(audio_bytes, format=ext, language=language or None)
+    result = await asyncio.to_thread(
+        backend.transcribe,
+        audio_bytes,
+        format=ext,
+        language=language or None,
+    )
     return {
         "text": result.text,
         "language": result.language,

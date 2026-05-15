@@ -498,40 +498,12 @@ class AgentManager:
     @staticmethod
     def list_templates() -> List[Dict[str, Any]]:
         """Discover built-in and user templates."""
-        import importlib.resources
-
         try:
-            import tomllib
-        except ModuleNotFoundError:
-            import tomli as tomllib  # type: ignore[no-redef]
+            from openjarvis.agents.library import list_templates
 
-        templates: List[Dict[str, Any]] = []
-
-        # Built-in templates
-        try:
-            tpl_dir = importlib.resources.files("openjarvis.agents") / "templates"
-            for item in tpl_dir.iterdir():
-                if str(item).endswith(".toml"):
-                    data = tomllib.loads(item.read_text(encoding="utf-8"))
-                    tpl = data.get("template", {})
-                    tpl["source"] = "built-in"
-                    templates.append(tpl)
+            return list_templates()
         except Exception:
-            pass
-
-        # User templates
-        user_dir = Path("~/.openjarvis/templates").expanduser()
-        if user_dir.is_dir():
-            for f in user_dir.glob("*.toml"):
-                try:
-                    data = tomllib.loads(f.read_text(encoding="utf-8"))
-                    tpl = data.get("template", {})
-                    tpl["source"] = "user"
-                    templates.append(tpl)
-                except Exception:
-                    pass
-
-        return templates
+            return []
 
     def create_from_template(
         self,
@@ -551,6 +523,7 @@ class AgentManager:
         config = {k: v for k, v in tpl.items() if k not in skip}
         if overrides:
             config.update(overrides)
+        config.setdefault("template_id", template_id)
         agent_type = config.pop("agent_type", "monitor_operative")
 
         # Expand system_prompt_template with instruction

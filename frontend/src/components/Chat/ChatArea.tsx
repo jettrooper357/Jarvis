@@ -1,15 +1,27 @@
-import { useRef, useEffect, useState, useCallback } from 'react';
+import { memo, useRef, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { MessageBubble } from './MessageBubble';
 import { InputArea } from './InputArea';
 import { StreamingDots } from './StreamingDots';
+import { ToolCallCard } from './ToolCallCard';
 import { ChatHero, SuggestedPrompts } from './ChatWelcome';
 import { useAppStore } from '../../lib/store';
 import { PanelRightOpen, PanelRightClose, Database, X } from 'lucide-react';
 import { listConnectors } from '../../lib/connectors-api';
 
-export function ChatArea() {
+const MessageList = memo(function MessageList() {
   const messages = useAppStore((s) => s.messages);
+  return (
+    <>
+      {messages.map((msg) => (
+        <MessageBubble key={msg.id} message={msg} />
+      ))}
+    </>
+  );
+});
+
+export function ChatArea() {
+  const messageCount = useAppStore((s) => s.messages.length);
   const streamState = useAppStore((s) => s.streamState);
   const systemPanelOpen = useAppStore((s) => s.systemPanelOpen);
   const toggleSystemPanel = useAppStore((s) => s.toggleSystemPanel);
@@ -28,10 +40,18 @@ export function ChatArea() {
   }, []);
 
   useEffect(() => {
-    if (shouldAutoScroll.current && listRef.current) {
-      listRef.current.scrollTop = listRef.current.scrollHeight;
-    }
-  }, [messages, streamState.content]);
+    if (!shouldAutoScroll.current || !listRef.current) return;
+    const node = listRef.current;
+    const rafId = requestAnimationFrame(() => {
+      node.scrollTop = node.scrollHeight;
+    });
+    return () => cancelAnimationFrame(rafId);
+  }, [
+    messageCount,
+    streamState.isStreaming,
+    streamState.content,
+    streamState.activeToolCalls.length,
+  ]);
 
   const handleScroll = () => {
     if (!listRef.current) return;
@@ -39,7 +59,7 @@ export function ChatArea() {
     shouldAutoScroll.current = scrollHeight - scrollTop - clientHeight < 100;
   };
 
-  const isEmpty = messages.length === 0 && !streamState.isStreaming;
+  const isEmpty = messageCount === 0 && !streamState.isStreaming;
 
   const PanelIcon = systemPanelOpen ? PanelRightClose : PanelRightOpen;
 
@@ -98,12 +118,39 @@ export function ChatArea() {
           <SuggestedPrompts />
         ) : (
           <div className="max-w-[var(--chat-max-width)] mx-auto px-4 py-6">
-            {messages.map((msg) => (
-              <MessageBubble key={msg.id} message={msg} />
-            ))}
-            {streamState.isStreaming && streamState.content === '' && (
-              <div className="flex justify-start mb-4">
-                <StreamingDots phase={streamState.phase} />
+            <MessageList />
+            {streamState.isStreaming && (
+              <div className="mb-6">
+                {streamState.activeToolCalls.length > 0 && (
+                  <div className="mb-3 flex flex-col gap-2">
+                    {streamState.activeToolCalls.map((tc) => (
+                      <ToolCallCard key={tc.id} toolCall={tc} />
+                    ))}
+                  </div>
+                )}
+                {streamState.content ? (
+                  <div
+                    className="text-sm leading-relaxed whitespace-pre-wrap break-words"
+                    style={{ color: 'var(--color-text)' }}
+                  >
+                    {streamState.content}
+                  </div>
+                ) : (
+                  <div className="flex justify-start mb-4">
+                    <StreamingDots phase={streamState.phase} />
+                  </div>
+                )}
+                {streamState.content && (
+                  <div
+                    className="mt-2 text-xs"
+                    style={{ color: 'var(--color-text-tertiary)' }}
+                  >
+                    {streamState.phase || 'Generating...'}
+                    {streamState.elapsedMs > 0
+                      ? ` · ${(streamState.elapsedMs / 1000).toFixed(1)}s`
+                      : ''}
+                  </div>
+                )}
               </div>
             )}
           </div>
