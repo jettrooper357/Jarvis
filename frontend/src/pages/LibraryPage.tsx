@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Plus, Pencil, Trash2, RefreshCw, Download, Search } from 'lucide-react';
+import {
+  Plus,
+  Pencil,
+  Trash2,
+  RefreshCw,
+  Download,
+  Search,
+  Loader2,
+} from 'lucide-react';
 import { toast } from 'sonner';
 import {
   fetchSkills,
@@ -500,7 +508,11 @@ export function LibraryPage() {
                       color: 'var(--color-on-accent)',
                     }}
                   >
-                    <Search size={14} />
+                    {dlSearching ? (
+                      <Loader2 size={14} className="animate-spin" />
+                    ) : (
+                      <Search size={14} />
+                    )}
                     {dlSearching ? 'Syncing…' : 'Browse'}
                   </button>
                 </div>
@@ -533,11 +545,18 @@ export function LibraryPage() {
                 >
                   {dlSearching ? (
                     <div
-                      className="text-xs p-2"
+                      className="flex flex-col items-center justify-center gap-3 py-10 text-xs text-center"
                       style={{ color: 'var(--color-text-tertiary)' }}
                     >
-                      Syncing source… the first fetch clones the repository and can
-                      take a while.
+                      <Loader2
+                        size={32}
+                        className="animate-spin"
+                        style={{ color: 'var(--color-accent)' }}
+                      />
+                      <span>
+                        Syncing source… the first fetch clones the repository and
+                        can take a while.
+                      </span>
                     </div>
                   ) : dlResults.length === 0 ? (
                     <div
@@ -586,7 +605,11 @@ export function LibraryPage() {
                               color: 'var(--color-on-accent)',
                             }}
                           >
-                            <Download size={13} />
+                            {installingThis ? (
+                              <Loader2 size={13} className="animate-spin" />
+                            ) : (
+                              <Download size={13} />
+                            )}
                             {installingThis ? 'Installing…' : 'Install'}
                           </button>
                         </div>

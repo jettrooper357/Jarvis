@@ -38,13 +38,21 @@ class OpenClawResolver(SourceResolver):
     def sync(self) -> None:
         if self._cache_root.exists() and (self._cache_root / ".git").exists():
             subprocess.run(
-                ["git", "-C", str(self._cache_root), "pull", "--ff-only"],
+                ["git", "-C", str(self._cache_root), "pull", "--ff-only", "--depth", "1"],
                 check=True,
             )
         else:
             self._cache_root.parent.mkdir(parents=True, exist_ok=True)
             subprocess.run(
-                ["git", "clone", OPENCLAW_REPO_URL, str(self._cache_root)],
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--single-branch",
+                    OPENCLAW_REPO_URL,
+                    str(self._cache_root),
+                ],
                 check=True,
             )
 
