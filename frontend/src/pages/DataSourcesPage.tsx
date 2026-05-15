@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
+import type { ReactNode, CSSProperties } from 'react';
 import { motion } from 'motion/react';
 import { useAppStore } from '../lib/store';
 import {
@@ -20,6 +21,7 @@ import {
   Database, MessageSquare, Loader2, Brain, Search, FolderOpen, FileText,
   Mail, Hash, MessageCircle, CalendarDays, Contact, StickyNote, BookText,
   Package, Upload, Link2, PhoneCall, AlertTriangle, RefreshCw, CheckCircle2,
+  ChevronRight, Shield, MoreHorizontal,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { SOURCE_CATALOG } from '../types/connectors';
@@ -35,6 +37,7 @@ import {
   fetchTelegramHealth,
 } from '../lib/connectors-api';
 import type { SyncStatus } from '../types/connectors';
+import { HudFrame } from '../components/Jarvis/HudFrame';
 
 // ---------------------------------------------------------------------------
 // Inline connect form (reused from AgentsPage pattern)
@@ -321,6 +324,52 @@ const IconFor = ({ id, size = 18 }: { id: string; size?: number }) => {
   return <Ico size={size} />;
 };
 
+// Connector glyph in a J.A.R.V.I.S. accent tile (replaces the bare icon).
+const SourceIconTile = ({ id, size = 44 }: { id: string; size?: number }) => (
+  <div
+    className="shrink-0 grid place-items-center rounded-xl"
+    style={{
+      width: size,
+      height: size,
+      background: 'var(--color-accent-subtle)',
+      border: '1px solid color-mix(in srgb, var(--color-accent) 30%, transparent)',
+    }}
+  >
+    <IconFor id={id} size={Math.round(size * 0.42)} />
+  </div>
+);
+
+// A connector card with the four animated HUD corner brackets. Unlike a raw
+// hud-panel it keeps overflow visible so the brackets aren't clipped.
+function HudRow({
+  children,
+  accent = 'var(--color-accent)',
+  style,
+}: {
+  children: ReactNode;
+  accent?: string;
+  style?: CSSProperties;
+}) {
+  return (
+    <div
+      className="hud-frame relative"
+      style={{
+        background:
+          'linear-gradient(180deg, color-mix(in srgb, var(--color-surface) 88%, transparent), var(--color-surface))',
+        border: `1px solid color-mix(in srgb, ${accent} 26%, transparent)`,
+        borderRadius: 'var(--radius-lg)',
+        ...style,
+      }}
+    >
+      <span className="hud-corner hud-corner--tl" aria-hidden="true" />
+      <span className="hud-corner hud-corner--tr" aria-hidden="true" />
+      <span className="hud-corner hud-corner--bl" aria-hidden="true" />
+      <span className="hud-corner hud-corner--br" aria-hidden="true" />
+      {children}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Data Sources section
 // ---------------------------------------------------------------------------
@@ -600,30 +649,44 @@ function GoogleOAuthClientForm() {
   };
 
   return (
-    <section
-      className="hud-panel"
-      style={{ padding: '12px 16px' }}
-    >
+    <HudRow style={{ padding: '16px 18px' }}>
       <button
         onClick={() => setOpen((v) => !v)}
         style={{
           width: '100%',
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          display: 'flex', alignItems: 'center', gap: 14,
           background: 'transparent', border: 'none', cursor: 'pointer',
           padding: 0,
         }}
       >
-        <div style={{ textAlign: 'left' }}>
-          <div className="hud-label" style={{ marginBottom: 2 }}>
+        <div
+          className="shrink-0 grid place-items-center rounded-xl"
+          style={{
+            width: 44, height: 44,
+            background: 'var(--color-accent-subtle)',
+            border: '1px solid color-mix(in srgb, var(--color-accent) 30%, transparent)',
+          }}
+        >
+          <Shield size={20} style={{ color: 'var(--color-accent)' }} />
+        </div>
+        <div style={{ textAlign: 'left', flex: 1, minWidth: 0 }}>
+          <div className="font-semibold" style={{ fontSize: 14, color: 'var(--color-text)' }}>
             Google OAuth client credentials
           </div>
-          <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>
+          <div style={{ fontSize: 12, color: 'var(--color-text-tertiary)', marginTop: 2 }}>
             Paste your <code>client_secret_*.json</code> here so every Google connector
             (Gmail / Drive / Calendar / Tasks / Contacts) can use it.
           </div>
         </div>
-        <span style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>
-          {open ? '–' : '+'}
+        <span
+          className="shrink-0 grid place-items-center rounded-md"
+          style={{
+            width: 30, height: 26,
+            border: '1px solid var(--color-border)',
+            color: 'var(--color-text-tertiary)',
+          }}
+        >
+          <MoreHorizontal size={14} />
         </span>
       </button>
 
@@ -674,7 +737,7 @@ function GoogleOAuthClientForm() {
           </div>
         </div>
       )}
-    </section>
+    </HudRow>
   );
 }
 
@@ -841,19 +904,15 @@ function DataSourcesSection() {
             const isReconnecting = expandedId === c.connector_id;
             const hasError = !!sync?.error;
             return (
-              <div
+              <HudRow
                 key={c.connector_id}
-                className="hud-panel"
-                style={{
-                  borderColor: hasError
-                    ? 'color-mix(in srgb, var(--color-error) 28%, transparent)'
-                    : 'var(--color-border)',
-                }}
+                accent={hasError ? 'var(--color-error)' : 'var(--color-accent)'}
               >
                 <div style={{
                   padding: '14px 18px',
                   display: 'flex', alignItems: 'center', gap: 14,
                 }}>
+                  <SourceIconTile id={c.connector_id} />
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div className="font-semibold" style={{ fontSize: 14, fontWeight: 600, color: 'var(--color-text)' }}>
                       {c.display_name}
@@ -868,18 +927,18 @@ function DataSourcesSection() {
                   </div>
                   <button
                     onClick={() => setExpandedId(isReconnecting ? null : c.connector_id)}
-                    className="hud-label"
                     style={{
-                      padding: '6px 12px',
+                      padding: '7px 16px',
                       background: 'transparent',
-                      color: 'var(--color-text-secondary)',
-                      border: '1px solid var(--color-border)',
-                      borderRadius: 4, cursor: 'pointer',
-                      letterSpacing: '0.15em',
+                      color: 'var(--color-accent)',
+                      border: '1px solid color-mix(in srgb, var(--color-accent) 45%, transparent)',
+                      borderRadius: 6, cursor: 'pointer',
+                      fontSize: 13, fontWeight: 500,
                     }}
                   >
                     {isReconnecting ? 'Cancel' : 'Reconnect'}
                   </button>
+                  <ChevronRight size={18} style={{ color: 'var(--color-text-tertiary)', flexShrink: 0 }} />
                 </div>
                 {isReconnecting && c.auth_type === 'oauth' && !meta?.steps && (
                   <OAuthReauthorize connectorId={c.connector_id} displayName={c.display_name} onDone={() => { setExpandedId(null); loadConnectors(); loadSyncStatuses(); }} />
@@ -924,7 +983,7 @@ function DataSourcesSection() {
                     )}
                   </div>
                 )}
-              </div>
+              </HudRow>
             );
           })}
           </div>
@@ -944,12 +1003,11 @@ function DataSourcesSection() {
             const isExpanded = expandedId === c.connector_id;
 
             return (
-              <div
+              <HudRow
                 key={c.connector_id}
-                className="hud-panel"
                 style={{
                   gridColumn: isExpanded ? '1 / -1' : undefined,
-                  opacity: isExpanded ? 1 : 0.85,
+                  opacity: isExpanded ? 1 : 0.8,
                   borderStyle: isExpanded ? 'solid' : 'dashed',
                 }}
               >
@@ -961,6 +1019,7 @@ function DataSourcesSection() {
                   }}
                   onClick={() => setExpandedId(isExpanded ? null : c.connector_id)}
                 >
+                  <SourceIconTile id={c.connector_id} size={38} />
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div className="font-semibold" style={{ fontSize: 14, fontWeight: 600, color: 'var(--color-text)' }}>
                       {c.display_name}
@@ -969,7 +1028,7 @@ function DataSourcesSection() {
                       Not connected
                     </div>
                   </div>
-                  <span style={{ color: 'var(--color-text-secondary)', fontSize: 12, fontWeight: 500 }}>
+                  <span style={{ color: 'var(--color-accent)', fontSize: 12, fontWeight: 500 }}>
                     {isExpanded ? '× Close' : '+ Add'}
                   </span>
                 </div>
@@ -1067,7 +1126,7 @@ function DataSourcesSection() {
                     )}
                   </div>
                 )}
-              </div>
+              </HudRow>
             );
           })}
           </div>
@@ -2383,15 +2442,34 @@ export function DataSourcesPage() {
   ];
 
   return (
-    <div className="flex-1 overflow-y-auto px-6 py-10">
-      <div className="max-w-5xl mx-auto">
-      <header className="mb-6">
-        <h1 className="text-lg font-semibold" style={{ color: 'var(--color-text)' }}>
-          Data Sources, Channels &amp; Memory
-        </h1>
-        <p className="text-sm mt-2 max-w-2xl" style={{ color: 'var(--color-text-secondary)' }}>
-          Connect personal data so the assistant can search across everything, and set up messaging channels to chat from your phone.
-        </p>
+    <div className="flex-1 overflow-y-auto px-6 py-8">
+      <div className="max-w-6xl mx-auto">
+      <HudFrame className="rounded-xl p-6">
+      <header className="mb-7 flex items-start gap-5">
+        <div
+          className="shrink-0 grid place-items-center rounded-2xl"
+          style={{
+            width: 64,
+            height: 64,
+            background: 'var(--color-accent-subtle)',
+            border: '1px solid color-mix(in srgb, var(--color-accent) 35%, transparent)',
+            boxShadow: '0 0 24px -8px var(--color-accent-glow)',
+          }}
+        >
+          <Database size={28} style={{ color: 'var(--color-accent)' }} />
+        </div>
+        <div>
+          <h1
+            className="hud-title text-2xl tracking-[0.04em]"
+            style={{ color: 'var(--color-text)' }}
+          >
+            Data Sources, Channels &amp; Memory
+          </h1>
+          <p className="text-sm mt-2 max-w-2xl" style={{ color: 'var(--color-text-secondary)' }}>
+            Connect your personal data and messaging channels to give your AI
+            assistant context, memory, and real-time awareness.
+          </p>
+        </div>
       </header>
 
       <div
@@ -2406,7 +2484,7 @@ export function DataSourcesPage() {
               onClick={() => setActiveTab(tab.id)}
               className="relative px-4 py-2.5 text-sm transition-colors cursor-pointer"
               style={{
-                color: isActive ? 'var(--color-text)' : 'var(--color-text-secondary)',
+                color: isActive ? 'var(--color-accent)' : 'var(--color-text-secondary)',
                 fontWeight: isActive ? 600 : 400,
               }}
             >
@@ -2415,7 +2493,10 @@ export function DataSourcesPage() {
                 <motion.span
                   layoutId="data-sources-tab-indicator"
                   className="absolute left-0 right-0 -bottom-px h-[2px]"
-                  style={{ background: 'var(--color-text)' }}
+                  style={{
+                    background: 'var(--color-accent)',
+                    boxShadow: '0 0 8px var(--color-accent-glow)',
+                  }}
                   transition={{ type: 'spring', stiffness: 380, damping: 30 }}
                 />
               )}
@@ -2438,6 +2519,7 @@ export function DataSourcesPage() {
         )}
         {activeTab === 'memory' && <MemorySection />}
       </div>
+      </HudFrame>
       </div>
     </div>
   );

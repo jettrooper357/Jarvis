@@ -80,6 +80,8 @@ interface Settings {
   ttsVoice: string;
   ttsSpeed: number;
   wakeWords: string[];
+  /** Max recent messages sent verbatim; older turns are condensed. */
+  contextMaxMessages: number;
 }
 
 function loadSettings(): Settings {
@@ -97,6 +99,7 @@ function loadSettings(): Settings {
     ttsVoice: '',
     ttsSpeed: 1.0,
     wakeWords: [],
+    contextMaxMessages: 12,
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);

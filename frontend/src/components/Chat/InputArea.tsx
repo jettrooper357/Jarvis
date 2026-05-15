@@ -10,6 +10,34 @@ import { useTTSPlayer } from '../../hooks/useTTSPlayer';
 import { matchWakeWord } from '../../lib/wakeWord';
 import type { ChatMessage, ToolCallInfo, TokenUsage, MessageTelemetry } from '../../types';
 
+type ApiMessage = { role: string; content: string };
+
+/**
+ * Keep the last `limit` messages verbatim and fold everything older into a
+ * single condensed system message. Purely local (no extra LLM round-trip) so
+ * it adds no latency — the point is to stop resending an ever-growing
+ * transcript on every turn.
+ */
+function buildContextMessages(messages: ChatMessage[], limit: number): ApiMessage[] {
+  if (!Number.isFinite(limit) || limit <= 0 || messages.length <= limit) {
+    return messages.map((m) => ({ role: m.role, content: m.content }));
+  }
+  const split = messages.length - limit;
+  const older = messages.slice(0, split);
+  const recent = messages.slice(split);
+  const summary = older
+    .map((m) => `${m.role}: ${m.content.replace(/\s+/g, ' ').trim().slice(0, 160)}`)
+    .join('\n')
+    .slice(0, 1500);
+  return [
+    {
+      role: 'system',
+      content: `Summary of earlier conversation (older turns condensed for brevity):\n${summary}`,
+    },
+    ...recent.map((m) => ({ role: m.role, content: m.content })),
+  ];
+}
+
 export function InputArea() {
   const [input, setInput] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -37,14 +65,17 @@ export function InputArea() {
 
   const { state: speechState, available: speechAvailable, startRecording, stopRecording } = useSpeech();
   const sendRef = useRef<((override?: string) => Promise<void>) | null>(null);
+  // tts is declared before `streaming` so the barge-in callback can reference it.
+  const tts = useTTSPlayer({ voiceId: ttsVoice, speed: ttsSpeed });
   const streaming = useStreamingSpeech({
     onFinal: (text) => {
       const filtered = matchWakeWord(text, wakeWords);
       if (filtered === null) return;
       if (filtered.trim()) sendRef.current?.(filtered);
     },
+    // Barge-in: the moment VAD hears the user, cut the assistant off.
+    onSpeechStart: () => tts.stop(),
   });
-  const tts = useTTSPlayer({ voiceId: ttsVoice, speed: ttsSpeed });
 
   // Wake-word mode: when any wake phrase is configured, keep the mic open
   // continuously so the user can speak to the chat hands-free. The streaming
@@ -148,12 +179,12 @@ export function InputArea() {
     };
     addMessage(convId, userMsg);
 
-    // Build API messages before adding assistant placeholder
+    // Build API messages before adding assistant placeholder. Older turns are
+    // condensed into one summary message so latency/token cost stays flat as
+    // the conversation grows, instead of resending the whole transcript.
     const currentMessages = useAppStore.getState().messages;
-    const apiMessages = currentMessages.map((m) => ({
-      role: m.role,
-      content: m.content,
-    }));
+    const contextLimit = useAppStore.getState().settings.contextMaxMessages;
+    const apiMessages = buildContextMessages(currentMessages, contextLimit);
 
     const assistantMsg: ChatMessage = {
       id: generateId(),
@@ -362,6 +393,16 @@ export function InputArea() {
     sendRef.current = sendMessage;
   }, [sendMessage]);
 
+  // Welcome-screen action tiles / suggested prompts submit through here.
+  useEffect(() => {
+    const onSend = (e: Event) => {
+      const text = (e as CustomEvent<string>).detail;
+      if (text && text.trim()) sendRef.current?.(text);
+    };
+    window.addEventListener('jarvis-send', onSend as EventListener);
+    return () => window.removeEventListener('jarvis-send', onSend as EventListener);
+  }, []);
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -400,8 +441,8 @@ export function InputArea() {
         className="flex items-center gap-2 rounded-2xl px-4 py-3 transition-shadow"
         style={{
           background: 'var(--color-input-bg)',
-          border: '1px solid var(--color-input-border)',
-          boxShadow: 'var(--shadow-sm)',
+          border: '1px solid color-mix(in srgb, var(--color-accent) 45%, transparent)',
+          boxShadow: '0 0 0 1px color-mix(in srgb, var(--color-accent) 10%, transparent), 0 0 20px -6px var(--color-accent-glow)',
         }}
       >
         <textarea
@@ -409,7 +450,7 @@ export function InputArea() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Message OpenJarvis..."
+          placeholder="Message J.A.R.V.I.S..."
           rows={1}
           className="flex-1 bg-transparent outline-none resize-none text-sm leading-relaxed"
           style={{ color: 'var(--color-text)', maxHeight: '200px' }}

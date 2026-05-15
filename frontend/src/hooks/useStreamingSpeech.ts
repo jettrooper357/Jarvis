@@ -6,6 +6,11 @@ export type StreamingSpeechState = 'idle' | 'listening' | 'transcribing';
 interface UseStreamingSpeechOptions {
   /** Called every time the server emits a `final` transcript (VAD silence). */
   onFinal?: (text: string) => void;
+  /**
+   * Called the instant VAD detects speech onset, before any transcription.
+   * Used for barge-in: stop the assistant the moment the user starts talking.
+   */
+  onSpeechStart?: () => void;
   /** Optional language hint (e.g. 'en'). Omit for auto-detect. */
   language?: string;
 }
@@ -39,6 +44,8 @@ export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
   const streamRef = useRef<MediaStream | null>(null);
   const onFinalRef = useRef(opts.onFinal);
   onFinalRef.current = opts.onFinal;
+  const onSpeechStartRef = useRef(opts.onSpeechStart);
+  onSpeechStartRef.current = opts.onSpeechStart;
 
   useEffect(() => {
     fetchSpeechHealth()
@@ -111,28 +118,17 @@ export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
     ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
 
-    let opened = false;
-    await new Promise<void>((resolve, reject) => {
-      ws.onopen = () => {
-        opened = true;
-        resolve();
-      };
-      ws.onerror = () => {
-        if (!opened) reject(new Error('WebSocket connection failed'));
-      };
-    }).catch((err) => {
-      setError(err.message);
-    });
-    if (!opened) {
-      cleanup();
-      return;
-    }
-
+    // Attach message/close handlers *before* awaiting open. The backend can
+    // accept the socket and then immediately emit an error + close (e.g.
+    // streaming STT unsupported). If we attached these after the await, those
+    // events would dispatch into the gap and be lost, leaving the UI stuck in
+    // "listening" with no transcript and no error.
     ws.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data);
         if (msg.type === 'speech_start') {
           setState('listening');
+          onSpeechStartRef.current?.();
         } else if (msg.type === 'partial' && msg.text) {
           setInterim(msg.text);
           setState('listening');
@@ -149,6 +145,23 @@ export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
     ws.onclose = () => {
       setState('idle');
     };
+
+    let opened = false;
+    await new Promise<void>((resolve, reject) => {
+      ws.onopen = () => {
+        opened = true;
+        resolve();
+      };
+      ws.onerror = () => {
+        if (!opened) reject(new Error('WebSocket connection failed'));
+      };
+    }).catch((err) => {
+      setError(err.message);
+    });
+    if (!opened) {
+      cleanup();
+      return;
+    }
 
     const source = ctx.createMediaStreamSource(stream);
     const node = new AudioWorkletNode(ctx, 'pcm-worklet');

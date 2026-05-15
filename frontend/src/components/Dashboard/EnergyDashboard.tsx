@@ -40,11 +40,13 @@ function StatCard({
   label,
   value,
   unit,
+  bar,
 }: {
   icon: typeof Zap;
   label: string;
   value: string;
   unit?: string;
+  bar?: { pct: number; color: string };
 }) {
   return (
     <div className="hud-panel p-4">
@@ -52,7 +54,10 @@ function StatCard({
         <Icon size={12} style={{ color: 'var(--color-accent)' }} />
         <span className="hud-label">{label}</span>
       </div>
-      <div className="hud-mono text-2xl font-semibold truncate" style={{ color: 'var(--color-text)' }}>
+      <div
+        className="hud-mono text-2xl font-semibold truncate"
+        style={{ color: bar ? bar.color : 'var(--color-text)' }}
+      >
         {value}
         {unit && (
           <span className="hud-label ml-1" style={{ fontSize: '0.625rem', letterSpacing: '0.18em' }}>
@@ -60,6 +65,20 @@ function StatCard({
           </span>
         )}
       </div>
+      {bar && (
+        <div
+          className="mt-2 h-1.5 rounded-full overflow-hidden"
+          style={{ background: 'var(--color-bg-tertiary)' }}
+        >
+          <div
+            className="h-full rounded-full transition-[width] duration-700"
+            style={{
+              width: `${Math.max(4, Math.min(100, bar.pct))}%`,
+              background: `linear-gradient(90deg, var(--color-accent), ${bar.color})`,
+            }}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -160,6 +179,10 @@ export function EnergyDashboard() {
           icon={Gauge}
           label="Thermal"
           value={thermalStatus.label}
+          bar={{
+            pct: Math.min(100, ((energy.avg_power_w ?? 0) / 200) * 100),
+            color: thermalStatus.color,
+          }}
         />
         <StatCard
           icon={Hash}

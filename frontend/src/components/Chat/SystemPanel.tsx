@@ -11,9 +11,11 @@ import {
   X,
   Trophy,
   ExternalLink,
+  Mic,
 } from 'lucide-react';
 import { useAppStore } from '../../lib/store';
 import { getBase } from '../../lib/api';
+import { JarvisWaveform } from '../Jarvis/JarvisWaveform';
 
 interface EnergyData {
   total_energy_j?: number;
@@ -39,6 +41,7 @@ export function SystemPanel() {
   const toggleSystemPanel = useAppStore((s) => s.toggleSystemPanel);
   const optInEnabled = useAppStore((s) => s.optInEnabled);
   const setOptInModalOpen = useAppStore((s) => s.setOptInModalOpen);
+  const speechEnabled = useAppStore((s) => s.settings.speechEnabled);
   const [energy, setEnergy] = useState<EnergyData | null>(null);
   const [telemetry, setTelemetry] = useState<TelemetryStats | null>(null);
 
@@ -78,19 +81,19 @@ export function SystemPanel() {
     <div
       className="flex flex-col h-full overflow-y-auto"
       style={{
-        width: 280,
-        minWidth: 280,
+        width: 300,
+        minWidth: 300,
         background: 'var(--color-bg)',
-        borderLeft: '1px solid var(--color-border)',
+        borderLeft: '1px solid color-mix(in srgb, var(--color-accent) 22%, transparent)',
       }}
     >
       {/* Header */}
       <div
-        className="flex items-center justify-between px-4 py-3 shrink-0"
-        style={{ borderBottom: '1px solid var(--color-border)' }}
+        className="hud-panel-head flex items-center justify-between px-4 py-3 shrink-0 mx-3 mt-3"
       >
-        <span className="text-xs font-semibold tracking-wide uppercase" style={{ color: 'var(--color-text-secondary)' }}>
-          System
+        <span className="hud-label flex items-center gap-2" style={{ letterSpacing: '0.16em', color: 'var(--color-text-secondary)' }}>
+          <Zap size={13} style={{ color: 'var(--color-accent)' }} />
+          SYSTEM STATUS
         </span>
         <button
           onClick={toggleSystemPanel}
@@ -265,6 +268,32 @@ export function SystemPanel() {
             <ExternalLink size={10} />
             View Leaderboard
           </a>
+        </section>
+
+        {/* Voice mode */}
+        <section className="hud-panel p-4 mt-1">
+          <div className="flex items-center justify-between mb-3">
+            <span className="hud-label" style={{ letterSpacing: '0.16em' }}>
+              VOICE MODE
+            </span>
+            <span
+              className="hud-mono text-[10px] px-1.5 py-0.5 rounded-full"
+              style={{
+                background: speechEnabled ? 'var(--color-accent-subtle)' : 'var(--color-bg-secondary)',
+                color: speechEnabled ? 'var(--color-accent)' : 'var(--color-text-tertiary)',
+              }}
+            >
+              {speechEnabled ? 'READY' : 'OFF'}
+            </span>
+          </div>
+          <JarvisWaveform mode={speechEnabled ? 'idle' : 'off'} bars={36} height={36} />
+          <div
+            className="flex items-center justify-center gap-1.5 mt-3 text-[11px]"
+            style={{ color: 'var(--color-text-tertiary)' }}
+          >
+            <Mic size={11} style={{ color: speechEnabled ? 'var(--color-accent)' : 'var(--color-text-tertiary)' }} />
+            {speechEnabled ? 'Tap mic to speak' : 'Enable speech in Settings'}
+          </div>
         </section>
       </div>
     </div>

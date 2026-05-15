@@ -31,6 +31,43 @@ const STEP_COLORS: Record<string, string> = {
   respond: 'var(--color-accent-purple)',
 };
 
+function TraceReticle({ caption }: { caption: string }) {
+  return (
+    <div className="h-full flex flex-col items-center justify-center gap-5">
+      <div className="relative" style={{ width: 132, height: 132 }} aria-hidden="true">
+        <span
+          className="absolute inset-0 rounded-full"
+          style={{
+            border: '1px dashed color-mix(in srgb, var(--color-accent) 35%, transparent)',
+            animation: 'hud-reticle 14s linear infinite',
+          }}
+        />
+        <span
+          className="absolute rounded-full"
+          style={{
+            inset: '20%',
+            border: '1px solid color-mix(in srgb, var(--color-accent-purple) 40%, transparent)',
+            animation: 'hud-reticle 9s linear infinite reverse',
+          }}
+        />
+        <span
+          className="absolute rounded-full"
+          style={{
+            inset: '40%',
+            border: '1px solid color-mix(in srgb, var(--color-accent) 55%, transparent)',
+            animation: 'hud-breathe 2.6s ease-in-out infinite',
+          }}
+        />
+        <span className="absolute left-1/2 top-0 bottom-0 w-px -translate-x-1/2" style={{ background: 'linear-gradient(var(--color-accent), transparent, var(--color-accent))', opacity: 0.25 }} />
+        <span className="absolute top-1/2 left-0 right-0 h-px -translate-y-1/2" style={{ background: 'linear-gradient(90deg, var(--color-accent), transparent, var(--color-accent))', opacity: 0.25 }} />
+      </div>
+      <span className="hud-label" style={{ letterSpacing: '0.22em' }}>
+        {caption}
+      </span>
+    </div>
+  );
+}
+
 function StepBadge({ type }: { type: string }) {
   const color = STEP_COLORS[type] || 'var(--color-text-tertiary)';
   return (
@@ -163,8 +200,8 @@ export function TraceDebugger() {
       </h3>
 
       {traces.length === 0 ? (
-        <div className="h-48 flex items-center justify-center text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
-          No traces yet. Start making queries to see them here.
+        <div className="h-64">
+          <TraceReticle caption="NO TRACES YET — RUN A QUERY" />
         </div>
       ) : (
         <div className="flex gap-4 h-80">
@@ -192,9 +229,7 @@ export function TraceDebugger() {
                 ))}
               </div>
             ) : (
-              <div className="h-full flex items-center justify-center text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
-                Select a trace to view details
-              </div>
+              <TraceReticle caption="SELECT A TRACE TO VIEW DETAILS" />
             )}
           </div>
         </div>

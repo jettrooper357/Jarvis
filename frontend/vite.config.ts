@@ -51,7 +51,15 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/v1': process.env.VITE_API_URL || 'http://localhost:8000',
+      // ws:true is required so the /v1/speech/stream WebSocket (streaming STT)
+      // is forwarded to the backend. The string-shorthand form cannot carry
+      // ws:true, so this must be the object form. Without it, text chat (HTTP
+      // SSE) works but voice silently fails to connect.
+      '/v1': {
+        target: process.env.VITE_API_URL || 'http://localhost:8000',
+        changeOrigin: true,
+        ws: true,
+      },
       '/health': process.env.VITE_API_URL || 'http://localhost:8000',
     },
   },

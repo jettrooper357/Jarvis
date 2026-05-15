@@ -496,6 +496,20 @@ export function SettingsPage() {
                 className="w-32 cursor-pointer accent-[var(--color-accent)]"
               />
             </SettingRow>
+            <SettingRow
+              label="Context window"
+              description={`${settings.contextMaxMessages} recent msgs · older turns condensed`}
+            >
+              <input
+                type="range"
+                min="2"
+                max="40"
+                step="2"
+                value={settings.contextMaxMessages}
+                onChange={(e) => { updateSettings({ contextMaxMessages: parseInt(e.target.value) }); showSaved(); }}
+                className="w-32 cursor-pointer accent-[var(--color-accent)]"
+              />
+            </SettingRow>
           </Section>
 
           {/* Speech */}

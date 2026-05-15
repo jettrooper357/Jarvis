@@ -245,6 +245,54 @@ def create_app(
     except Exception:
         pass  # traces are optional; don't block server startup
 
+    @app.on_event("startup")
+    async def _warm_up_models() -> None:
+        """Preload STT/TTS/LLM weights off the request path so the *first*
+        interaction isn't penalised by cold model loads (latency target:
+        speech-end -> first token < 2s; models stay resident afterwards).
+
+        Best-effort and fully isolated: runs in a daemon thread so server
+        startup never blocks, and every stage is guarded so a missing model
+        or offline runtime degrades gracefully instead of crashing.
+        """
+        import asyncio
+        import inspect
+        import threading
+
+        def _warm() -> None:
+            sb = getattr(app.state, "speech_backend", None)
+            ensure = getattr(sb, "_ensure_model", None)
+            if callable(ensure):
+                try:
+                    ensure()
+                except Exception as exc:
+                    logger.warning("STT warm-up skipped: %s", exc)
+
+            tb = getattr(app.state, "tts_backend", None)
+            if tb is not None:
+                try:
+                    tb.synthesize("Ready.", output_format="wav")
+                except Exception as exc:
+                    logger.warning("TTS warm-up skipped: %s", exc)
+
+            eng = getattr(app.state, "engine", None)
+            mdl = getattr(app.state, "model", None)
+            gen = getattr(eng, "generate", None)
+            if callable(gen) and mdl:
+                try:
+                    from openjarvis.core.types import Message
+
+                    args = ([Message(role="user", content="hi")],)
+                    kw = {"model": mdl, "max_tokens": 1}
+                    if inspect.iscoroutinefunction(gen):
+                        asyncio.run(gen(*args, **kw))
+                    else:
+                        gen(*args, **kw)
+                except Exception as exc:
+                    logger.warning("LLM warm-up skipped: %s", exc)
+
+        threading.Thread(target=_warm, name="jarvis-warmup", daemon=True).start()
+
     app.include_router(router)
     app.include_router(dashboard_router)
     app.include_router(comparison_router)
