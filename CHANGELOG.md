@@ -15,10 +15,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   timeline/Gantt view, a KPI dashboard, and AI summaries. Backed by a
   server-side SQLite store (`~/.openjarvis/projects.db`) exposed via a new
   `/v1/projects` API, a `project_management` data-source connector (so agents
-  can query project state), a `project_assistant` agent template, and a
-  `project-management` preset (`jarvis init --preset project-management`).
-  New sidebar **Projects** section with portfolio, detail/task-tree,
-  timeline, and dashboard pages.
+  can query project state), a `project_assistant` agent template, a
+  `project-status-report` skill (grounded health/risks/next-actions report),
+  and a `project-management` preset
+  (`jarvis init --preset project-management`). New sidebar **Projects**
+  section with portfolio, detail/task-tree, timeline, and dashboard pages.
 - **Library page** in the web/desktop UI (sidebar → Library, `/library`) for
   managing skill and preset definitions (create / edit / delete via a TOML
   editor) and downloading skills from Hermes Agent, OpenClaw, or any GitHub

@@ -63,6 +63,21 @@ The connector also reads optional extra local project folders
 (`~/.openjarvis/connectors/project_management.json`, editable from the Data
 Sources page).
 
+### `project-status-report` skill
+
+A built-in skill that packages the assistant's core job: it pulls the named
+project's data from the `project_management` data source via knowledge
+search, then produces a grounded report — a health summary,
+risks/blocked/overdue items, and the prioritized next actions. Run it from
+the CLI:
+
+```bash
+jarvis skill run project-status-report --arg project="My Project"
+```
+
+It's also on the Library page, and the **Project Assistant** agent can call
+it directly.
+
 ## REST API
 
 All UI actions are thin clients over these endpoints (useful for scripting):

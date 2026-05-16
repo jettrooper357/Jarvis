@@ -1,0 +1,25 @@
+[skill]
+name = "project-status-report"
+description = "Produce a grounded status report for a project: health, risks/blockers, and the most important next actions"
+version = "0.1.0"
+author = "openjarvis"
+
+# Pulls the named project's normalized data (metadata + nested task tree +
+# notes) from the project_management data source via knowledge search, then
+# reasons over it. Invoke with a {project} name, e.g. the Project Assistant
+# agent uses this to answer "summarize Project X" / "what's next".
+
+[[skill.steps]]
+tool_name = "knowledge_search"
+arguments_template = '{"query": "project {project} status tasks subtasks blockers overdue notes"}'
+output_key = "project_data"
+
+[[skill.steps]]
+tool_name = "think"
+arguments_template = '{"thought": "From this project data, assess: overall health (on track / at risk / delayed), what is progressing, what is blocked or overdue, and concrete risks. Ground every point in the data — do not invent state. If data is missing or stale, say so explicitly. Project data: {project_data}"}'
+output_key = "analysis"
+
+[[skill.steps]]
+tool_name = "think"
+arguments_template = '{"thought": "Write the final status report for the requesting stakeholder. Format: (1) a 3-6 sentence health summary, (2) a short bulleted list of risks and blocked/overdue items with specific task titles, (3) the single most important next action, then a prioritized list of the next 3-5 actions ranked by priority, due date, and blocked status. Be concrete and concise. Analysis: {analysis}"}'
+output_key = "status_report"
