@@ -364,11 +364,13 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
 
     if request_body.stream:
         bus = getattr(request.app.state, "bus", None)
-        # Use the agent stream bridge only when tools are present (the
-        # bridge runs agent.run() synchronously and word-splits the result,
-        # so it can't stream tokens in real-time).  For plain chat, stream
-        # directly from the engine for true token-by-token output.
-        if agent is not None and bus is not None and request_body.tools:
+        # Route streaming chat through the agent whenever one is available so
+        # the chat box can use the agent's tools (web_search, etc.) and answer
+        # with live data. Tradeoff: the bridge runs agent.run() synchronously
+        # and word-splits the result, so turns are not streamed token-by-token
+        # in real time. Fall back to direct engine streaming only when no
+        # agent/bus exists.
+        if agent is not None and bus is not None:
             return await _handle_agent_stream(agent, bus, model, request_body)
         return await _handle_stream(engine, model, request_body, complexity_info)
 

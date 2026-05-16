@@ -1,0 +1,50 @@
+# Project Management — local-first projects, tasks, timeline & AI planning
+# Copy to ~/.openjarvis/config.toml  (or run: jarvis init --preset project-management)
+#
+# Requirements:
+#   - Ollama (or vLLM) running locally for the AI planning/summary features
+#
+# What this enables:
+#   - The Projects workspace in the UI (portfolio, task tree, timeline, dashboard)
+#   - The `project_management` data source so agents can query project state
+#   - A project-oriented toolset for planning and status reasoning
+
+[engine]
+default = "ollama"
+
+[engine.ollama]
+host = "http://localhost:11434"
+
+[intelligence]
+default_model = "qwen3.5:9b"
+
+[agent]
+# The "project_assistant" template ships with this preset — launch it from
+# the Agents page for planning, summaries, and risk detection.
+default_agent = "simple"
+
+[tools]
+enabled = [
+  "knowledge_search",
+  "knowledge_sql",
+  "web_search",
+  "think",
+  "file_read",
+  "file_write",
+]
+
+# ─── Project Management ─────────────────────────────────────────
+
+[project_management]
+enabled = true
+sources = ["local_project_files"]
+
+[project_management.local_project_files]
+# Extra folders of .json/.md/.yaml project files to ingest alongside the
+# canonical project store. The store itself lives at ~/.openjarvis/projects.db
+path = "~/.openjarvis/projects"
+
+# Connect the project data source so agents can answer questions from it.
+# (The connector is also manageable from the Data Sources page.)
+[connectors.project_management]
+enabled = true

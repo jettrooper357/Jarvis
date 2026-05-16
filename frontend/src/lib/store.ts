@@ -20,6 +20,7 @@ export interface CachedConnector {
   connected: boolean;
   chunks: number;
   auth_type?: 'oauth' | 'local' | 'bridge' | 'filesystem';
+  config_editable?: boolean;
 }
 
 export interface AgentEvent {

@@ -6,6 +6,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 import logging
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,23 @@ def _ensure_connectors_registered() -> None:
                     importlib.reload(sys.modules[mod_name])
                 except Exception:
                     pass
+
+
+def _connector_config_path(instance: Any) -> Optional[Path]:
+    """Return the editable JSON config path for a connector, if it has one.
+
+    Keyed on the ``_config_path`` attribute (the news_rss-style *config*
+    file convention). OAuth/credential connectors store secrets under
+    ``_credentials_path``/``_token_path`` instead, so token files are never
+    exposed by the config editor.
+    """
+    raw = getattr(instance, "_config_path", None)
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.suffix.lower() != ".json":
+        return None
+    return path
 
 
 def _get_or_create_connector_instance(connector_id: str) -> Any:
@@ -298,6 +316,7 @@ def create_connectors_router():
             "auth_type": getattr(instance, "auth_type", "unknown"),
             "connected": instance.is_connected(),
             "chunks": chunks,
+            "config_editable": _connector_config_path(instance) is not None,
         }
 
     # ------------------------------------------------------------------
@@ -378,7 +397,86 @@ def create_connectors_router():
             "auth_url": auth_url,
             "mcp_tools": mcp_tools,
             "oauth_setup": oauth_setup,
+            "config_editable": _connector_config_path(instance) is not None,
         }
+
+    @router.get("/{connector_id}/config")
+    async def get_connector_config(connector_id: str):
+        """Return the editable JSON config for a file-backed connector."""
+        _ensure_connectors_registered()
+        if not ConnectorRegistry.contains(connector_id):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Connector '{connector_id}' not found",
+            )
+        instance = _get_or_create(connector_id)
+        path = _connector_config_path(instance)
+        if path is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Connector '{connector_id}' has no editable JSON config",
+            )
+        if path.exists():
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500, detail=f"Failed to read config: {exc}"
+                )
+        else:
+            template = getattr(instance, "config_template", None)
+            content = template if isinstance(template, str) else "{}\n"
+        return {
+            "connector_id": connector_id,
+            "path": str(path),
+            "exists": path.exists(),
+            "content": content,
+        }
+
+    @router.put("/{connector_id}/config")
+    async def put_connector_config(connector_id: str, request: Request):
+        """Validate and write the JSON config for a file-backed connector."""
+        import json as _json
+
+        _ensure_connectors_registered()
+        if not ConnectorRegistry.contains(connector_id):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Connector '{connector_id}' not found",
+            )
+        instance = _get_or_create(connector_id)
+        path = _connector_config_path(instance)
+        if path is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Connector '{connector_id}' has no editable JSON config",
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be JSON")
+        content = body.get("content") if isinstance(body, dict) else None
+        if not isinstance(content, str):
+            raise HTTPException(
+                status_code=400,
+                detail="Expected an object with a 'content' string",
+            )
+        try:
+            _json.loads(content)
+        except _json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid JSON: {exc}"
+            )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to write config: {exc}"
+            )
+        # Drop the cached instance so the next status/sync re-reads the file.
+        _instances.pop(connector_id, None)
+        return {"connector_id": connector_id, "path": str(path), "saved": True}
 
     @router.post("/{connector_id}/connect")
     async def connect_connector(connector_id: str, req: ConnectRequest):

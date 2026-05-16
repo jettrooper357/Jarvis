@@ -48,6 +48,9 @@ export function resolveModelSelection({
   serverModel = '',
   models,
 }: ResolveModelSelectionArgs): string {
+  // Honor an explicit selection/default verbatim. A model that isn't
+  // installed yet is pulled on demand by the Ollama engine
+  // (OllamaEngine._ensure_model) rather than silently swapped here.
   const explicitSelected = selectedModel.trim();
   if (explicitSelected) return explicitSelected;
 

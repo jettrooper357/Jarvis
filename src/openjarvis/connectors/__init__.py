@@ -132,3 +132,8 @@ try:
     import openjarvis.connectors.news_rss  # noqa: F401
 except ImportError:
     pass
+
+try:
+    import openjarvis.connectors.project_management  # noqa: F401
+except ImportError:
+    pass

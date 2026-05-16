@@ -62,6 +62,7 @@ import {
   Copy,
   Check,
   Pencil,
+  Maximize2,
 } from 'lucide-react';
 import { SOURCE_CATALOG } from '../types/connectors';
 import type { ConnectRequest } from '../types/connectors';
@@ -2457,42 +2458,124 @@ function AgentOrgChart({
   onSelect: (agentId: string) => void;
 }) {
   const roots = getOrgRoots(managedAgents);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const chartRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!isFullscreen) return;
+
+    const pane = chartRef.current?.closest('[data-agents-page-pane]') as HTMLElement | null;
+    const previousOverflow = pane?.style.overflow ?? '';
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsFullscreen(false);
+    };
+
+    if (pane) pane.style.overflow = 'hidden';
+    window.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      if (pane) pane.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [isFullscreen]);
 
   if (roots.length === 0) return null;
 
-  return (
-    <section
-      className="rounded-2xl p-4 overflow-x-auto"
-      style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
-    >
-      <div className="flex items-start justify-between gap-4 mb-5">
-        <div>
-          <h2 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
-            Organization Chart
-          </h2>
-          <p className="text-sm mt-1" style={{ color: 'var(--color-text-secondary)' }}>
-            Reporting lines are drawn from each agent&apos;s manager assignment. Click any node to open that agent.
-          </p>
-        </div>
-        <div className="text-xs whitespace-nowrap" style={{ color: 'var(--color-text-tertiary)' }}>
-          {managedAgents.length} agent{managedAgents.length === 1 ? '' : 's'}
-        </div>
+  const chartTree = (
+    <div className="min-w-max pb-2">
+      <div className="flex items-start justify-center gap-10">
+        {roots.map((root) => (
+          <OrgChartNode
+            key={root.id}
+            agent={root}
+            managedAgents={managedAgents}
+            selectedAgentId={selectedAgentId}
+            onSelect={onSelect}
+          />
+        ))}
       </div>
+    </div>
+  );
 
-      <div className="min-w-max pb-2">
-        <div className="flex items-start justify-center gap-10">
-          {roots.map((root) => (
-            <OrgChartNode
-              key={root.id}
-              agent={root}
-              managedAgents={managedAgents}
-              selectedAgentId={selectedAgentId}
-              onSelect={onSelect}
-            />
-          ))}
+  return (
+    <>
+      <section
+        ref={chartRef}
+        className="rounded-2xl p-4"
+        style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
+      >
+        <div className="flex items-start justify-between gap-4 mb-5">
+          <div>
+            <h2 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+              Organization Chart
+            </h2>
+            <p className="text-sm mt-1" style={{ color: 'var(--color-text-secondary)' }}>
+              Reporting lines are drawn from each agent&apos;s manager assignment. Click any node to open that agent.
+            </p>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="text-xs whitespace-nowrap" style={{ color: 'var(--color-text-tertiary)' }}>
+              {managedAgents.length} agent{managedAgents.length === 1 ? '' : 's'}
+            </div>
+            <button
+              type="button"
+              onClick={() => setIsFullscreen(true)}
+              aria-label="Expand organization chart to full screen"
+              title="Expand chart"
+              className="flex h-9 w-9 items-center justify-center rounded-full transition-colors"
+              style={{
+                background: 'var(--color-bg)',
+                border: '1px solid var(--color-border)',
+                color: 'var(--color-text-secondary)',
+              }}
+            >
+              <Maximize2 size={16} />
+            </button>
+          </div>
         </div>
-      </div>
-    </section>
+
+        <div className="overflow-x-auto">
+          {chartTree}
+        </div>
+      </section>
+
+      {isFullscreen && (
+        <div className="absolute inset-0 z-40 p-4 sm:p-6" style={{ background: 'rgba(0, 0, 0, 0.72)' }}>
+          <div
+            className="relative flex h-full w-full flex-col overflow-hidden rounded-[28px]"
+            style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)' }}
+          >
+            <button
+              type="button"
+              onClick={() => setIsFullscreen(false)}
+              aria-label="Close full screen organization chart"
+              title="Close full screen"
+              className="absolute right-4 top-4 z-10 flex h-10 w-10 items-center justify-center rounded-full transition-colors"
+              style={{
+                background: 'var(--color-bg-secondary)',
+                border: '1px solid var(--color-border)',
+                color: 'var(--color-text-secondary)',
+              }}
+            >
+              <X size={18} />
+            </button>
+
+            <div className="border-b px-6 py-5 pr-20" style={{ borderColor: 'var(--color-border)' }}>
+              <h2 className="text-base font-semibold" style={{ color: 'var(--color-text)' }}>
+                Organization Chart
+              </h2>
+              <p className="text-sm mt-1 max-w-3xl" style={{ color: 'var(--color-text-secondary)' }}>
+                Scroll to inspect the full reporting structure, then press Escape or use the close button to return.
+              </p>
+            </div>
+
+            <div className="flex-1 overflow-auto px-6 py-6">
+              {chartTree}
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -4988,7 +5071,7 @@ export function AgentsPage() {
   // ── List View ───────────────────────────────────────────────────────────
 
   return (
-    <div className="flex-1 overflow-y-auto px-6 py-10">
+    <div data-agents-page-pane className="relative flex-1 overflow-y-auto px-6 py-10">
       <div className="max-w-5xl mx-auto">
       {/* Launch wizard modal */}
       {showWizard && (

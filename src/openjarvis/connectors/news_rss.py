@@ -93,6 +93,14 @@ class NewsRSSConnector(BaseConnector):
     connector_id = "news_rss"
     display_name = "News / RSS"
     auth_type = "local"
+    config_template = (
+        '{\n'
+        '  "feeds": [\n'
+        '    { "name": "Hacker News Front Page",'
+        ' "url": "https://hnrss.org/frontpage" }\n'
+        '  ]\n'
+        '}\n'
+    )
 
     def __init__(self, *, config_path: str = _DEFAULT_CONFIG_PATH) -> None:
         self._config_path = Path(config_path)
@@ -142,9 +150,23 @@ class NewsRSSConnector(BaseConnector):
             for item in items:
                 pub_dt = _parse_pub_date(item["pubDate"])
 
-                # Filter by since if the date is parseable
-                if since and pub_dt and pub_dt.replace(tzinfo=None) < since:
-                    continue
+                # Filter by since if the date is parseable. Normalise both
+                # sides to naive datetimes — feed timestamps are often
+                # offset-aware while *since* may be naive (or vice versa),
+                # and comparing the two raises TypeError.
+                if since and pub_dt:
+                    pd_naive = (
+                        pub_dt.replace(tzinfo=None)
+                        if pub_dt.tzinfo is not None
+                        else pub_dt
+                    )
+                    since_naive = (
+                        since.replace(tzinfo=None)
+                        if since.tzinfo is not None
+                        else since
+                    )
+                    if pd_naive < since_naive:
+                        continue
 
                 title = item["title"] or "Untitled"
                 doc_id = f"rss-{feed_name}-{title[:40]}"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -55,6 +56,7 @@ class OllamaEngine(InferenceEngine):
         max_tokens: int = 1024,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        self._ensure_model(model)
         msg_dicts = messages_to_dicts(messages)
         # Ollama expects tool_call arguments as dicts, not JSON strings
         for md in msg_dicts:
@@ -106,6 +108,13 @@ class OllamaEngine(InferenceEngine):
             if resp.status_code == 400 and tools:
                 # Model may not support function calling -- retry without tools
                 payload.pop("tools", None)
+                resp = self._client.post("/api/chat", json=payload)
+            if resp.status_code == 500 and self._is_corrupt_model_error(
+                resp.text
+            ):
+                # Corrupt local model — delete, re-pull, and retry once so a
+                # damaged download self-heals instead of failing every call.
+                self._repull_model(model)
                 resp = self._client.post("/api/chat", json=payload)
             resp.raise_for_status()
         except (httpx.ConnectError, httpx.TimeoutException) as exc:
@@ -186,6 +195,7 @@ class OllamaEngine(InferenceEngine):
         max_tokens: int = 1024,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
+        await asyncio.to_thread(self._ensure_model, model)
         payload: Dict[str, Any] = {
             "model": model,
             "messages": messages_to_dicts(messages),
@@ -254,6 +264,7 @@ class OllamaEngine(InferenceEngine):
         response. Falls back to a tools-less retry on 400 (mirrors
         ``generate()``'s behaviour for models that don't support tools).
         """
+        await asyncio.to_thread(self._ensure_model, model)
         msg_dicts = messages_to_dicts(messages)
         for md in msg_dicts:
             for tc in md.get("tool_calls", []):
@@ -386,6 +397,99 @@ class OllamaEngine(InferenceEngine):
             raise EngineConnectionError(
                 f"Ollama not reachable at {self._host}"
             ) from exc
+
+    @staticmethod
+    def _model_installed(model: str, installed: List[str]) -> bool:
+        """True if *model* matches an installed tag (``:latest``-tolerant)."""
+        if model in installed:
+            return True
+        if ":" not in model and f"{model}:latest" in installed:
+            return True
+        if model.endswith(":latest") and model[: -len(":latest")] in installed:
+            return True
+        return False
+
+    # Ollama JSON-parse errors raised when a model's manifest/blob is
+    # truncated or null-padded (corrupt download). The model still shows up
+    # in /api/tags, so it must be deleted and re-pulled to recover.
+    _CORRUPT_MARKERS = (
+        "invalid character",
+        "looking for beginning of value",
+        "unexpected end of json",
+        "unexpected EOF",
+    )
+
+    @classmethod
+    def _is_corrupt_model_error(cls, text: str) -> bool:
+        low = (text or "").lower()
+        return any(m.lower() in low for m in cls._CORRUPT_MARKERS)
+
+    def _pull_model(self, model: str) -> None:
+        """Pull *model* from the Ollama registry. Blocks until complete."""
+        logger.info("Pulling model %r from Ollama…", model)
+        try:
+            with self._client.stream(
+                "POST", "/api/pull", json={"name": model, "stream": True}
+            ) as resp:
+                resp.raise_for_status()
+                last_status = ""
+                for line in resp.iter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if evt.get("error"):
+                        raise RuntimeError(
+                            f"Ollama could not pull model {model!r}: "
+                            f"{evt['error']}"
+                        )
+                    last_status = evt.get("status", last_status)
+            logger.info("Model %r pull complete (%s)", model, last_status)
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text[:300] if exc.response is not None else ""
+            raise RuntimeError(
+                f"Ollama could not pull model {model!r} "
+                f"(HTTP {exc.response.status_code}): {body}"
+            ) from exc
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            raise EngineConnectionError(
+                f"Ollama not reachable at {self._host}"
+            ) from exc
+
+    def _repull_model(self, model: str) -> None:
+        """Delete a corrupt model then re-pull it from scratch."""
+        logger.warning(
+            "Model %r appears corrupt in Ollama — deleting and re-pulling.",
+            model,
+        )
+        try:
+            self._client.request(
+                "DELETE", "/api/delete", json={"name": model}
+            )
+        except Exception:
+            logger.debug("Delete of corrupt model %r failed (continuing)", model)
+        self._pull_model(model)
+
+    def _ensure_model(self, model: str) -> None:
+        """Pull *model* into Ollama if it isn't installed yet.
+
+        Blocks until the pull finishes so the caller never sees a 404 for a
+        model the user selected. Raises ``RuntimeError`` if the model cannot
+        be pulled (e.g. it does not exist in the Ollama registry).
+        """
+        model = (model or "").strip()
+        if not model:
+            return
+        try:
+            installed = self.list_models()
+        except Exception:
+            installed = []
+        if installed and self._model_installed(model, installed):
+            return
+        logger.info("Model %r not installed in Ollama — pulling…", model)
+        self._pull_model(model)
 
     def list_models(self) -> List[str]:
         try:
