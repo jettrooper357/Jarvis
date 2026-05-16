@@ -653,4 +653,16 @@ def serve(
 
     import uvicorn
 
+    # Surface native crashes (segfaults / access violations inside torch,
+    # audio, STT/TTS or other C extensions) as a Python traceback instead of
+    # a silent process exit back to the shell. Without this, an extension
+    # fault leaves no diagnostics at all.
+    import faulthandler
+
+    try:
+        if not faulthandler.is_enabled():
+            faulthandler.enable(all_threads=True)
+    except Exception:
+        pass
+
     uvicorn.run(app, host=bind_host, port=bind_port, log_level="info")

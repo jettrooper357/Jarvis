@@ -52,6 +52,38 @@ export async function triggerSync(id: string): Promise<{ connector_id: string; c
   return res.json();
 }
 
+export async function getConnectorConfig(
+  id: string,
+): Promise<{ connector_id: string; path: string; exists: boolean; content: string }> {
+  const res = await fetch(
+    `${getBase()}/v1/connectors/${encodeURIComponent(id)}/config`,
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || `Failed to load config: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function saveConnectorConfig(
+  id: string,
+  content: string,
+): Promise<{ connector_id: string; path: string; saved: boolean }> {
+  const res = await fetch(
+    `${getBase()}/v1/connectors/${encodeURIComponent(id)}/config`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || `Failed to save config: ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function fetchTelegramConfig(): Promise<{
   has_token: boolean;
   token_preview: string;

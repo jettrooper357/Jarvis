@@ -35,6 +35,8 @@ import {
   fetchTelegramConfig,
   saveTelegramConfig,
   fetchTelegramHealth,
+  getConnectorConfig,
+  saveConnectorConfig,
 } from '../lib/connectors-api';
 import type { SyncStatus } from '../types/connectors';
 import { HudFrame } from '../components/Jarvis/HudFrame';
@@ -106,6 +108,139 @@ function InlineConnectForm({
       >
         Connect
       </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Connector JSON config editor (file-backed sources, e.g. News / RSS)
+// ---------------------------------------------------------------------------
+
+function ConnectorConfigEditor({
+  connectorId,
+  onSaved,
+}: {
+  connectorId: string;
+  onSaved?: () => void;
+}) {
+  const [content, setContent] = useState('');
+  const [path, setPath] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    getConnectorConfig(connectorId)
+      .then((r) => {
+        if (alive) {
+          setContent(r.content);
+          setPath(r.path);
+        }
+      })
+      .catch((e: any) => {
+        if (alive) setMsg({ kind: 'err', text: e.message || 'Failed to load config' });
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [connectorId]);
+
+  const save = async () => {
+    setSaving(true);
+    setMsg(null);
+    try {
+      await saveConnectorConfig(connectorId, content);
+      setMsg({ kind: 'ok', text: 'Saved. Click Sync to ingest the latest items.' });
+      onSaved?.();
+    } catch (e: any) {
+      setMsg({ kind: 'err', text: e.message || 'Save failed' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={{ borderTop: '1px solid var(--color-border)', padding: 12 }}>
+      <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4, color: 'var(--color-text)' }}>
+        Edit config (JSON)
+      </div>
+      {path && (
+        <div
+          style={{
+            fontSize: 10,
+            color: 'var(--color-text-tertiary)',
+            marginBottom: 6,
+            fontFamily: 'monospace',
+            wordBreak: 'break-all',
+          }}
+        >
+          {path}
+        </div>
+      )}
+      {loading ? (
+        <div style={{ fontSize: 12, color: 'var(--color-text-tertiary)' }}>
+          <Loader2
+            size={12}
+            className="animate-spin"
+            style={{ display: 'inline', marginRight: 6, verticalAlign: 'middle' }}
+          />
+          Loading…
+        </div>
+      ) : (
+        <>
+          <textarea
+            value={content}
+            onChange={(e) => setContent(e.target.value)}
+            spellCheck={false}
+            rows={10}
+            style={{
+              width: '100%',
+              padding: 10,
+              fontFamily: 'monospace',
+              fontSize: 12,
+              background: 'var(--color-bg)',
+              border: '1px solid var(--color-border)',
+              borderRadius: 4,
+              color: 'var(--color-text)',
+              boxSizing: 'border-box',
+              resize: 'vertical',
+            }}
+          />
+          {msg && (
+            <div
+              style={{
+                fontSize: 11,
+                marginTop: 6,
+                color: msg.kind === 'ok' ? 'var(--color-success)' : 'var(--color-error)',
+              }}
+            >
+              {msg.text}
+            </div>
+          )}
+          <button
+            onClick={save}
+            disabled={saving}
+            style={{
+              marginTop: 8,
+              width: '100%',
+              padding: 8,
+              background: saving ? 'var(--color-disabled-bg)' : 'var(--color-accent-purple)',
+              color: 'var(--color-on-accent)',
+              border: 'none',
+              borderRadius: 6,
+              fontSize: 12,
+              cursor: saving ? 'not-allowed' : 'pointer',
+            }}
+          >
+            {saving ? 'Saving…' : 'Save config'}
+          </button>
+        </>
+      )}
     </div>
   );
 }
@@ -761,6 +896,7 @@ function DataSourcesSection() {
             connected: c.connected,
             chunks: (c as any).chunks || 0,
             auth_type: c.auth_type,
+            config_editable: (c as any).config_editable === true,
           })),
         ),
       )
@@ -855,7 +991,7 @@ function DataSourcesSection() {
   const connected = connectors.filter((c) => c.connected);
   const notConnectedBase = connectors.filter((c) => !c.connected);
   // Always show the upload card in the not-connected list (it has no backend connector)
-  const uploadEntry = { connector_id: 'upload', display_name: 'Upload / Paste', connected: false, chunks: 0 };
+  const uploadEntry = { connector_id: 'upload', display_name: 'Upload / Paste', connected: false, chunks: 0, config_editable: false };
   const notConnected = notConnectedBase.some((c) => c.connector_id === 'upload')
     ? notConnectedBase
     : [...notConnectedBase, uploadEntry];
@@ -982,6 +1118,15 @@ function DataSourcesSection() {
                       />
                     )}
                   </div>
+                )}
+                {isReconnecting && c.config_editable && (
+                  <ConnectorConfigEditor
+                    connectorId={c.connector_id}
+                    onSaved={() => {
+                      loadConnectors();
+                      loadSyncStatuses();
+                    }}
+                  />
                 )}
               </HudRow>
             );
@@ -1125,6 +1270,15 @@ function DataSourcesSection() {
                       </div>
                     )}
                   </div>
+                )}
+                {isExpanded && c.connector_id !== 'upload' && c.config_editable && (
+                  <ConnectorConfigEditor
+                    connectorId={c.connector_id}
+                    onSaved={() => {
+                      loadConnectors();
+                      loadSyncStatuses();
+                    }}
+                  />
                 )}
               </HudRow>
             );

@@ -30,6 +30,7 @@ export interface ConnectorInfo {
   auth_url?: string;
   mcp_tools?: string[];
   chunks?: number;
+  config_editable?: boolean;
 }
 
 export interface SyncStatus {
