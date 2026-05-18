@@ -93,6 +93,9 @@ export function InputArea() {
   }, []);
   // tts is declared before `streaming` so the barge-in callback can reference it.
   const tts = useTTSPlayer({ voiceId: ttsVoice, speed: ttsSpeed });
+  // Only auto-speak responses when voice streaming is on — a text-only chat
+  // session should stay silent even if TTS autoplay is enabled.
+  const autoSpeak = ttsAutoplay && speechStreaming;
   const streaming = useStreamingSpeech({
     onFinal: (text) => {
       const spoken = text.trim();
@@ -226,7 +229,7 @@ export function InputArea() {
     }
 
     if (override === undefined) setInput('');
-    if (ttsAutoplay) tts.stop();
+    if (autoSpeak) tts.stop();
     clearWakeAwaitingCommand();
 
     let convId = activeId;
@@ -344,7 +347,7 @@ export function InputArea() {
                 setStreamState({ content: accumulatedContent, phase: '' });
                 lastDraftFlush = now;
               }
-              if (ttsAutoplay) tts.feedToken(delta.content);
+              if (autoSpeak) tts.feedToken(delta.content);
             }
             if (data.choices?.[0]?.finish_reason === 'stop') break;
           } catch {}
@@ -408,7 +411,7 @@ export function InputArea() {
         audio: audioMeta,
       };
       addMessage(convId, assistantMsg);
-      if (ttsAutoplay) tts.flush();
+      if (autoSpeak) tts.flush();
       if (timerRef.current) {
         clearInterval(timerRef.current);
         timerRef.current = null;
@@ -436,7 +439,7 @@ export function InputArea() {
     addMessage,
     setStreamState,
     resetStream,
-    ttsAutoplay,
+    autoSpeak,
     tts,
     temperature,
     maxTokens,

@@ -63,7 +63,9 @@ Open **Settings → Speech** and toggle:
 - **Real-time streaming** — uses the streaming WebSocket (default).
   Disable to fall back to push-to-talk (record → stop → transcribe).
 - **Speak responses** — autoplays assistant messages through TTS as they
-  stream.
+  stream. Only takes effect while **Real-time streaming** is on, so a
+  text-only chat session stays silent. Use the per-message speaker icon to
+  hear a single reply on demand regardless of this toggle.
 
 The mic button in the chat composer now opens a streaming session: click
 to start listening, click again (or simply stop speaking for ~700 ms) to

@@ -95,6 +95,15 @@ OpenJarvis is a modular AI assistant framework. Here's what developers build wit
     # Persistent agent that runs on a cron schedule
     ```
 
+=== "Project Management"
+
+    ```bash
+    jarvis init --preset project-management
+    jarvis serve
+    # Open the Projects page in the sidebar: portfolio, nested task tree,
+    # timeline/Gantt, KPI dashboard, and an AI-grounded Project Assistant
+    ```
+
 For complete copy-paste patterns, see [Code Snippets](snippets.md).
 
 ## Starter Configs
@@ -110,6 +119,7 @@ Copy one of these to `~/.openjarvis/config.toml` to get a pre-configured setup:
 | [`morning-digest-mac.toml`](https://github.com/open-jarvis/OpenJarvis/blob/main/configs/openjarvis/examples/morning-digest-mac.toml) | Mac (Apple Silicon) | Daily spoken briefing from email, calendar, health, news |
 | [`morning-digest-linux.toml`](https://github.com/open-jarvis/OpenJarvis/blob/main/configs/openjarvis/examples/morning-digest-linux.toml) | Linux / GPU server | Same, with vLLM support |
 | [`morning-digest-minimal.toml`](https://github.com/open-jarvis/OpenJarvis/blob/main/configs/openjarvis/examples/morning-digest-minimal.toml) | Any machine | Just Gmail + Calendar |
+| [`project-management.toml`](https://github.com/open-jarvis/OpenJarvis/blob/main/configs/openjarvis/examples/project-management.toml) | Any machine | Local-first projects/tasks workspace + AI Project Assistant |
 
 Or generate a config with digest included:
 

@@ -9,6 +9,16 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+try:
+    # FastAPI resolves endpoint annotations from module globals. Under
+    # postponed evaluation of annotations (`from __future__ import
+    # annotations`) the `request: Request` params are strings, so `Request`
+    # must be importable here or FastAPI mistakes it for a query param
+    # (422 on every write endpoint).
+    from fastapi import Request
+except ImportError:  # pragma: no cover - optional server dependency
+    Request = Any  # type: ignore[assignment,misc]
+
 logger = logging.getLogger(__name__)
 
 _store = None  # lazy singleton
@@ -54,7 +64,7 @@ def _ai_summary(engine: Any, model: str, text: str) -> Optional[str]:
 
 def create_projects_router():
     """Return an APIRouter exposing project-management CRUD + analytics."""
-    from fastapi import APIRouter, HTTPException, Request
+    from fastapi import APIRouter, HTTPException
 
     router = APIRouter(prefix="/v1/projects", tags=["projects"])
 
@@ -63,6 +73,105 @@ def create_projects_router():
     @router.get("/dashboard")
     async def dashboard():
         return _get_store().dashboard()
+
+    @router.get("/mission-control")
+    async def mission_control(request: Request):
+        """One-call aggregate for the Mission Control view.
+
+        Projects with nested tasks/subtasks (+ rollup), the agents linked
+        to each task with live status, a global agent roster by role
+        tier, and the portfolio KPIs.
+        """
+        store = _get_store()
+        manager = getattr(request.app.state, "agent_manager", None)
+
+        # project_task_id -> [linked agent summaries]
+        links: dict[str, list] = {}
+        roster: list = []
+        if manager is not None:
+            try:
+                import time as _time
+
+                from openjarvis.projects import authz
+
+                # An agent is only *really* working if it is running AND has
+                # emitted a heartbeat recently. Interrupted runs (server
+                # restart / crash) leave status='running' +
+                # current_activity='Generating response...' forever; without
+                # this the dashboard reports those stale agents as active.
+                STALE_SECONDS = 120
+                now = _time.time()
+
+                for ag in manager.list_agents():
+                    a_tasks = manager.list_tasks(ag["id"])
+                    linked = [t for t in a_tasks if t.get("project_task_id")]
+                    primary = next(
+                        (t for t in linked if t.get("status") == "active"),
+                        linked[0] if linked else None,
+                    )
+                    last_act = ag.get("last_activity_at") or 0
+                    is_running = ag.get("status") == "running"
+                    fresh = bool(last_act) and (now - last_act) <= STALE_SECONDS
+                    working = is_running and fresh
+                    stale = is_running and not fresh
+                    activity = ag.get("current_activity") or "" if working else ""
+                    roster.append(
+                        {
+                            "id": ag["id"],
+                            "name": ag.get("name"),
+                            "org_role": ag.get("org_role") or "",
+                            "role_tier": authz.classify(ag),
+                            "status": ag.get("status"),
+                            "working": working,
+                            "stale": stale,
+                            "last_activity_at": last_act or None,
+                            "current_activity": activity,
+                            "manager_agent_id": ag.get("manager_agent_id"),
+                            "linked_project_task_id": (
+                                primary.get("project_task_id")
+                                if primary
+                                else None
+                            ),
+                        }
+                    )
+                    for t in linked:
+                        links.setdefault(t["project_task_id"], []).append(
+                            {
+                                "agent_id": ag["id"],
+                                "agent_name": ag.get("name"),
+                                "agent_status": ag.get("status"),
+                                "working": working,
+                                "current_activity": activity,
+                                "agent_task_id": t["id"],
+                                "agent_task_status": t.get("status"),
+                            }
+                        )
+            except Exception:  # pragma: no cover - roster is best-effort
+                logger.exception("Mission Control agent roster failed")
+
+        projects_out = []
+        for p in store.list_projects():
+            tasks = store.list_tasks(p["id"])
+            by_id = {
+                t["id"]: {**t, "linked_agents": links.get(t["id"], []),
+                          "subtasks": []}
+                for t in tasks
+            }
+            roots = []
+            for t in tasks:
+                node = by_id[t["id"]]
+                parent = t.get("parent_task_id")
+                if parent and parent in by_id:
+                    by_id[parent]["subtasks"].append(node)
+                else:
+                    roots.append(node)
+            projects_out.append({**p, "tasks": roots})
+
+        return {
+            "kpis": store.dashboard(),
+            "projects": projects_out,
+            "agents": roster,
+        }
 
     # --- projects ------------------------------------------------------
 

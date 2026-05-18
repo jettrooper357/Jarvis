@@ -5,6 +5,7 @@ from pathlib import Path
 
 from openjarvis.agents.manager import AgentManager
 from openjarvis.core.events import EventBus, EventType
+from openjarvis.projects.store import ProjectStore
 from openjarvis.server.managed_agent_runtime import ManagedAgentRuntime
 from tests.agents.fake_engine import FakeEngine
 
@@ -175,6 +176,72 @@ def test_agents_can_assign_tasks_and_message_each_other():
             ]
         finally:
             manager.close()
+
+
+def test_successful_project_create_completes_linked_agent_task(tmp_path, monkeypatch):
+    project_store = ProjectStore(tmp_path / "projects.db")
+    manager = AgentManager(
+        db_path=str(tmp_path / "agents.db"),
+        project_store=project_store,
+    )
+    monkeypatch.setattr(
+        "openjarvis.tools.project_tools._project_store",
+        lambda: project_store,
+    )
+    try:
+        project_manager = manager.create_agent(
+            name="Workflow Manager",
+            agent_type="monitor_operative",
+            org_role="Workflow Manager",
+            config={"max_turns": 4},
+        )
+        tracker_project = project_store.create_project(
+            name="Unassigned Work",
+            status="Active",
+        )
+        tracker_task = project_store.create_task(
+            tracker_project["id"],
+            title="Start a new project called test project",
+        )
+        agent_task = manager.create_task(
+            project_manager["id"],
+            description="Start a new project called test project",
+            status="active",
+            project_task_id=tracker_task["id"],
+        )
+
+        engine = FakeEngine(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "call-1",
+                            "project_create",
+                            '{"name":"test project","status":"Active"}',
+                        )
+                    ]
+                },
+                {"content": "Created test project."},
+            ]
+        )
+
+        runtime = ManagedAgentRuntime(
+            manager,
+            engine,
+            default_model="fake-model",
+        )
+        response = runtime.run(
+            project_manager["id"],
+            "Start a new project called test project",
+        )
+
+        assert response == "Created test project."
+        updated = manager._get_task(agent_task["id"])
+        assert updated["status"] == "completed"
+        assert "project setup tool" in updated["progress"]["note"]
+    finally:
+        manager.close()
+        project_store.close()
 
 
 def test_assign_task_starts_assignee_immediately_by_default():

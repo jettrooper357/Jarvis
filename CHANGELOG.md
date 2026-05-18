@@ -20,6 +20,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and a `project-management` preset
   (`jarvis init --preset project-management`). New sidebar **Projects**
   section with portfolio, detail/task-tree, timeline, and dashboard pages.
+- **Mission Control** — the sidebar "Dashboard" is renamed **Mission
+  Control** and augmented (engine telemetry retained) with a live view of
+  projects, nested tasks/subtasks with progress, and the managed-agent
+  roster showing which agents are working/idle and the task each is on.
+  Backed by a new aggregate endpoint `GET /v1/projects/mission-control`.
+  Managed-agent tasks now link to a project task/subtask
+  (`project_task_id`); a running agent auto-updates its linked task
+  (notes + status, gated by a 3-tier org-chart role model:
+  Project Management / Worker / QA). New `openjarvis.projects.authz`.
 - **Library page** in the web/desktop UI (sidebar → Library, `/library`) for
   managing skill and preset definitions (create / edit / delete via a TOML
   editor) and downloading skills from Hermes Agent, OpenClaw, or any GitHub
@@ -47,6 +56,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `HERMES_AGENT_PATH` and `OPENCLAW_PATH` env vars to point at your local
   checkouts before running the framework-comparison harness; missing or
   empty paths now raise `ThirdPartyNotFoundError` with an actionable hint.
+- **Breaking (agents):** managed-agent tasks and runs now require a link to
+  a project task/subtask. `AgentManager.create_task(...)` and
+  `POST /v1/managed-agents/{id}/tasks` require `project_task_id`;
+  `POST /v1/managed-agents/{id}/run` returns 400 if the agent has no
+  linked task; the `managed_agent_assign_task` tool gains a required
+  `project_task_id`. Existing unlinked agent tasks are auto-migrated to a
+  system "Unassigned Work" project (tagged `needs-reconciliation`) so
+  agents keep running until reconciled.
 
 #### Skills System (Plans 1, 2A, 2B)
 

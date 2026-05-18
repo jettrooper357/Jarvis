@@ -10,7 +10,7 @@ import json
 import sqlite3
 import time
 import uuid
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -89,12 +89,23 @@ CREATE TABLE IF NOT EXISTS agent_learning_log (
 
 _SUMMARY_MAX = 2000
 
+# System project that holds agent work not yet tied to a real project task.
+# Created on demand by the migration backfill; surfaced in Mission Control
+# as "needs reconciliation".
+_UNASSIGNED_PROJECT_NAME = "Unassigned Work"
+
 
 class AgentManager:
     """Persistent agent lifecycle manager with SQLite backing."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self, db_path: str, project_store: Optional[Any] = None
+    ) -> None:
         self._db_path = str(db_path)
+        # Lazily-resolved ProjectStore for cross-store linkage validation /
+        # backfill. Injectable so tests can isolate the projects DB.
+        self._injected_project_store = project_store
+        self._proj_store: Optional[Any] = project_store
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -122,6 +133,9 @@ class AgentManager:
             "ALTER TABLE agent_tasks ADD COLUMN assigned_by_agent_id TEXT",
             # JSON-encoded array of {tool, arguments, result, success, latency}
             "ALTER TABLE agent_messages ADD COLUMN tool_calls TEXT",
+            # Mission Control: every agent task links to a project task/subtask
+            "ALTER TABLE agent_tasks ADD COLUMN project_task_id TEXT",
+            "ALTER TABLE agent_tasks ADD COLUMN project_id TEXT",
         ]
         for migration in _MIGRATIONS:
             try:
@@ -129,9 +143,202 @@ class AgentManager:
             except sqlite3.OperationalError:
                 pass  # Column already exists
         self._conn.commit()
+        # One-time backfill so the new hard linkage requirement does not
+        # break agents that already have unlinked tasks.
+        self._backfill_unlinked_project_tasks()
 
     def close(self) -> None:
         self._conn.close()
+
+    # ── Project-store linkage (Mission Control) ───────────────────
+
+    def _project_store(self) -> Any:
+        """Lazily resolve a ProjectStore for cross-store linkage.
+
+        Injected one wins (tests); otherwise a default singleton is
+        created on first use, mirroring projects_router's pattern.
+        """
+        if self._proj_store is None:
+            from openjarvis.projects.store import ProjectStore
+
+            self._proj_store = ProjectStore()
+        return self._proj_store
+
+    def validate_project_task(self, project_task_id: str) -> Dict[str, Any]:
+        """Return the linked project task or raise ValueError.
+
+        Enforces the hard requirement that every agent task references an
+        existing project task or subtask.
+        """
+        ptid = str(project_task_id or "").strip()
+        if not ptid:
+            raise ValueError(
+                "project_task_id is required: every agent task must be "
+                "linked to a project task or subtask."
+            )
+        proj_task = self._project_store().get_task(ptid)
+        if proj_task is None:
+            raise ValueError(
+                f"Linked project task not found: {ptid!r}"
+            )
+        return proj_task
+
+    @staticmethod
+    def _agent_status_to_project_status(status: str) -> str:
+        normalized = str(status or "").strip().casefold()
+        if normalized == "active":
+            return "In Progress"
+        if normalized == "completed":
+            return "Done"
+        if normalized == "failed":
+            return "Blocked"
+        return "Backlog"
+
+    def _resolve_agent_work_project_task(
+        self,
+        *,
+        agent_id: str,
+        description: str,
+        status: str,
+        project_task_id: str,
+    ) -> Dict[str, Any]:
+        """Return the concrete project task an agent task should link to.
+
+        The "Unassigned Work" migration creates one durable catch-all task per
+        agent. New work routed through that catch-all still needs its own child
+        task so Mission Control shows each chat request in the project tree.
+        """
+        proj_task = (
+            self.validate_project_task(project_task_id)
+            if str(project_task_id or "").strip()
+            else self._ensure_unassigned_catchall_task(agent_id)
+        )
+        ps = self._project_store()
+        project = ps.get_project(str(proj_task.get("project_id", "")))
+        is_unassigned_catchall = (
+            project is not None
+            and project.get("name") == _UNASSIGNED_PROJECT_NAME
+            and str(proj_task.get("title", "")).startswith("Unreconciled work")
+            and not proj_task.get("parent_task_id")
+        )
+        if not is_unassigned_catchall:
+            return proj_task
+
+        agent = self.get_agent(agent_id)
+        title = str(description or "Agent work").strip() or "Agent work"
+        child = ps.create_task(
+            proj_task["project_id"],
+            parent_task_id=proj_task["id"],
+            title=title[:160],
+            description=description,
+            type="Chore",
+            status=self._agent_status_to_project_status(status),
+            assigned_to=(agent or {}).get("name", "") or "",
+        )
+        return child
+
+    def _ensure_unassigned_catchall_task(self, agent_id: str) -> Dict[str, Any]:
+        ps = self._project_store()
+        sys_proj = next(
+            (
+                p
+                for p in ps.list_projects()
+                if p.get("name") == _UNASSIGNED_PROJECT_NAME
+            ),
+            None,
+        )
+        if sys_proj is None:
+            sys_proj = ps.create_project(
+                name=_UNASSIGNED_PROJECT_NAME,
+                description=(
+                    "System catch-all for agent work that was not assigned "
+                    "to a real project task yet. Reassign these tasks to a "
+                    "real project task, then archive this project."
+                ),
+                status="Active",
+                tags=["system", "needs-reconciliation"],
+            )
+        agent = self.get_agent(agent_id)
+        aname = (agent or {}).get("name") or agent_id
+        catchall_title = f"Unreconciled work — {aname}"
+        existing = next(
+            (
+                t
+                for t in ps.list_tasks(sys_proj["id"])
+                if t.get("title") == catchall_title and not t.get("parent_task_id")
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+        return ps.create_task(
+            sys_proj["id"],
+            title=catchall_title,
+            description=(
+                "Auto-created during the Mission Control migration. "
+                "Reassign the agent's tasks to a real project task "
+                "or subtask."
+            ),
+            type="Chore",
+            status="Backlog",
+            assigned_to=aname,
+        )
+
+    def _backfill_unlinked_project_tasks(self) -> None:
+        """Link any pre-existing unlinked agent tasks to a catch-all task.
+
+        Only touches the projects DB when there is actually unlinked work,
+        so already-migrated / fresh installs pay no cost.
+        """
+        try:
+            probe = self._conn.execute(
+                "SELECT 1 FROM agent_tasks WHERE "
+                "project_task_id IS NULL OR project_task_id = '' LIMIT 1"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return  # agent_tasks table not present yet
+        if probe is None:
+            return
+
+        ps = self._project_store()
+        sys_proj = next(
+            (
+                p
+                for p in ps.list_projects()
+                if p.get("name") == _UNASSIGNED_PROJECT_NAME
+            ),
+            None,
+        )
+        if sys_proj is None:
+            sys_proj = ps.create_project(
+                name=_UNASSIGNED_PROJECT_NAME,
+                description=(
+                    "System catch-all for agent work created before "
+                    "Mission Control linkage. Reassign these tasks to a "
+                    "real project task, then archive this project."
+                ),
+                status="Active",
+                tags=["system", "needs-reconciliation"],
+            )
+
+        rows = self._conn.execute(
+            "SELECT id, agent_id FROM agent_tasks WHERE "
+            "project_task_id IS NULL OR project_task_id = ''"
+        ).fetchall()
+        catchall: Dict[str, str] = {}
+        for r in rows:
+            agent_id = r["agent_id"]
+            ptid = catchall.get(agent_id)
+            if ptid is None:
+                t = self._ensure_unassigned_catchall_task(agent_id)
+                ptid = t["id"]
+                catchall[agent_id] = ptid
+            self._conn.execute(
+                "UPDATE agent_tasks SET project_task_id = ?, project_id = ? "
+                "WHERE id = ?",
+                (ptid, sys_proj["id"], r["id"]),
+            )
+        self._conn.commit()
 
     # ── Agent CRUD ────────────────────────────────────────────────
 
@@ -271,6 +478,25 @@ class AgentManager:
         )
         self._conn.commit()
 
+    def reap_stale_running(self, stale_seconds: int = 120) -> int:
+        """Reset agents stuck 'running' with no recent heartbeat to idle.
+
+        An interrupted run (server restart / crash / killed thread) never
+        reaches :meth:`end_tick`, so the agent stays ``status='running'``
+        with a frozen ``current_activity`` forever and can't be re-run.
+        Call this on server startup. Returns the number reaped.
+        """
+        now = time.time()
+        cur = self._conn.execute(
+            "UPDATE managed_agents SET status = 'idle', "
+            "current_activity = '', updated_at = ? "
+            "WHERE status = 'running' AND "
+            "(last_activity_at IS NULL OR last_activity_at < ?)",
+            (now, now - stale_seconds),
+        )
+        self._conn.commit()
+        return cur.rowcount or 0
+
     # ── Checkpoints ───────────────────────────────────────────────
 
     _CHECKPOINT_RETENTION = 5
@@ -363,19 +589,38 @@ class AgentManager:
         description: str,
         status: str = "pending",
         assigned_by_agent_id: Optional[str] = None,
+        project_task_id: Optional[str] = None,
+        project_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        # Hard requirement: agent work must be tied to a project task or
+        # subtask for tracking and documentation. Raises ValueError if the
+        # link is missing or does not resolve to an existing project task.
+        proj_task = self._resolve_agent_work_project_task(
+            agent_id=agent_id,
+            description=description,
+            status=status,
+            project_task_id=project_task_id or "",
+        )
+        resolved_project_id = (
+            str(project_id).strip()
+            if project_id
+            else proj_task.get("project_id")
+        )
         task_id = uuid.uuid4().hex[:12]
         now = time.time()
         self._conn.execute(
             "INSERT INTO agent_tasks "
-            "(id, agent_id, assigned_by_agent_id, description, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(id, agent_id, assigned_by_agent_id, description, status, "
+            "project_task_id, project_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 agent_id,
                 self._normalize_manager_id(assigned_by_agent_id),
                 description,
                 status,
+                str(proj_task["id"]).strip(),
+                resolved_project_id,
                 now,
             ),
         )
@@ -387,6 +632,71 @@ class AgentManager:
     ) -> List[Dict[str, Any]]:
         query = "SELECT * FROM agent_tasks WHERE agent_id = ?"
         params: List[Any] = [agent_id]
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC"
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._row_to_task(r) for r in rows]
+
+    @staticmethod
+    def _parse_task_start(value: Any) -> Optional[float]:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            return dt.timestamp()
+        return dt.astimezone(timezone.utc).timestamp()
+
+    def _is_runnable_agent_task(
+        self,
+        task: Dict[str, Any],
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        if str(task.get("status") or "") in ("completed", "failed"):
+            return False
+        project_task_id = str(task.get("project_task_id") or "").strip()
+        if not project_task_id:
+            return False
+        try:
+            project_task = self._project_store().get_task(project_task_id)
+        except Exception:
+            return False
+        if project_task is None:
+            return False
+        if project_task.get("status") in ("Done", "Cancelled"):
+            return False
+        start_ts = self._parse_task_start(project_task.get("start_date"))
+        return start_ts is None or start_ts <= (now or time.time())
+
+    def list_runnable_tasks(self, agent_id: str) -> List[Dict[str, Any]]:
+        now = time.time()
+        return [
+            task
+            for task in self.list_tasks(agent_id)
+            if self._is_runnable_agent_task(task, now=now)
+        ]
+
+    def has_runnable_task(self, agent_id: str) -> bool:
+        return bool(self.list_runnable_tasks(agent_id))
+
+    def has_open_linked_task(self, agent_id: str) -> bool:
+        return any(
+            task.get("project_task_id")
+            and str(task.get("status") or "") not in ("completed", "failed")
+            for task in self.list_tasks(agent_id)
+        )
+
+    def list_tasks_assigned_by(
+        self, assigned_by_agent_id: str, status: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM agent_tasks WHERE assigned_by_agent_id = ?"
+        params: List[Any] = [assigned_by_agent_id]
         if status:
             query += " AND status = ?"
             params.append(status)
@@ -772,6 +1082,7 @@ class AgentManager:
     def _row_to_task(row: sqlite3.Row) -> Dict[str, Any]:
         progress_raw = row["progress_json"]
         findings_raw = row["findings_json"]
+        keys = row.keys()
         return {
             "id": row["id"],
             "agent_id": row["agent_id"],
@@ -780,6 +1091,12 @@ class AgentManager:
             "status": row["status"],
             "progress": json.loads(progress_raw) if progress_raw else {},
             "findings": json.loads(findings_raw) if findings_raw else [],
+            "project_task_id": (
+                row["project_task_id"] if "project_task_id" in keys else None
+            ),
+            "project_id": (
+                row["project_id"] if "project_id" in keys else None
+            ),
             "created_at": row["created_at"],
         }
 

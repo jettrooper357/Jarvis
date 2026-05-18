@@ -89,11 +89,11 @@ def _has_clone_voices() -> bool:
 def _try_load_clone_backend():
     """Return an F5-TTS instance if importable and healthy, else None."""
     try:
-        from openjarvis.core.registry import TTSRegistry
-
         # Re-import speech package so newly-installed modules register.
         import importlib
+
         import openjarvis.speech as _speech_pkg
+        from openjarvis.core.registry import TTSRegistry
 
         importlib.reload(_speech_pkg)
 
@@ -515,8 +515,7 @@ def serve(
                 event_bus=bus,
             )
             for ag in agent_manager.list_agents():
-                sched_type = ag.get("config", {}).get("schedule_type", "manual")
-                if sched_type in ("cron", "interval") and ag["status"] not in (
+                if ag["status"] not in (
                     "archived",
                     "error",
                 ):
@@ -651,13 +650,13 @@ def serve(
             "authenticated requests to your instance."
         )
 
-    import uvicorn
-
     # Surface native crashes (segfaults / access violations inside torch,
     # audio, STT/TTS or other C extensions) as a Python traceback instead of
     # a silent process exit back to the shell. Without this, an extension
     # fault leaves no diagnostics at all.
     import faulthandler
+
+    import uvicorn
 
     try:
         if not faulthandler.is_enabled():

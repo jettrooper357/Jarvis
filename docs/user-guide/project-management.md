@@ -46,6 +46,53 @@ Sidebar → **Projects**:
   health summary and next action (falls back to a deterministic summary if no
   engine is available).
 
+## Mission Control
+
+The sidebar **Mission Control** page (`/dashboard`, formerly "Dashboard")
+augments the on-device engine telemetry with a live project + agent view:
+
+- **Projects · tasks & subtasks** — every project with its nested task tree,
+  per-task and per-project progress bars, and status. Each task shows the
+  agents linked to it with a live working/idle indicator and their current
+  activity.
+- **Agents** — the full managed-agent roster grouped by working vs idle, each
+  tagged with its role tier and the task it is on.
+
+It refreshes on a short poll and immediately on any agent event, and is fed
+by a single aggregate call (`GET /v1/projects/mission-control`).
+
+### Agent work is always tied to a project task
+
+Agent work is tracked under the project plan, not in a parallel silo:
+
+- **Hard requirement.** Every managed-agent task must reference an existing
+  project task or subtask (`project_task_id`). Creating an agent task — via
+  the API, the `managed_agent_assign_task` tool, or starting a run — fails
+  with a clear error if it is not linked.
+- **Migration.** Agent tasks that pre-date this requirement are auto-linked
+  on upgrade to a system **"Unassigned Work"** project (tagged
+  `needs-reconciliation`) with a per-agent catch-all task, so existing
+  agents keep running. Reassign them to real project tasks, then archive
+  that project.
+- **Auto-update.** While an agent runs, its linked project task is updated
+  in place: a note is recorded on start and finish (or failure), the task is
+  nudged to *In Progress*, a failed run marks it *Blocked*, and a successful
+  run on a leaf task with no subtasks completes it. Progress is never
+  over-claimed for tasks with subtasks.
+
+### Role tiers
+
+What an agent may change is governed by its org-chart role (the free-text
+`org_role` plus org-chart position — an agent with no manager sits at the
+top). Tiers, matched case-insensitively (function-first, so a "QA Lead" is
+QA, not a manager):
+
+| Tier | Matches | May |
+|---|---|---|
+| **Project Management / Manager** | `manager`, `project manage`, `pm`, `director`, `lead`, `owner`, `chief`, `head`, or top of the org chart | Full project & task CRUD, (re)assignment, scheduling |
+| **Worker / Operative** (default) | everything else | Update only its own assigned task (status, %, notes); add subtasks under its task |
+| **Quality Assurance / QA Testing** | `qa`, `quality`, `test`, `review` | Read all; add notes; pass/fail a task under test; file bug subtasks. No project CRUD or reassignment |
+
 ## Data source & agents
 
 The `project_management` connector (Data Sources page) normalizes every
@@ -91,6 +138,7 @@ All UI actions are thin clients over these endpoints (useful for scripting):
 | `GET/POST /v1/projects/tasks/{task_id}/notes` | List / add notes |
 | `PUT/DELETE /v1/projects/notes/{note_id}` | Update / delete a note |
 | `GET /v1/projects/dashboard` | Portfolio KPIs |
+| `GET /v1/projects/mission-control` | Aggregate: projects + nested tasks + linked agents + KPIs |
 | `POST /v1/projects/{id}/ai-summary` | AI (or heuristic) project summary |
 
 ## Configuration

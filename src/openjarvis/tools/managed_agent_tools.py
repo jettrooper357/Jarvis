@@ -6,9 +6,8 @@ from typing import Any, Dict, List, Optional
 
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
-from openjarvis.tools._stubs import BaseTool, ToolSpec
-
 from openjarvis.server.managed_agent_runtime import get_managed_agent_context
+from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 
 def _truncate(value: str, limit: int = 180) -> str:
@@ -403,7 +402,8 @@ class ManagedAgentAssignTaskTool(BaseTool):
             name="managed_agent_assign_task",
             description=(
                 "Create a persistent task for another managed agent so it shows "
-                "up in that agent's task list."
+                "up in that agent's task list. Provide project_task_id when "
+                "known; otherwise the work is routed into Unassigned Work."
             ),
             parameters={
                 "type": "object",
@@ -415,6 +415,15 @@ class ManagedAgentAssignTaskTool(BaseTool):
                     "description": {
                         "type": "string",
                         "description": "The task to assign.",
+                    },
+                    "project_task_id": {
+                        "type": "string",
+                        "description": (
+                            "ID of the project task or subtask this "
+                            "work belongs to (from the projects workspace). "
+                            "If omitted, Jarvis creates a trackable child "
+                            "task under Unassigned Work."
+                        ),
                     },
                     "status": {
                         "type": "string",
@@ -430,7 +439,10 @@ class ManagedAgentAssignTaskTool(BaseTool):
                         ),
                     },
                 },
-                "required": ["agent_name_or_id", "description"],
+                "required": [
+                    "agent_name_or_id",
+                    "description",
+                ],
             },
             category="agent",
         )
@@ -456,12 +468,25 @@ class ManagedAgentAssignTaskTool(BaseTool):
                 content=error,
             )
 
-        task = ctx.manager.create_task(
-            target["id"],
-            description=str(params.get("description", "")),
-            status=str(params.get("status", "pending") or "pending"),
-            assigned_by_agent_id=ctx.current_agent_id,
-        )
+        try:
+            task = ctx.manager.create_task(
+                target["id"],
+                description=str(params.get("description", "")),
+                status=str(params.get("status", "pending") or "pending"),
+                assigned_by_agent_id=ctx.current_agent_id,
+                project_task_id=str(params.get("project_task_id", "") or "")
+                or None,
+                project_id=str(params.get("project_id", "") or "") or None,
+            )
+        except ValueError as exc:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content=(
+                    f"Cannot delegate: {exc} Use a valid 'project_task_id' "
+                    "or omit it so the task is routed to Unassigned Work."
+                ),
+            )
         target_name = str(target.get("name", target["id"]))
         assigner = ctx.manager.get_agent(ctx.current_agent_id)
         assigner_name = str(

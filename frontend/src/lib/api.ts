@@ -458,6 +458,9 @@ export interface AgentTask {
   status: 'pending' | 'active' | 'completed' | 'failed';
   progress: Record<string, unknown>;
   findings: unknown[];
+  // Mission Control: every agent task is tied to a project task/subtask.
+  project_task_id?: string | null;
+  project_id?: string | null;
   created_at: number;
 }
 
@@ -578,21 +581,158 @@ export async function resumeManagedAgent(agentId: string): Promise<void> {
   if (!res.ok) throw new Error(`Failed: ${res.status}`);
 }
 
-export async function fetchAgentTasks(agentId: string): Promise<AgentTask[]> {
-  const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}/tasks`);
+export async function fetchAgentTasks(
+  agentId: string,
+  includeDelegated = false,
+): Promise<AgentTask[]> {
+  const qs = includeDelegated ? '?include_delegated=true' : '';
+  const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}/tasks${qs}`);
   if (!res.ok) throw new Error(`Failed: ${res.status}`);
   const data = await res.json();
   return data.tasks || [];
 }
 
-export async function createAgentTask(agentId: string, description: string): Promise<AgentTask> {
+export async function createAgentTask(
+  agentId: string,
+  description: string,
+  projectTaskId: string,
+  projectId?: string,
+): Promise<AgentTask> {
   const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}/tasks`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ description }),
+    body: JSON.stringify({
+      description,
+      project_task_id: projectTaskId,
+      project_id: projectId,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(body.detail || `Failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Mission Control aggregation
+// ---------------------------------------------------------------------------
+
+export interface MissionControlKpis {
+  projects_total: number;
+  projects_active: number;
+  projects_at_risk: number;
+  tasks_total: number;
+  tasks_in_progress: number;
+  tasks_overdue: number;
+  tasks_blocked: number;
+  tasks_done: number;
+  avg_completion: number;
+  workload_by_assignee: Record<string, number>;
+  at_risk_projects: { id: string; name: string; status: string }[];
+}
+
+export interface MissionControlLinkedAgent {
+  agent_id: string;
+  agent_name: string;
+  agent_status: string;
+  working?: boolean;
+  current_activity: string;
+  agent_task_id: string;
+  agent_task_status: string;
+}
+
+export interface MissionControlTask {
+  id: string;
+  title: string;
+  description?: string;
+  status: string;
+  priority?: string;
+  type?: string;
+  percent_complete: number;
+  assigned_to?: string;
+  due_date?: string | null;
+  parent_task_id?: string | null;
+  updated_at?: number;
+  linked_agents: MissionControlLinkedAgent[];
+  subtasks: MissionControlTask[];
+}
+
+export interface MissionControlProject {
+  id: string;
+  name: string;
+  description?: string;
+  status: string;
+  progress: number;
+  tasks: MissionControlTask[];
+}
+
+export interface MissionControlAgent {
+  id: string;
+  name: string;
+  org_role: string;
+  role_tier: 'manager' | 'worker' | 'qa';
+  status: string;
+  working: boolean;
+  stale?: boolean;
+  last_activity_at?: number | null;
+  current_activity: string;
+  manager_agent_id?: string | null;
+  linked_project_task_id?: string | null;
+}
+
+export interface MissionControlData {
+  kpis: MissionControlKpis;
+  projects: MissionControlProject[];
+  agents: MissionControlAgent[];
+}
+
+export async function fetchMissionControl(): Promise<MissionControlData> {
+  const res = await fetch(`${getBase()}/v1/projects/mission-control`);
+  if (!res.ok) throw new Error(`Failed to fetch Mission Control: ${res.status}`);
+  return res.json();
+}
+
+export interface ProjectTaskNote {
+  id: string;
+  task_id: string;
+  author: string;
+  content: string;
+  type: string;
+  ai_summary?: string | null;
+  created_at: number;
+}
+
+export async function fetchTaskNotes(
+  taskId: string,
+): Promise<ProjectTaskNote[]> {
+  const res = await fetch(
+    `${getBase()}/v1/projects/tasks/${taskId}/notes`,
+  );
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.notes || [];
+}
+
+export async function updateAgentTask(
+  agentId: string,
+  taskId: string,
+  updates: { description?: string; status?: AgentTask['status'] },
+): Promise<AgentTask> {
+  const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}/tasks/${taskId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
   });
   if (!res.ok) throw new Error(`Failed: ${res.status}`);
   return res.json();
+}
+
+export async function deleteAgentTask(agentId: string, taskId: string): Promise<void> {
+  const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}/tasks/${taskId}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
 }
 
 export async function fetchAgentChannels(agentId: string): Promise<ChannelBinding[]> {

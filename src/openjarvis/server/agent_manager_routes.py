@@ -7,12 +7,16 @@ import re as _re
 from typing import Any, Dict, List, Optional, Tuple
 
 from openjarvis.agents.capabilities import (
-    AUTO_COLLABORATION_TOOLS,
-    configured_agent_tool_names as _configured_capability_tool_names,
-    configured_agent_skill_names as _configured_capability_skill_names,
-    effective_agent_tool_names as _effective_capability_tool_names,
-    enrich_agent_record as _enrich_capability_record,
     build_agent_tool_instances,
+)
+from openjarvis.agents.capabilities import (
+    configured_agent_tool_names as _configured_capability_tool_names,
+)
+from openjarvis.agents.capabilities import (
+    effective_agent_tool_names as _effective_capability_tool_names,
+)
+from openjarvis.agents.capabilities import (
+    enrich_agent_record as _enrich_capability_record,
 )
 from openjarvis.agents.library import (
     delete_template,
@@ -55,6 +59,10 @@ class TemplateDocumentRequest(BaseModel):
 
 class CreateTaskRequest(BaseModel):
     description: str
+    # Agent work is always persisted against a project task/subtask; when
+    # omitted, the manager routes it through the Unassigned Work project.
+    project_task_id: Optional[str] = None
+    project_id: Optional[str] = None
 
 
 class UpdateTaskRequest(BaseModel):
@@ -539,7 +547,10 @@ def _fallback_response_from_tool_calls(tool_calls: List[Dict[str, Any]]) -> str:
         return result_text
     tool_name = str(last.get("tool", "") or "tool")
     if last.get("success", False):
-        return f"{tool_name} completed successfully, but no final response was produced."
+        return (
+            f"{tool_name} completed successfully, but no final response was "
+            "produced."
+        )
     return f"{tool_name} failed, and no final response was produced."
 
 
@@ -716,6 +727,7 @@ async def _stream_managed_agent(
     from openjarvis.server.managed_agent_runtime import (
         ManagedAgentExecutionContext,
         ManagedAgentRuntime,
+        _build_managed_system_prompt,
         use_managed_agent_context,
     )
 
@@ -731,7 +743,10 @@ async def _stream_managed_agent(
         or getattr(app_state, "model", "")
         or ""
     )
-    system_prompt = config.get("system_prompt")
+    # Use the shared builder so chat applies the same role/triage guidance
+    # as the runtime path — otherwise chief/PM agents have no guardrail and
+    # turn plain chat / skill / preset requests into project_create calls.
+    system_prompt = _build_managed_system_prompt(agent_record)
     temperature = config.get("temperature", 0.7)
     max_tokens = config.get("max_tokens", 1024)
     max_turns = config.get("max_turns", 10)
@@ -1314,7 +1329,8 @@ async def _stream_managed_agent(
                                 tool_result_content = result.content
                             else:
                                 logger.warning(
-                                    "Tool '%s' not found in agent tool set or MCP adapters",
+                            "Tool '%s' not found in agent tool set or MCP "
+                            "adapters",
                                     tool_name,
                                 )
                         tool_succeeded = True
@@ -1449,7 +1465,12 @@ def create_agent_manager_router(
 
     @agents_router.get("")
     async def list_agents():
-        return {"agents": [_enrich_agent_record(agent) for agent in manager.list_agents()]}
+        return {
+            "agents": [
+                _enrich_agent_record(agent)
+                for agent in manager.list_agents()
+            ]
+        }
 
     @agents_router.post("")
     async def create_agent(req: CreateAgentRequest, request: Request):
@@ -1473,10 +1494,10 @@ def create_agent_manager_router(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        # Register with scheduler if cron/interval
+        # Register with scheduler so both explicit schedules and due project
+        # task backlog can fire without a manual Run click.
         scheduler = getattr(request.app.state, "agent_scheduler", None)
-        sched_type = (req.config or {}).get("schedule_type", "manual")
-        if scheduler and sched_type in ("cron", "interval"):
+        if scheduler:
             scheduler.register_agent(agent["id"])
 
         return _enrich_agent_record(agent)
@@ -1543,7 +1564,37 @@ def create_agent_manager_router(
         if agent["status"] == "archived":
             raise HTTPException(status_code=400, detail="Agent is archived")
         if agent["status"] == "running":
-            raise HTTPException(status_code=409, detail="Agent is already running")
+            import time as _t
+
+            last = agent.get("last_activity_at") or 0
+            if last and (_t.time() - last) <= 120:
+                raise HTTPException(
+                    status_code=409, detail="Agent is already running"
+                )
+            # Stale 'running' from an interrupted run — recover instead of
+            # blocking forever.
+            manager.update_agent(agent_id, status="idle", current_activity="")
+            agent = manager.get_agent(agent_id) or agent
+
+        # Hard requirement: an agent may only run if its work is tied to a
+        # project task or subtask (Mission Control tracking & documentation).
+        if not manager.has_open_linked_task(agent_id):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Agent has no task linked to a project task or subtask. "
+                    "Create a linked task first — Mission Control requires "
+                    "all agent work to be tracked under a project."
+                ),
+            )
+        if not manager.has_runnable_task(agent_id):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Agent has linked work, but every open task is scheduled "
+                    "for a future start date/time."
+                ),
+            )
 
         # Auto-recover from error/needs_attention state
         if agent["status"] in ("error", "needs_attention"):
@@ -1605,14 +1656,34 @@ def create_agent_manager_router(
     # ── Tasks ────────────────────────────────────────────────
 
     @agents_router.get("/{agent_id}/tasks")
-    async def list_tasks(agent_id: str, status: Optional[str] = None):
-        return {"tasks": manager.list_tasks(agent_id, status=status)}
+    async def list_tasks(
+        agent_id: str,
+        status: Optional[str] = None,
+        include_delegated: bool = False,
+    ):
+        tasks = manager.list_tasks(agent_id, status=status)
+        if include_delegated:
+            seen = {task["id"] for task in tasks}
+            for task in manager.list_tasks_assigned_by(agent_id, status=status):
+                if task["id"] not in seen:
+                    tasks.append(task)
+                    seen.add(task["id"])
+            tasks.sort(key=lambda task: task.get("created_at", 0), reverse=True)
+        return {"tasks": tasks}
 
     @agents_router.post("/{agent_id}/tasks")
     async def create_task(agent_id: str, req: CreateTaskRequest):
         if not manager.get_agent(agent_id):
             raise HTTPException(status_code=404, detail="Agent not found")
-        return manager.create_task(agent_id, description=req.description)
+        try:
+            return manager.create_task(
+                agent_id,
+                description=req.description,
+                project_task_id=req.project_task_id,
+                project_id=req.project_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
     @agents_router.get("/{agent_id}/tasks/{task_id}")
     async def get_task(agent_id: str, task_id: str):

@@ -6,8 +6,8 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from openjarvis.agents.capabilities import build_agent_tool_instances
 from openjarvis.agents._stubs import AgentResult
+from openjarvis.agents.capabilities import build_agent_tool_instances
 from openjarvis.agents.errors import (
     AgentTickError,
     EscalateError,
@@ -108,10 +108,15 @@ class AgentExecutor:
         tool_name = str(getattr(last, "tool_name", "") or "tool")
         success = bool(getattr(last, "success", False))
         if success:
-            return f"{tool_name} completed successfully, but no final response was produced."
+            return (
+                f"{tool_name} completed successfully, but no final response "
+                "was produced."
+            )
         return f"{tool_name} failed, and no final response was produced."
 
-    def _sync_response_to_single_open_task(self, agent_id: str, response_text: str) -> None:
+    def _sync_response_to_single_open_task(
+        self, agent_id: str, response_text: str
+    ) -> None:
         text = str(response_text or "").strip()
         if not text:
             return
@@ -166,6 +171,28 @@ class AgentExecutor:
         3. Update stats
         4. Release guard (end_tick)
         """
+        has_linked_open_task = (
+            self._manager.has_open_linked_task(agent_id)
+            if hasattr(self._manager, "has_open_linked_task")
+            else False
+        )
+        has_runnable_task = (
+            self._manager.has_runnable_task(agent_id)
+            if hasattr(self._manager, "has_runnable_task")
+            else True
+        )
+        if has_linked_open_task and not has_runnable_task:
+            logger.info(
+                "Agent %s only has future-scheduled tasks; skipping tick",
+                agent_id,
+            )
+            return
+        if not has_runnable_task and not self._manager.get_pending_messages(agent_id):
+            logger.info(
+                "Agent %s has no due linked task or pending message; skipping tick",
+                agent_id,
+            )
+            return
         try:
             self._manager.start_tick(agent_id)
             self._set_activity(agent_id, "Preparing tick...")
@@ -394,12 +421,19 @@ class AgentExecutor:
             base = memory or "Continue your assigned task."
             input_text = f"Current date: {today}\n\n{base}"
         pending = self._manager.get_pending_messages(agent["id"])
-        open_tasks = self._manager.list_tasks(agent["id"])
+        if hasattr(self._manager, "list_runnable_tasks"):
+            open_tasks = self._manager.list_runnable_tasks(agent["id"])
+        else:
+            open_tasks = self._manager.list_tasks(agent["id"])
         actionable_tasks = [
-            task for task in open_tasks if str(task.get("status", "")).strip() != "completed"
+            task
+            for task in open_tasks
+            if str(task.get("status", "")).strip() != "completed"
         ]
         if actionable_tasks:
-            task_lines = "\n".join(_format_open_task(task) for task in actionable_tasks[:10])
+            task_lines = "\n".join(
+                _format_open_task(task) for task in actionable_tasks[:10]
+            )
             input_text = f"{input_text}\n\nOpen tasks:\n{task_lines}"
         if pending:
             user_msgs = "\n".join(f"User: {m['content']}" for m in pending)

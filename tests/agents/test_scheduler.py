@@ -137,3 +137,76 @@ class TestSchedulerBasic:
         scheduler.stop()
 
         executor.execute_tick.assert_not_called()
+
+    def test_backlog_fires_manual_agent_with_due_task(self, tmp_path):
+        from openjarvis.agents.manager import AgentManager
+        from openjarvis.agents.scheduler import AgentScheduler
+        from openjarvis.projects.store import ProjectStore
+
+        project_store = ProjectStore(tmp_path / "projects.db")
+        mgr = AgentManager(str(tmp_path / "agents.db"), project_store=project_store)
+        try:
+            project = project_store.create_project(name="P", status="Active")
+            project_task = project_store.create_task(project["id"], title="Build")
+            agent = mgr.create_agent(
+                name="worker",
+                agent_type="monitor_operative",
+                config={"schedule_type": "manual"},
+            )
+            mgr.create_task(
+                agent["id"],
+                description="Do the work",
+                project_task_id=project_task["id"],
+            )
+            executor = MagicMock()
+            scheduler = AgentScheduler(
+                manager=mgr,
+                executor=executor,
+                task_poll_interval=0,
+            )
+
+            scheduler._check_task_backlog()
+
+            executor.execute_tick.assert_called_once_with(agent["id"])
+        finally:
+            mgr.close()
+            project_store.close()
+
+    def test_backlog_skips_future_scheduled_task(self, tmp_path):
+        from datetime import datetime, timedelta
+
+        from openjarvis.agents.manager import AgentManager
+        from openjarvis.agents.scheduler import AgentScheduler
+        from openjarvis.projects.store import ProjectStore
+
+        project_store = ProjectStore(tmp_path / "projects.db")
+        mgr = AgentManager(str(tmp_path / "agents.db"), project_store=project_store)
+        try:
+            future = (datetime.now() + timedelta(days=1)).isoformat(
+                timespec="minutes"
+            )
+            project = project_store.create_project(name="P", status="Active")
+            project_task = project_store.create_task(
+                project["id"],
+                title="Later",
+                start_date=future,
+            )
+            agent = mgr.create_agent(name="worker", agent_type="monitor_operative")
+            mgr.create_task(
+                agent["id"],
+                description="Wait for schedule",
+                project_task_id=project_task["id"],
+            )
+            executor = MagicMock()
+            scheduler = AgentScheduler(
+                manager=mgr,
+                executor=executor,
+                task_poll_interval=0,
+            )
+
+            scheduler._check_task_backlog()
+
+            executor.execute_tick.assert_not_called()
+        finally:
+            mgr.close()
+            project_store.close()

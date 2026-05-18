@@ -1,4 +1,5 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import type { CSSProperties } from 'react';
 import { useNavigate } from 'react-router';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -7,6 +8,9 @@ import { useAppStore } from '../lib/store';
 import {
   fetchManagedAgents,
   fetchAgentTasks,
+  updateAgentTask,
+  deleteAgentTask,
+  fetchMissionControl,
   fetchAgentChannels,
   bindAgentChannel,
   unbindAgentChannel,
@@ -34,8 +38,8 @@ import {
   sendblueTest,
   sendblueHealth,
 } from '../lib/api';
-import type { AgentTask, ChannelBinding, AgentTemplate, AgentMessage, ManagedAgent, LearningLogEntry, AgentTrace, ToolInfo, InstalledSkill } from '../lib/api';
-import { useAgentEvents } from '../lib/useAgentEvents';
+import type { AgentTask, ChannelBinding, AgentTemplate, AgentMessage, ManagedAgent, LearningLogEntry, AgentTrace, ToolInfo, InstalledSkill, MissionControlData, MissionControlProject, MissionControlTask } from '../lib/api';
+import { useAgentEvents, type AgentEvent } from '../lib/useAgentEvents';
 import {
   Plus,
   Bot,
@@ -97,6 +101,29 @@ const STATUS_COLOR: Record<AgentStatus, string> = {
 
 function statusColor(s: string): string {
   return STATUS_COLOR[s as AgentStatus] || 'var(--color-text-tertiary)';
+}
+
+// Tick lifecycle events used to tell which agents are actively working.
+const AGENT_ACTIVITY_EVENTS = [
+  'agent_tick_start',
+  'agent_tick_end',
+  'agent_tick_error',
+] as const;
+
+/**
+ * Style for an org-chart reporting line. When `active` is true the connector
+ * shows a pulse of accent colour travelling along it — signalling that the
+ * agents it joins are currently working / talking to each other. Otherwise
+ * it renders as the standard static border line.
+ */
+function connectorStyle(active: boolean): CSSProperties {
+  if (!active) return { background: 'var(--color-border)' };
+  return {
+    backgroundImage:
+      'linear-gradient(180deg, transparent 0%, var(--color-accent) 50%, transparent 100%)',
+    backgroundSize: '100% 200%',
+    animation: 'pulse-travel-y 1.4s linear infinite',
+  };
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -212,13 +239,23 @@ const ORG_ROLE_PRESETS = [
 const ROLE_INSTRUCTION_PRESETS: Record<string, string> = {
   'Chief Orchestrator': `You are the Chief Orchestrator.
 
+Use your own capabilities first:
+- You have connected data sources, skills, and presets. Use them to answer directly.
+- Query your knowledge with knowledge_search (it covers your connected data sources — News/RSS, Hacker News, email, calendar, drive, etc.) and run any skill/preset configured for you.
+- Never claim you "do not have access" to news, current events, or any topic without first checking knowledge_search. If a data source or skill is configured for you, you have access — use it and return the result.
+- Delegation and project creation are last resorts, not the default.
+
 Your job:
 - Receive user requests and classify the work.
-- Route the request to the correct agent or sequence of agents.
+- Answer directly from your own data sources, skills, and presets whenever they can satisfy the request.
+- Route to other agents only when the work genuinely needs them.
 - Prevent duplicated effort and unnecessary delegation.
 - Review the final output before it goes back to the user.
 
 How to operate:
+- For explicit "create/start/set up a project" requests, create the project record first. Do not ask the user for an agent name.
+- Create project tasks/subtasks before delegating execution so assigned work has a project_task_id.
+- Use the agent directory to identify agents by role and route to the best owner.
 - Use the Business Analyst when the request is vague, incomplete, or business-heavy.
 - Use the CTO when architecture, technical risk, tooling, or technical sequencing decisions are needed.
 - Use the Workflow Manager to break approved work into tracked tasks and stages.
@@ -1682,6 +1719,251 @@ function AgentCard({
 // Detail view — Configuration grid with editable model
 // ---------------------------------------------------------------------------
 
+const TASK_STATUSES: AgentTask['status'][] = ['pending', 'active', 'completed', 'failed'];
+type AgentTaskStatusFilter = 'all' | AgentTask['status'];
+
+interface AgentTaskProjectContext {
+  projectName: string;
+  projectTaskTitle: string;
+}
+
+function taskStatusColor(status: AgentTask['status']): string {
+  if (status === 'completed') return 'var(--color-success)';
+  if (status === 'active') return 'var(--color-accent)';
+  if (status === 'failed') return 'var(--color-error)';
+  return 'var(--color-warning)';
+}
+
+function TaskItem({
+  task,
+  agentId,
+  managedAgents,
+  projectContext,
+  onChanged,
+}: {
+  task: AgentTask;
+  agentId: string;
+  managedAgents: ManagedAgent[];
+  projectContext?: AgentTaskProjectContext;
+  onChanged: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draftDesc, setDraftDesc] = useState(task.description);
+  const [draftStatus, setDraftStatus] = useState<AgentTask['status']>(task.status);
+  const [busy, setBusy] = useState(false);
+
+  function beginEdit() {
+    setDraftDesc(task.description);
+    setDraftStatus(task.status);
+    setEditing(true);
+  }
+
+  async function commit() {
+    const trimmed = draftDesc.trim();
+    if (!trimmed) return;
+    if (trimmed === task.description && draftStatus === task.status) {
+      setEditing(false);
+      return;
+    }
+    setBusy(true);
+    try {
+      await updateAgentTask(task.agent_id, task.id, { description: trimmed, status: draftStatus });
+      setEditing(false);
+      onChanged();
+    } catch {
+      toast.error('Failed to update task');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove() {
+    if (!window.confirm('Delete this task? This cannot be undone.')) return;
+    setBusy(true);
+    try {
+      await deleteAgentTask(task.agent_id, task.id);
+      onChanged();
+    } catch {
+      toast.error('Failed to delete task');
+      setBusy(false);
+    }
+  }
+
+  if (editing) {
+    return (
+      <div
+        className="p-3 rounded-lg space-y-2"
+        style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-accent)' }}
+      >
+        <textarea
+          autoFocus
+          value={draftDesc}
+          disabled={busy}
+          onChange={(e) => setDraftDesc(e.target.value)}
+          rows={3}
+          className="w-full text-sm px-2 py-1 rounded outline-none resize-y"
+          style={{
+            color: 'var(--color-text)',
+            background: 'var(--color-bg)',
+            border: '1px solid var(--color-border)',
+          }}
+        />
+        <div className="flex items-center justify-between gap-2">
+          <select
+            value={draftStatus}
+            disabled={busy}
+            onChange={(e) => setDraftStatus(e.target.value as AgentTask['status'])}
+            className="text-xs px-2 py-1 rounded outline-none"
+            style={{
+              color: 'var(--color-text)',
+              background: 'var(--color-bg)',
+              border: '1px solid var(--color-border)',
+            }}
+          >
+            {TASK_STATUSES.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={commit}
+              disabled={busy}
+              title="Save"
+              className="p-1.5 rounded transition-colors"
+              style={{ color: 'var(--color-accent)' }}
+            >
+              <Check size={15} />
+            </button>
+            <button
+              onClick={() => setEditing(false)}
+              disabled={busy}
+              title="Cancel"
+              className="p-1.5 rounded transition-colors"
+              style={{ color: 'var(--color-text-tertiary)' }}
+            >
+              <X size={15} />
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="group p-3 rounded-lg"
+      style={{
+        background: 'var(--color-bg-secondary)',
+        border: `1px solid ${taskStatusColor(task.status)}`,
+      }}
+    >
+      <div className="flex justify-between items-start gap-3">
+        <div className="space-y-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span
+              className="text-[10px] px-1.5 py-0.5 rounded"
+              style={{
+                background:
+                  task.agent_id === agentId
+                    ? 'var(--color-accent-subtle)'
+                    : 'var(--color-bg-tertiary)',
+                color:
+                  task.agent_id === agentId
+                    ? 'var(--color-accent)'
+                    : 'var(--color-text-secondary)',
+              }}
+            >
+              {task.agent_id === agentId ? 'Performed here' : 'Passed to subordinate'}
+            </span>
+            {projectContext?.projectName && (
+              <span
+                className="text-[10px] px-1.5 py-0.5 rounded truncate max-w-[220px]"
+                style={{
+                  background: 'var(--color-bg-tertiary)',
+                  color: 'var(--color-text-secondary)',
+                }}
+                title={projectContext.projectName}
+              >
+                {projectContext.projectName}
+              </span>
+            )}
+          </div>
+          <span className="text-sm block" style={{ color: 'var(--color-text)' }}>
+            {task.description}
+          </span>
+          {projectContext?.projectTaskTitle && (
+            <span className="text-xs block" style={{ color: 'var(--color-text-secondary)' }}>
+              Project task: {projectContext.projectTaskTitle}
+            </span>
+          )}
+          {task.agent_id !== agentId && (
+            <span className="text-xs block" style={{ color: 'var(--color-text-tertiary)' }}>
+              Assigned to {findAgentById(managedAgents, task.agent_id)?.name || task.agent_id}
+            </span>
+          )}
+          {task.assigned_by_agent_id && (
+            <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+              Assigned by {findAgentById(managedAgents, task.assigned_by_agent_id)?.name || task.assigned_by_agent_id}
+            </span>
+          )}
+          {task.progress && Object.keys(task.progress).length > 0 && (
+            <span className="text-xs block" style={{ color: 'var(--color-text-secondary)' }}>
+              Progress: {String((task.progress as Record<string, unknown>).note || JSON.stringify(task.progress))}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <span
+            className="text-xs px-2 py-0.5 rounded"
+            style={{
+              background: `color-mix(in srgb, ${taskStatusColor(task.status)} 18%, transparent)`,
+              color: taskStatusColor(task.status),
+            }}
+          >
+            {task.status}
+          </span>
+          <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+            <button
+              onClick={beginEdit}
+              disabled={busy}
+              title="Edit task"
+              className="p-1 rounded transition-colors"
+              style={{ color: 'var(--color-text-tertiary)' }}
+            >
+              <Pencil size={13} />
+            </button>
+            <button
+              onClick={remove}
+              disabled={busy}
+              title="Delete task"
+              className="p-1 rounded transition-colors"
+              style={{ color: 'var(--color-text-tertiary)' }}
+              onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--color-error, #ef4444)')}
+              onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--color-text-tertiary)')}
+            >
+              <Trash2 size={13} />
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function collectProjectTaskContext(data: MissionControlData | null) {
+  const projectById = new Map<string, MissionControlProject>();
+  const taskById = new Map<string, MissionControlTask & { projectId: string }>();
+  const walk = (project: MissionControlProject, task: MissionControlTask) => {
+    taskById.set(task.id, { ...task, projectId: project.id });
+    task.subtasks?.forEach((subtask) => walk(project, subtask));
+  };
+  for (const project of data?.projects || []) {
+    projectById.set(project.id, project);
+    project.tasks?.forEach((task) => walk(project, task));
+  }
+  return { projectById, taskById };
+}
+
 function AgentNameField({ agent, onAgentUpdated }: { agent: ManagedAgent; onAgentUpdated: () => void }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
@@ -2371,14 +2653,18 @@ function OrgChartNode({
   managedAgents,
   selectedAgentId,
   onSelect,
+  activeAgentIds,
 }: {
   agent: ManagedAgent;
   managedAgents: ManagedAgent[];
   selectedAgentId: string | null;
   onSelect: (agentId: string) => void;
+  activeAgentIds: Set<string>;
 }) {
   const reports = getOrgChildren(managedAgents, agent.id);
   const isSelected = selectedAgentId === agent.id;
+  // The trunk below a manager lights up while any direct report is active.
+  const anyReportActive = reports.some((r) => activeAgentIds.has(r.id));
 
   return (
     <div className="flex flex-col items-center min-w-[220px]">
@@ -2412,12 +2698,13 @@ function OrgChartNode({
 
       {reports.length > 0 && (
         <div className="mt-3 flex flex-col items-center">
-          <div className="h-6 w-px" style={{ background: 'var(--color-border)' }} />
+          <div className="h-6 w-px" style={connectorStyle(anyReportActive)} />
           <div className="flex items-start justify-center">
             {reports.map((report, index) => {
               const isOnly = reports.length === 1;
               const isFirst = index === 0;
               const isLast = index === reports.length - 1;
+              const reportActive = activeAgentIds.has(report.id);
 
               return (
                 <div key={report.id} className="relative flex flex-col items-center px-3 pt-6">
@@ -2431,12 +2718,13 @@ function OrgChartNode({
                       }}
                     />
                   )}
-                  <div className="absolute top-0 h-6 w-px" style={{ background: 'var(--color-border)' }} />
+                  <div className="absolute top-0 h-6 w-px" style={connectorStyle(reportActive)} />
                   <OrgChartNode
                     agent={report}
                     managedAgents={managedAgents}
                     selectedAgentId={selectedAgentId}
                     onSelect={onSelect}
+                    activeAgentIds={activeAgentIds}
                   />
                 </div>
               );
@@ -2460,6 +2748,42 @@ function AgentOrgChart({
   const roots = getOrgRoots(managedAgents);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const chartRef = useRef<HTMLElement | null>(null);
+
+  // Track which agents have an in-flight work tick so the reporting lines
+  // between them can animate. `expiry` is a safety net: if a tick's
+  // completion event is ever missed, the line stops pulsing on its own.
+  const [activeAgentIds, setActiveAgentIds] = useState<Set<string>>(() => new Set());
+  const activeExpiryRef = useRef<Map<string, number>>(new Map());
+
+  const handleAgentEvent = useCallback((event: AgentEvent) => {
+    const raw = event.data?.agent_id;
+    if (typeof raw !== 'string' || !raw) return;
+    const expiry = activeExpiryRef.current;
+    if (event.type === 'agent_tick_start') {
+      expiry.set(raw, Date.now() + 120_000);
+      setActiveAgentIds(new Set(expiry.keys()));
+    } else if (event.type === 'agent_tick_end' || event.type === 'agent_tick_error') {
+      if (expiry.delete(raw)) setActiveAgentIds(new Set(expiry.keys()));
+    }
+  }, []);
+
+  useAgentEvents('*', handleAgentEvent, AGENT_ACTIVITY_EVENTS);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const expiry = activeExpiryRef.current;
+      const now = Date.now();
+      let changed = false;
+      for (const [aid, exp] of expiry) {
+        if (exp <= now) {
+          expiry.delete(aid);
+          changed = true;
+        }
+      }
+      if (changed) setActiveAgentIds(new Set(expiry.keys()));
+    }, 5000);
+    return () => window.clearInterval(id);
+  }, []);
 
   useEffect(() => {
     if (!isFullscreen) return;
@@ -2491,6 +2815,7 @@ function AgentOrgChart({
             managedAgents={managedAgents}
             selectedAgentId={selectedAgentId}
             onSelect={onSelect}
+            activeAgentIds={activeAgentIds}
           />
         ))}
       </div>
@@ -4562,6 +4887,9 @@ export function AgentsPage() {
   const [loading, setLoading] = useState(true);
   const [agentManagerAvailable, setAgentManagerAvailable] = useState<boolean | null>(null);
   const [tasks, setTasks] = useState<AgentTask[]>([]);
+  const [taskStatusFilter, setTaskStatusFilter] = useState<AgentTaskStatusFilter>('all');
+  const [taskProjectFilter, setTaskProjectFilter] = useState('all');
+  const [missionControlData, setMissionControlData] = useState<MissionControlData | null>(null);
   const [channels, setChannels] = useState<ChannelBinding[]>([]);
   const [templates, setTemplates] = useState<AgentTemplate[]>([]);
   const [skills, setSkills] = useState<InstalledSkill[]>([]);
@@ -4594,13 +4922,43 @@ export function AgentsPage() {
   }, [refresh, refreshLibrary]);
 
   const selectedAgent = managedAgents.find((a) => a.id === selectedAgentId);
+  const taskProjectContext = useMemo(
+    () => collectProjectTaskContext(missionControlData),
+    [missionControlData],
+  );
+  const taskProjectOptions = useMemo(() => {
+    const ids = new Set(tasks.map((task) => task.project_id).filter(Boolean) as string[]);
+    return [...ids].map((id) => ({
+      id,
+      name: taskProjectContext.projectById.get(id)?.name || `Project ${id}`,
+    })).sort((a, b) => a.name.localeCompare(b.name));
+  }, [tasks, taskProjectContext]);
+  const filteredTasks = useMemo(() => {
+    return tasks.filter((task) => {
+      if (taskStatusFilter !== 'all' && task.status !== taskStatusFilter) {
+        return false;
+      }
+      if (taskProjectFilter !== 'all' && task.project_id !== taskProjectFilter) {
+        return false;
+      }
+      return true;
+    });
+  }, [tasks, taskProjectFilter, taskStatusFilter]);
+
+  const reloadTasks = useCallback(() => {
+    if (!selectedAgentId) return;
+    fetchAgentTasks(selectedAgentId, true).then(setTasks).catch(() => setTasks([]));
+    fetchMissionControl().then(setMissionControlData).catch(() => setMissionControlData(null));
+  }, [selectedAgentId]);
 
   useEffect(() => {
     if (selectedAgentId) {
-      fetchAgentTasks(selectedAgentId).then(setTasks).catch(() => setTasks([]));
+      setTaskStatusFilter('all');
+      setTaskProjectFilter('all');
+      reloadTasks();
       fetchAgentChannels(selectedAgentId).then(setChannels).catch(() => setChannels([]));
     }
-  }, [selectedAgentId]);
+  }, [selectedAgentId, reloadTasks]);
 
   const handlePause = async (id: string) => {
     await pauseManagedAgent(id).catch(() => {});
@@ -4996,44 +5354,90 @@ export function AgentsPage() {
 
         {/* Tab: Tasks */}
         {detailTab === 'tasks' && (
-          <div className="space-y-2">
-            {tasks.map((t) => (
-              <div
-                key={t.id}
-                className="p-3 rounded-lg"
-                style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
-              >
-                <div className="flex justify-between items-start gap-3">
-                  <div className="space-y-1">
-                    <span className="text-sm block" style={{ color: 'var(--color-text)' }}>
-                      {t.description}
-                    </span>
-                    {t.assigned_by_agent_id && (
-                      <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                        Assigned by {findAgentById(managedAgents, t.assigned_by_agent_id)?.name || t.assigned_by_agent_id}
-                      </span>
-                    )}
-                    {t.progress && Object.keys(t.progress).length > 0 && (
-                      <span className="text-xs block" style={{ color: 'var(--color-text-secondary)' }}>
-                        Progress: {String((t.progress as Record<string, unknown>).note || JSON.stringify(t.progress))}
-                      </span>
-                    )}
-                  </div>
-                  <span
-                    className="text-xs px-2 py-0.5 rounded flex-shrink-0"
-                    style={{
-                      background: statusColor(t.status) + '20',
-                      color: statusColor(t.status),
-                    }}
-                  >
-                    {t.status}
-                  </span>
+          <div className="space-y-3">
+            <div
+              className="p-3 rounded-lg grid grid-cols-1 md:grid-cols-[1fr_180px_220px] gap-3 items-end"
+              style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
+            >
+              <div>
+                <div className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+                  Agent task ledger
+                </div>
+                <div className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>
+                  Shows work this agent performed and work it passed to subordinate agents.
                 </div>
               </div>
-            ))}
-            {tasks.length === 0 && (
+              <label className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                Status
+                <select
+                  value={taskStatusFilter}
+                  onChange={(e) => setTaskStatusFilter(e.target.value as AgentTaskStatusFilter)}
+                  className="mt-1 w-full px-2 py-1.5 rounded outline-none"
+                  style={{
+                    background: 'var(--color-bg)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text)',
+                  }}
+                >
+                  <option value="all">All statuses</option>
+                  {TASK_STATUSES.map((status) => (
+                    <option key={status} value={status}>
+                      {status}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                Project
+                <select
+                  value={taskProjectFilter}
+                  onChange={(e) => setTaskProjectFilter(e.target.value)}
+                  className="mt-1 w-full px-2 py-1.5 rounded outline-none"
+                  style={{
+                    background: 'var(--color-bg)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text)',
+                  }}
+                >
+                  <option value="all">All projects</option>
+                  {taskProjectOptions.map((project) => (
+                    <option key={project.id} value={project.id}>
+                      {project.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <div className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+              Showing {filteredTasks.length} of {tasks.length} task{tasks.length === 1 ? '' : 's'}
+            </div>
+
+            {filteredTasks.map((t) => {
+              const projectTask = t.project_task_id
+                ? taskProjectContext.taskById.get(t.project_task_id)
+                : undefined;
+              const projectId = t.project_id || projectTask?.projectId || '';
+              const project = projectId
+                ? taskProjectContext.projectById.get(projectId)
+                : undefined;
+              return (
+                <TaskItem
+                  key={t.id}
+                  task={t}
+                  agentId={selectedAgent.id}
+                  managedAgents={managedAgents}
+                  projectContext={{
+                    projectName: project?.name || (projectId ? `Project ${projectId}` : ''),
+                    projectTaskTitle: projectTask?.title || '',
+                  }}
+                  onChanged={reloadTasks}
+                />
+              );
+            })}
+            {filteredTasks.length === 0 && (
               <div className="text-sm py-8 text-center" style={{ color: 'var(--color-text-tertiary)' }}>
-                No tasks assigned.
+                No tasks match these filters.
               </div>
             )}
           </div>

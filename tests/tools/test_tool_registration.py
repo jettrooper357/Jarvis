@@ -68,6 +68,10 @@ EXPECTED_TOOLS = {
     "kg_add_relation",
     "kg_query",
     "kg_neighbors",
+    # project_tools.py
+    "project_create",
+    "project_create_task",
+    "project_list",
 }
 
 

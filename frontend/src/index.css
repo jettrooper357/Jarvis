@@ -390,6 +390,13 @@
     100% { background-position: 200% center; }
   }
 
+  /* Vertical variant — used for org-chart reporting lines between
+     agents that are actively working / talking to each other. */
+  @keyframes pulse-travel-y {
+    0% { background-position: center -200%; }
+    100% { background-position: center 200%; }
+  }
+
   /* HUD ambient animations (CSS-only — kept out of JS for zero-cost continuous motion) */
   @keyframes hud-breathe {
     0%, 100% { box-shadow: 0 0 0 1px var(--color-border), 0 0 0 0 var(--color-accent-glow); }

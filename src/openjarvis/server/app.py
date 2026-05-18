@@ -230,6 +230,18 @@ def create_app(
     app.state.tts_backend = tts_backend
     app.state.tts_clone_backend = tts_clone_backend
     app.state.agent_manager = agent_manager
+    # Reap agents left 'running' by an interrupted prior run (restart/crash)
+    # so the dashboard is accurate and they become runnable again.
+    try:
+        _reaped = agent_manager.reap_stale_running()
+        if _reaped:
+            logging.getLogger(__name__).info(
+                "Reaped %d stale 'running' agent(s) on startup", _reaped
+            )
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Stale-agent reaper failed on startup"
+        )
     app.state.agent_scheduler = agent_scheduler
     app.state.session_start = time.time()
 

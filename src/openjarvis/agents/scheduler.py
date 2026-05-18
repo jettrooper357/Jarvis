@@ -50,14 +50,17 @@ class AgentScheduler:
         manager: AgentManager,
         executor: AgentExecutor | Any,
         tick_interval: float = 1.0,
+        task_poll_interval: float = 5.0,
         event_bus: Any = None,
     ) -> None:
         self._manager = manager
         self._executor = executor
         self._tick_interval = tick_interval
+        self._task_poll_interval = task_poll_interval
         self._bus = event_bus
         # agent_id -> {schedule_type, schedule_value, next_fire}
         self._agents: dict[str, dict] = {}
+        self._backlog_last_fire: dict[str, float] = {}
         self._tick_counts: dict[str, int] = {}
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -140,6 +143,7 @@ class AgentScheduler:
         while not self._stop_event.is_set():
             try:
                 self._check_due_agents()
+                self._check_task_backlog()
                 now = time.time()
                 if now - last_reconcile >= reconcile_interval:
                     self._reconcile()
@@ -161,13 +165,7 @@ class AgentScheduler:
 
         for agent_id, info in due:
             agent = self._manager.get_agent(agent_id)
-            if agent is None or agent["status"] in (
-                "paused",
-                "archived",
-                "running",
-                "budget_exceeded",
-                "stalled",
-            ):
+            if agent is None or not self._agent_can_run(agent):
                 continue
 
             logger.info("Firing tick for agent %s", agent_id)
@@ -189,6 +187,45 @@ class AgentScheduler:
                             info["schedule_value"]
                         )
                     # Manual: stays at inf
+
+    def _agent_can_run(self, agent: dict[str, Any]) -> bool:
+        return agent["status"] not in (
+            "paused",
+            "archived",
+            "running",
+            "budget_exceeded",
+            "stalled",
+            "error",
+            "needs_attention",
+        )
+
+    def _check_task_backlog(self) -> None:
+        """Keep idle agents moving while due uncompleted linked work exists."""
+        now = time.time()
+        for agent in self._manager.list_agents():
+            agent_id = agent["id"]
+            if not self._agent_can_run(agent):
+                continue
+            last_fire = self._backlog_last_fire.get(agent_id, 0.0)
+            if now - last_fire < self._task_poll_interval:
+                continue
+            try:
+                has_work = (
+                    self._manager.has_runnable_task(agent_id)
+                    if hasattr(self._manager, "has_runnable_task")
+                    else False
+                )
+            except Exception:
+                logger.exception("Failed checking runnable work for %s", agent_id)
+                continue
+            if not has_work:
+                continue
+            logger.info("Firing backlog tick for agent %s", agent_id)
+            self._backlog_last_fire[agent_id] = now
+            try:
+                self._executor.execute_tick(agent_id)
+            except Exception:
+                logger.exception("Error executing backlog tick for agent %s", agent_id)
 
     def _reconcile(self) -> None:
         """Check running agents for stalls and handle retries."""

@@ -55,7 +55,7 @@ export function Sidebar() {
 
   const navItems = [
     { path: '/', icon: MessageSquare, label: 'Chat' },
-    { path: '/dashboard', icon: BarChart3, label: 'Dashboard' },
+    { path: '/dashboard', icon: BarChart3, label: 'Mission Control' },
     { path: '/data-sources', icon: Database, label: 'Data Sources' },
     { path: '/agents', icon: Bot, label: 'Agents' },
     { path: '/projects', icon: FolderKanban, label: 'Projects' },

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Trash2 } from 'lucide-react';
 import type { Task } from '../../lib/projects-api';
+import { fetchManagedAgents } from '../../lib/api';
 import {
   TASK_STATUSES,
   TASK_PRIORITIES,
@@ -21,6 +22,18 @@ const inputStyle = {
 
 const labelCls = 'text-[11px] mb-1 block';
 
+function toDateTimeLocal(value: string | null | undefined): string {
+  if (!value) return '';
+  const dt = new Date(value);
+  if (isNaN(dt.getTime())) return value.length === 10 ? `${value}T00:00` : value;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+}
+
+function fromDateTimeLocal(value: string): string | null {
+  return value ? value : null;
+}
+
 export function TaskDetailPanel({
   task,
   onSave,
@@ -32,6 +45,13 @@ export function TaskDetailPanel({
 }) {
   const [draft, setDraft] = useState<Task>(task);
   useEffect(() => setDraft(task), [task]);
+
+  const [agents, setAgents] = useState<{ id: string; name: string }[]>([]);
+  useEffect(() => {
+    fetchManagedAgents()
+      .then((a) => setAgents(a.map((x) => ({ id: x.id, name: x.name }))))
+      .catch(() => {});
+  }, []);
 
   const set = (k: keyof Task, v: unknown) =>
     setDraft((d) => ({ ...d, [k]: v }) as Task);
@@ -105,31 +125,44 @@ export function TaskDetailPanel({
           <span className={labelCls} style={{ color: 'var(--color-text-tertiary)' }}>
             Assigned to
           </span>
-          <input
-            value={draft.assigned_to}
+          <select
+            value={draft.assigned_to || ''}
             onChange={(e) => set('assigned_to', e.target.value)}
             style={inputStyle}
-          />
+          >
+            <option value="">— Unassigned —</option>
+            {draft.assigned_to &&
+              !agents.some((a) => a.name === draft.assigned_to) && (
+                <option value={draft.assigned_to}>
+                  {draft.assigned_to} (not an agent)
+                </option>
+              )}
+            {agents.map((a) => (
+              <option key={a.id} value={a.name}>
+                {a.name}
+              </option>
+            ))}
+          </select>
         </div>
         <div>
           <span className={labelCls} style={{ color: 'var(--color-text-tertiary)' }}>
-            Start date
+            Start date/time
           </span>
           <input
-            type="date"
-            value={draft.start_date || ''}
-            onChange={(e) => set('start_date', e.target.value || null)}
+            type="datetime-local"
+            value={toDateTimeLocal(draft.start_date)}
+            onChange={(e) => set('start_date', fromDateTimeLocal(e.target.value))}
             style={inputStyle}
           />
         </div>
         <div>
           <span className={labelCls} style={{ color: 'var(--color-text-tertiary)' }}>
-            Due date
+            Due date/time
           </span>
           <input
-            type="date"
-            value={draft.due_date || ''}
-            onChange={(e) => set('due_date', e.target.value || null)}
+            type="datetime-local"
+            value={toDateTimeLocal(draft.due_date)}
+            onChange={(e) => set('due_date', fromDateTimeLocal(e.target.value))}
             style={inputStyle}
           />
         </div>

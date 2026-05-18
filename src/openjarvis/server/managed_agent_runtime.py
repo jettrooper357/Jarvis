@@ -7,18 +7,17 @@ import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from openjarvis.agents.capabilities import (
     build_agent_tool_instances,
+)
+from openjarvis.agents.capabilities import (
     effective_agent_tool_names as _effective_capability_tool_names,
 )
 from openjarvis.core.events import EventType
 from openjarvis.core.types import Message, Role, ToolCall, ToolResult
 from openjarvis.tools._stubs import ToolExecutor
-
-if TYPE_CHECKING:
-    from openjarvis.tools._stubs import BaseTool
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +86,109 @@ def _should_enable_knowledge(agent_record: Dict[str, Any]) -> bool:
     return should_enable_agent_knowledge(agent_record)
 
 
+def _role_guidance(agent_record: Dict[str, Any]) -> str:
+    role = str(agent_record.get("org_role", "") or "").strip()
+    if not role:
+        return ""
+    role_key = role.casefold()
+    is_chief = (
+        "chief orchestrator" in role_key
+        or "chief executive officer" in role_key
+        or role_key == "ceo"
+    )
+    if is_chief:
+        return (
+            "Use your own capabilities FIRST:\n"
+            "- You have connected data sources, skills, and presets. Use "
+            "them to answer directly. Query your knowledge with "
+            "knowledge_search (it covers your connected data sources — "
+            "e.g. News/RSS, Hacker News, email, calendar, drive) and run "
+            "any skill/preset configured for you.\n"
+            "- NEVER claim you 'do not have access' to news, current "
+            "events, or any topic without first calling knowledge_search. "
+            "If a relevant data source or skill is configured for you, you "
+            "DO have access — use it and return the result.\n"
+            "- Being the coordinator does not stop you answering "
+            "directly. Delegation is a last resort, not the default.\n"
+            "\n"
+            "Request triage — classify BEFORE acting:\n"
+            "- First decide what the request actually needs.\n"
+            "- If you can answer it directly (your data sources, skills, "
+            "or presets), just do that and reply. Do NOT create a "
+            "project or task for questions, lookups, quick chats, or a "
+            "single skill/preset job — return the answer itself.\n"
+            "- Treat it as project work ONLY when the user explicitly asks "
+            "to create/start/track a project, or it is a genuine "
+            "multi-step initiative that needs delegation and tracking.\n"
+            "\n"
+            "When (and only when) it is project work:\n"
+            "- You are a top-level coordinator. Project creation is not a "
+            "delegated task — call project_create first.\n"
+            "- Use project_create_task to create trackable project "
+            "tasks/subtasks before assigning agent work.\n"
+            "- Use managed_agent_directory to discover available agents by "
+            "role, then assign execution tasks to the best matching "
+            "subordinate with managed_agent_assign_task and the relevant "
+            "project_task_id.\n"
+            "- If no suitable subordinate exists, state the missing role "
+            "clearly and keep the project/task record updated yourself."
+        )
+    if "project manager" in role_key or "workflow manager" in role_key:
+        return (
+            "Use your own capabilities FIRST:\n"
+            "- Use your connected data sources (via knowledge_search), "
+            "skills, and presets to answer directly. Never claim you lack "
+            "access to a topic without first checking knowledge_search "
+            "when a relevant data source or skill is configured for you.\n"
+            "\n"
+            "Request triage — classify BEFORE acting:\n"
+            "- If you can answer directly or via a skill/preset, just "
+            "reply. Do NOT create a project or task for questions, quick "
+            "chats, or a single skill/preset job.\n"
+            "- Only when the user explicitly asks for a project, or it is "
+            "a genuine multi-step initiative:\n"
+            "  - Use project_create for new projects.\n"
+            "  - Use project_create_task for trackable tasks and "
+            "subtasks.\n"
+            "  - Assign agent work only after a project task exists, "
+            "passing its project_task_id into managed_agent_assign_task."
+        )
+    return ""
+
+
+def _build_managed_system_prompt(agent_record: Dict[str, Any]) -> str:
+    config = agent_record.get("config", {}) or {}
+    parts: List[str] = []
+    system_prompt = str(config.get("system_prompt", "") or "").strip()
+    instruction = str(config.get("instruction", "") or "").strip()
+    if system_prompt:
+        parts.append(system_prompt)
+    if instruction and instruction != system_prompt:
+        parts.append(f"Agent instruction:\n{instruction}")
+    role_guidance = _role_guidance(agent_record)
+    if role_guidance:
+        parts.append(role_guidance)
+    return "\n\n".join(parts)
+
+
+_AGENT_TASK_COMPLETION_TOOLS = {
+    "project_create",
+    "project_create_task",
+}
+
+
+def _tool_calls_completed_agent_task(
+    tool_calls: Optional[List[Dict[str, Any]]],
+) -> bool:
+    if not tool_calls:
+        return False
+    return any(
+        call.get("tool") in _AGENT_TASK_COMPLETION_TOOLS
+        and call.get("success", False)
+        for call in tool_calls
+    )
+
+
 class ManagedAgentRuntime:
     """Run managed agents synchronously with tool-calling and delegation."""
 
@@ -114,6 +216,16 @@ class ManagedAgentRuntime:
         agent_record = self._manager.get_agent(agent_id)
         if agent_record is None:
             raise KeyError(f"Agent {agent_id!r} not found")
+        if (
+            hasattr(self._manager, "has_open_linked_task")
+            and self._manager.has_open_linked_task(agent_id)
+            and hasattr(self._manager, "has_runnable_task")
+            and not self._manager.has_runnable_task(agent_id)
+        ):
+            raise ValueError(
+                "Agent has linked work, but every open task is scheduled "
+                "for a future start date/time."
+            )
 
         mode = "delegated" if parent_agent_id else "channel"
         started_at = time.time()
@@ -148,6 +260,7 @@ class ManagedAgentRuntime:
                     "Failed to publish AGENT_MESSAGE_RECEIVED for %s",
                     agent_id,
                 )
+        self._project_writeback(agent_record, phase="start", summary=user_content)
         response_text = ""
         tool_calls: Optional[List[Dict[str, Any]]] = None
         had_error = False
@@ -173,9 +286,27 @@ class ManagedAgentRuntime:
             response_text,
             tool_calls=tool_calls or None,
         )
+        if (
+            not had_error
+            and _tool_calls_completed_agent_task(tool_calls)
+        ):
+            self._complete_linked_agent_task(
+                agent_id,
+                note="Completed by successful project setup tool execution.",
+            )
+        self._project_writeback(
+            agent_record,
+            phase="finish",
+            summary=response_text,
+            error=had_error,
+        )
         if self._bus is not None:
             try:
-                event_type = EventType.AGENT_TICK_ERROR if had_error else EventType.AGENT_TICK_END
+                event_type = (
+                    EventType.AGENT_TICK_ERROR
+                    if had_error
+                    else EventType.AGENT_TICK_END
+                )
                 payload = {
                     "agent_id": agent_id,
                     "agent_name": agent_name,
@@ -190,6 +321,129 @@ class ManagedAgentRuntime:
                 logger.exception("Failed to publish completion event for %s", agent_id)
         return response_text
 
+    # ── Project-task writeback (Mission Control) ──────────────────
+
+    def _linked_project_task(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        """The agent's most relevant linked agent-task (active > recent)."""
+        try:
+            if hasattr(self._manager, "list_runnable_tasks"):
+                tasks = self._manager.list_runnable_tasks(agent_id)
+            else:
+                tasks = self._manager.list_tasks(agent_id)
+        except Exception:
+            return None
+        for status in ("active", "pending"):
+            for t in tasks:
+                if t.get("status") == status and t.get("project_task_id"):
+                    return t
+        for t in tasks:
+            if t.get("project_task_id"):
+                return t
+        return None
+
+    def _complete_linked_agent_task(self, agent_id: str, *, note: str) -> None:
+        """Mark the current linked agent-task complete after deterministic work.
+
+        The model can always call managed_agent_update_task itself. This
+        fallback covers deterministic one-shot work such as project_create,
+        where the tool result proves the assigned setup task is done.
+        """
+        try:
+            task = self._linked_project_task(agent_id)
+            if not task or task.get("status") == "completed":
+                return
+            progress = dict(task.get("progress") or {})
+            progress["note"] = note
+            self._manager.update_task(
+                task["id"],
+                status="completed",
+                progress=progress,
+            )
+        except Exception:
+            logger.exception("Failed to complete linked task for %s", agent_id)
+
+    def _project_writeback(
+        self,
+        agent_record: Dict[str, Any],
+        *,
+        phase: str,
+        summary: str = "",
+        error: bool = False,
+    ) -> None:
+        """Mirror a run into its linked project task (best-effort).
+
+        Role-gated via :mod:`openjarvis.projects.authz`: a note is added
+        when allowed (all tiers), and status/percent is changed only when
+        the agent may update the task (manager any; worker its own task).
+        On success of a leaf task with no subtasks owned by the agent the
+        task is completed; otherwise it is only nudged to In Progress so
+        we never over-claim rolled-up progress. Never raises into the run.
+        """
+        try:
+            link = self._linked_project_task(agent_record["id"])
+            if not link or not link.get("project_task_id"):
+                return
+            ptid = str(link["project_task_id"])
+            ps = self._manager._project_store()
+            ptask = ps.get_task(ptid)
+            if ptask is None:
+                return
+
+            from openjarvis.projects import authz
+
+            agent_name = str(agent_record.get("name") or agent_record["id"])
+            if authz.can(agent_record, "note.add", ptask):
+                if phase == "start":
+                    content = (
+                        f"Agent '{agent_name}' started a run: "
+                        f"{summary[:200]}"
+                    )
+                    ntype = "Agent"
+                elif error:
+                    content = (
+                        f"Agent '{agent_name}' run failed: {summary[:300]}"
+                    )
+                    ntype = "Blocker"
+                else:
+                    content = (
+                        f"Agent '{agent_name}' completed a run: "
+                        f"{summary[:300]}"
+                    )
+                    ntype = "Agent"
+                ps.add_note(
+                    ptid, author=agent_name, content=content, type=ntype
+                )
+
+            if not authz.can(agent_record, "task.update", ptask):
+                return
+            updates: Dict[str, Any] = {}
+            current = str(ptask.get("status") or "")
+            nudge = ("", "Backlog", "Planning", "To Do")
+            if phase == "start":
+                if current in nudge:
+                    updates["status"] = "In Progress"
+            elif error:
+                updates["status"] = "Blocked"
+            else:
+                subtasks = [
+                    t
+                    for t in ps.list_tasks(ptask["project_id"])
+                    if t.get("parent_task_id") == ptid
+                ]
+                if not subtasks:
+                    updates["status"] = "Done"
+                    updates["percent_complete"] = 100
+                elif current in nudge:
+                    updates["status"] = "In Progress"
+            if updates:
+                ps.update_task(ptid, **updates)
+        except Exception:
+            logger.exception(
+                "Project writeback (%s) failed for agent %s",
+                phase,
+                agent_record.get("id"),
+            )
+
     def _run_turn(
         self,
         *,
@@ -201,7 +455,11 @@ class ManagedAgentRuntime:
     ) -> tuple[str, List[Dict[str, Any]]]:
         agent_id = agent_record["id"]
         config = agent_record.get("config", {}) or {}
-        model = config.get("model") or getattr(self._engine, "_model", "") or self._default_model
+        model = (
+            config.get("model")
+            or getattr(self._engine, "_model", "")
+            or self._default_model
+        )
         if not model:
             raise RuntimeError("No model configured for managed agent runtime")
 
@@ -262,6 +520,7 @@ class ManagedAgentRuntime:
             max_tokens=int(config.get("max_tokens", 4096)),
             interactive=True,
             confirm_callback=lambda _prompt: True,
+            system_prompt=_build_managed_system_prompt(agent_record),
         )
 
         original_execute = dr_agent._executor.execute
@@ -306,7 +565,7 @@ class ManagedAgentRuntime:
         tool_map = {tool.spec.name: tool for tool in tool_instances}
 
         messages: List[Message] = []
-        system_prompt = config.get("system_prompt")
+        system_prompt = _build_managed_system_prompt(agent_record)
         if system_prompt:
             messages.append(Message(role=Role.SYSTEM, content=str(system_prompt)))
 
@@ -336,7 +595,9 @@ class ManagedAgentRuntime:
                 kwargs["tools"] = tool_specs
             result = self._engine.generate(messages, **kwargs)
             turn_content = _response_content(result)
-            tool_calls_raw = result.get("tool_calls", []) if isinstance(result, dict) else []
+            tool_calls_raw = (
+                result.get("tool_calls", []) if isinstance(result, dict) else []
+            )
 
             if not tool_calls_raw:
                 return f"{collected_prefix}{turn_content}", collected_tool_calls
@@ -381,7 +642,10 @@ class ManagedAgentRuntime:
                     tool_result_content = result_obj.content or ""
                     tool_success = bool(result_obj.success)
                 except Exception as exc:
-                    logger.exception("Managed agent tool execution failed for %s", tool_name)
+                    logger.exception(
+                        "Managed agent tool execution failed for %s",
+                        tool_name,
+                    )
                     tool_result_content = f"Error executing {tool_name}: {exc}"
 
                 collected_tool_calls.append(
@@ -408,7 +672,8 @@ class ManagedAgentRuntime:
             Message(
                 role=Role.USER,
                 content=(
-                    "Write the best final answer you can from the completed tool results. "
+                    "Write the best final answer you can from the completed "
+                    "tool results. "
                     "Do not call more tools."
                 ),
             )

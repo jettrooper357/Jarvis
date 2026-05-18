@@ -8,7 +8,11 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from openjarvis.agents.library import builtin_skills_dir, user_skills_dir, workspace_skills_dir
+from openjarvis.agents.library import (
+    builtin_skills_dir,
+    user_skills_dir,
+    workspace_skills_dir,
+)
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.skills.executor import SkillExecutor
 from openjarvis.skills.manager import SkillManager
@@ -25,6 +29,17 @@ AUTO_COLLABORATION_TOOLS = (
     "managed_agent_list_tasks",
     "managed_agent_update_task",
     "managed_agent_inspect",
+)
+AUTO_PROJECT_TOOLS = ("project_create", "project_create_task", "project_list")
+PROJECT_TOOL_ROLES = (
+    "chief orchestrator",
+    "chief executive officer",
+    "ceo",
+    "chief of staff",
+    "chief operating officer",
+    "coo",
+    "workflow manager",
+    "project manager",
 )
 KNOWLEDGE_TOOL_NAMES = ("knowledge_search", "knowledge_sql", "scan_chunks", "think")
 KNOWLEDGE_ENABLED_AGENT_TYPES = {"deep_research", "monitor_operative", "operative"}
@@ -67,10 +82,21 @@ def should_enable_agent_knowledge(agent_record: Dict[str, Any]) -> bool:
     return (DEFAULT_CONFIG_DIR / "knowledge.db").exists()
 
 
+def should_enable_project_tools(agent_record: Dict[str, Any]) -> bool:
+    role = str(agent_record.get("org_role", "") or "").strip().casefold()
+    name = str(agent_record.get("name", "") or "").strip().casefold()
+    haystack = f"{role} {name}"
+    return any(marker in haystack for marker in PROJECT_TOOL_ROLES)
+
+
 def effective_agent_tool_names(agent_record: Dict[str, Any]) -> List[str]:
     names = configured_agent_tool_names(agent_record)
     if str(agent_record.get("name", "")).strip() or agent_record.get("id"):
         for tool_name in AUTO_COLLABORATION_TOOLS:
+            if tool_name not in names:
+                names.append(tool_name)
+    if should_enable_project_tools(agent_record):
+        for tool_name in AUTO_PROJECT_TOOLS:
             if tool_name not in names:
                 names.append(tool_name)
     if should_enable_agent_knowledge(agent_record):
@@ -258,7 +284,9 @@ def build_agent_tool_instances(
     visible_tools: List[BaseTool] = []
     for tool_name in visible_tool_names:
         tool = instantiated_by_name.get(tool_name)
-        if tool is not None and tool.spec.name not in [t.spec.name for t in visible_tools]:
+        if tool is not None and tool.spec.name not in [
+            t.spec.name for t in visible_tools
+        ]:
             visible_tools.append(tool)
 
     if skill_manager is not None and selected_skill_manifests:

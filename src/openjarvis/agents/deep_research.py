@@ -190,6 +190,7 @@ class DeepResearchAgent(ToolUsingAgent):
             interactive=interactive,
             confirm_callback=confirm_callback,
         )
+        self._system_prompt_override = system_prompt
 
     @staticmethod
     def _extract_sources(tool_results: List[ToolResult]) -> List[str]:
@@ -220,9 +221,16 @@ class DeepResearchAgent(ToolUsingAgent):
     ) -> AgentResult:
         self._emit_turn_start(input)
 
-        # Build system prompt with current date/time injected
-        system_prompt = (
+        # Build system prompt with current date/time injected. A managed-agent
+        # override augments the research prompt instead of replacing it, so
+        # role instructions do not remove DeepResearch's tool-use guidance.
+        base_system_prompt = (
             load_system_prompt_override("deep_research") or _build_system_prompt()
+        )
+        system_prompt = (
+            f"{self._system_prompt_override}\n\n{base_system_prompt}"
+            if self._system_prompt_override
+            else base_system_prompt
         )
         messages = self._build_messages(input, context, system_prompt=system_prompt)
 

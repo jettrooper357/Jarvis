@@ -25,6 +25,9 @@ function buildWsUrl(agentId?: string): string {
 /**
  * Subscribe to agent events over WebSocket.
  * Auto-reconnects with backoff when the socket drops.
+ *
+ * Pass `'*'` as ``agentId`` to receive events for every agent (no
+ * server-side filter) — used by the org chart to track activity globally.
  */
 export function useAgentEvents(
   agentId: string | undefined,
@@ -43,20 +46,31 @@ export function useAgentEvents(
     let retry = 0;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+    // A connection must stay open at least this long to count as
+    // "healthy" and reset the backoff. Sockets that open then close
+    // almost immediately are flapping (backend overloaded/restarting);
+    // resetting the backoff on every onopen turns that into a ~1s
+    // reconnect hammer that, across every mounted subscription (incl.
+    // the global '*' one), exhausts browser sockets
+    // (net::ERR_INSUFFICIENT_RESOURCES).
+    const STABLE_MS = 5000;
+
     const connect = () => {
       if (closed) return;
+      let openedAt = 0;
       try {
-        ws = new WebSocket(buildWsUrl(agentId));
+        ws = new WebSocket(buildWsUrl(agentId === '*' ? undefined : agentId));
       } catch {
         schedule();
         return;
       }
       ws.onopen = () => {
-        retry = 0;
+        openedAt = Date.now();
       };
       ws.onmessage = (msg) => {
         try {
           const payload = JSON.parse(msg.data) as AgentEvent;
+          if (payload.type === 'ping') return; // server idle keepalive
           const allowed = typesRef.current;
           if (allowed && !allowed.includes(payload.type)) return;
           onEventRef.current(payload);
@@ -65,7 +79,11 @@ export function useAgentEvents(
         }
       };
       ws.onclose = () => {
-        if (!closed) schedule();
+        if (closed) return;
+        if (openedAt && Date.now() - openedAt >= STABLE_MS) {
+          retry = 0; // genuine long-lived connection dropped — reconnect fast
+        }
+        schedule();
       };
       ws.onerror = () => {
         ws?.close();
@@ -74,7 +92,10 @@ export function useAgentEvents(
 
     const schedule = () => {
       if (closed) return;
-      const delay = Math.min(30000, 1000 * 2 ** Math.min(retry, 5));
+      // Exponential backoff (1s→30s) plus jitter so the many concurrent
+      // subscriptions don't reconnect in lockstep (thundering herd).
+      const base = Math.min(30000, 1000 * 2 ** Math.min(retry, 5));
+      const delay = base + Math.floor(Math.random() * 1000);
       retry += 1;
       reconnectTimer = setTimeout(connect, delay);
     };

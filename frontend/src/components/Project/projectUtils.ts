@@ -81,6 +81,18 @@ export function fmtDate(d: string | null): string {
   });
 }
 
+export function fmtDateTime(d: string | null): string {
+  if (!d) return 'Now';
+  const dt = new Date(d);
+  if (isNaN(dt.getTime())) return d;
+  return dt.toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
 /** Build a parent→children map and return root tasks in sort order. */
 export function buildTaskTree(tasks: Task[]): {
   roots: Task[];
