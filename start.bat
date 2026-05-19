@@ -92,7 +92,9 @@ REM  cmd.exe /k keeps the spawned window open at a cmd prompt after wsl/bash
 REM  exits, so any error output from the inner command stays visible.
 REM  The speech extras pin huggingface_hub<1.0 / transformers<5 (see
 REM  pyproject.toml conflicts) -- needed for kokoro to import cleanly.
-set "BACKEND_BASH=UV_PROJECT_ENVIRONMENT=%VENV% uv run --extra server --extra speech --extra speech-tts-kokoro jarvis serve"
+REM  Default model for the OpenJarvis backend. qwen2.5-coder:7b: reliable
+REM  tool-calling + code, fits the CPU/RAM budget. Change here to switch.
+set "BACKEND_BASH=UV_PROJECT_ENVIRONMENT=%VENV% uv run --extra server --extra speech --extra speech-tts-kokoro jarvis serve --model qwen2.5-coder:7b"
 echo.
 echo  Starting OpenJarvis backend  (http://localhost:8000)
 start "OpenJarvis Backend"  conhost.exe cmd.exe /k wsl.exe --cd "%PROJECT%" -e bash -lc "%BACKEND_BASH%"

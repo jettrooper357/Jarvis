@@ -88,8 +88,8 @@ def _should_enable_knowledge(agent_record: Dict[str, Any]) -> bool:
 
 def _role_guidance(agent_record: Dict[str, Any]) -> str:
     role = str(agent_record.get("org_role", "") or "").strip()
-    if not role:
-        return ""
+    # No early return for a missing role: every agent gets baseline triage
+    # rules via the generic default at the end of this function.
     role_key = role.casefold()
     is_chief = (
         "chief orchestrator" in role_key
@@ -130,6 +130,10 @@ def _role_guidance(agent_record: Dict[str, Any]) -> str:
             "role, then assign execution tasks to the best matching "
             "subordinate with managed_agent_assign_task and the relevant "
             "project_task_id.\n"
+            "- Match work to the right role: information, news, research, "
+            "and lookup requests go to an Information Officer/CIO — never "
+            "to a project or workflow manager. Project/workflow managers "
+            "own project setup and tracking, not information retrieval.\n"
             "- If no suitable subordinate exists, state the missing role "
             "clearly and keep the project/task record updated yourself."
         )
@@ -153,7 +157,62 @@ def _role_guidance(agent_record: Dict[str, Any]) -> str:
             "  - Assign agent work only after a project task exists, "
             "passing its project_task_id into managed_agent_assign_task."
         )
-    return ""
+    is_information_officer = (
+        "information officer" in role_key
+        or role_key == "cio"
+        or "research" in role_key
+        or "analyst" in role_key
+        or "intelligence" in role_key
+    )
+    if is_information_officer:
+        return (
+            "You are the information/research authority. Answer "
+            "information, news, research, monitoring, and lookup requests "
+            "DIRECTLY and yourself.\n"
+            "- knowledge_search is your primary tool — it covers your "
+            "connected data sources (News/RSS, Hacker News, email, "
+            "calendar, drive). Always call it before saying you lack "
+            "access to any topic.\n"
+            "- Synthesize the retrieved results into a concise, sourced "
+            "answer. Do NOT paste the raw search output back — summarize "
+            "the key points and include links where available.\n"
+            "\n"
+            "Request triage — classify BEFORE acting:\n"
+            "- News, current events, lookups, and research questions are "
+            "YOUR job: answer directly via knowledge_search/skills. NEVER "
+            "create a project or task for these, and never delegate them "
+            "to a project or workflow manager.\n"
+            "- Treat it as project work ONLY when the user explicitly "
+            "asks to create/start/track a project, or it is a genuine "
+            "multi-step initiative; only then use project_create / "
+            "project_create_task."
+        )
+    # Generic default — every other (or unspecified) role still gets
+    # baseline triage so no agent routes a simple question into a project.
+    return (
+        "Use your own capabilities FIRST:\n"
+        "- You have connected data sources, skills, and presets. Use them "
+        "to answer directly. Query your knowledge with knowledge_search "
+        "(it covers your connected data sources — e.g. News/RSS, Hacker "
+        "News, email, calendar, drive) and run any skill or preset "
+        "configured for you.\n"
+        "- NEVER claim you 'do not have access' to news, current events, "
+        "or any topic without first calling knowledge_search. If a "
+        "relevant data source or skill is configured for you, you DO have "
+        "access — use it and return the result.\n"
+        "\n"
+        "Request triage — classify BEFORE acting:\n"
+        "- Decide what the request actually needs, then act once. If you "
+        "can answer it directly (your data sources, skills, or presets), "
+        "just do that and reply.\n"
+        "- Do NOT create a project or task for questions, lookups, quick "
+        "chats, or a single skill/preset job — return the answer itself. "
+        "This is an interactive chat: prefer a direct answer over routing "
+        "or delegation.\n"
+        "- Treat it as project work ONLY when the user explicitly asks "
+        "to create/start/track a project, or it is a genuine multi-step "
+        "initiative; only then use project_create / project_create_task."
+    )
 
 
 def _build_managed_system_prompt(agent_record: Dict[str, Any]) -> str:

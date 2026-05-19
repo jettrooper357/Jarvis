@@ -3219,7 +3219,7 @@ function InteractTab({ agentId, agentStatus }: { agentId: string; agentStatus: s
       });
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       // Add the agent's response as a local bubble immediately
-      if (response && response.content) {
+      if (response && (response.content || collectedToolCalls.length > 0)) {
         const meta = {
           _elapsed: elapsed,
           _toolCalls: toolCount,
@@ -3259,7 +3259,12 @@ function InteractTab({ agentId, agentStatus }: { agentId: string; agentStatus: s
   // Reverse so newest messages appear at the bottom (closest to input).
   // Filter out agent responses with empty content.
   const displayMessages = [...messages]
-    .filter((m) => m.direction === 'user_to_agent' || m.content.trim())
+    .filter(
+      (m) =>
+        m.direction === 'user_to_agent' ||
+        m.content.trim() ||
+        (m._toolCallDetails && m._toolCallDetails.length > 0),
+    )
     .reverse();
 
   return (
@@ -3285,7 +3290,10 @@ function InteractTab({ agentId, agentStatus }: { agentId: string; agentStatus: s
                 ))}
               </div>
             )}
-            {/* Message bubble */}
+            {/* Message bubble — skip the empty agent bubble when a turn
+                produced only tool-call cards (rendered above), so the
+                results stay visible instead of vanishing. */}
+            {(msg.direction === 'user_to_agent' || msg.content.trim()) && (
             <div className={`flex ${msg.direction === 'user_to_agent' ? 'justify-end' : 'justify-start'}`}>
               <div
                 className="max-w-[75%] px-3 py-2 rounded-lg text-sm"
@@ -3312,6 +3320,7 @@ function InteractTab({ agentId, agentStatus }: { agentId: string; agentStatus: s
                 )}
               </div>
             </div>
+            )}
           </div>
         ))}
         {/* Progress indicator — shown when waiting but no streamed content or tool calls yet */}

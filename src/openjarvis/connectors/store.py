@@ -10,6 +10,7 @@ Pure Python ``sqlite3`` (no Rust extension required).
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 import uuid
@@ -98,6 +99,29 @@ def _to_iso(ts: Optional[Union[datetime, str]]) -> str:
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     return ts.isoformat()
+
+
+# Unicode word tokens (letters/digits), excluding underscore.
+_FTS5_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _fts5_safe_query(query: str) -> str:
+    """Turn arbitrary user text into a safe FTS5 ``MATCH`` expression.
+
+    FTS5 parses the MATCH string as a query expression even when it is
+    bound as a ``?`` parameter, so characters like ``' " - * ( ) :``
+    raise ``fts5: syntax error`` and the whole search silently returns
+    nothing — e.g. the query ``today's news`` fails on the apostrophe.
+
+    We extract word tokens and OR them as quoted terms. Quoting makes
+    each token a literal (no operator can leak through), and OR keeps
+    recall high for natural-language questions sent by agents (BM25 then
+    ranks the matches). Returns ``""`` when there is nothing searchable.
+    """
+    tokens = _FTS5_TOKEN_RE.findall(query.lower())
+    if not tokens:
+        return ""
+    return " OR ".join(f'"{token}"' for token in tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +289,12 @@ class KnowledgeStore(MemoryBackend):
         if not query.strip():
             return []
 
+        # FTS5 parses the MATCH string even when bound, so raw user text
+        # (apostrophes, quotes, dashes…) is a syntax error. Sanitize it.
+        match_query = _fts5_safe_query(query)
+        if not match_query:
+            return []
+
         since_str = _to_iso(since) if since is not None else None
         until_str = _to_iso(until) if until is not None else None
 
@@ -309,7 +339,9 @@ class KnowledgeStore(MemoryBackend):
         """
 
         try:
-            rows = self._conn.execute(sql, [query] + params + [top_k]).fetchall()
+            rows = self._conn.execute(
+                sql, [match_query] + params + [top_k]
+            ).fetchall()
         except sqlite3.OperationalError:
             # Malformed FTS query — return empty rather than crash
             return []

@@ -54,6 +54,19 @@ REM Claude launch settings.
 SET "CLAUDE_ONLINE_ARGS="
 SET "CLAUDE_LOCAL_ARGS=--model ""%LOCAL_CLAUDE_MODEL%"""
 
+REM OpenJarvis web stack settings.
+REM The backend MUST be running or the Vite dev server gets ECONNREFUSED
+REM on every /v1 and /health proxy call. Edit the values; do not rewrite
+REM the script.
+SET "START_OPENJARVIS_STACK=1"
+REM Default model for the OpenJarvis backend (reliable tool-calling + code).
+SET "OJ_BACKEND_CMD=uv run jarvis serve --model qwen2.5-coder:7b"
+SET "OJ_BACKEND_HEALTH_URL=http://localhost:8000/health"
+SET "OJ_FRONTEND_FOLDER=%PROJECT_FOLDER%\frontend"
+SET "OJ_FRONTEND_CMD=npm run dev"
+SET "OJ_FRONTEND_URL=http://localhost:5173"
+SET "OJ_OPEN_BROWSER=1"
+
 REM ============================================================
 REM INITIALIZE LOGGING
 REM ============================================================
@@ -350,7 +363,53 @@ echo [%TS%] [%LOG_LEVEL%] %LOG_MESSAGE%
 echo [%TS%] [%LOG_LEVEL%] %LOG_MESSAGE%>> "%LOG_FILE%"
 exit /b 0
 
+:StartOpenJarvisStack
+if not "%START_OPENJARVIS_STACK%"=="1" (
+    call :Log INFO "START_OPENJARVIS_STACK disabled. Skipping web stack launch."
+    exit /b 0
+)
+
+where uv >nul 2>&1
+if errorlevel 1 (
+    call :Log ERROR "'uv' not found in PATH. Cannot start the OpenJarvis backend. Install uv or clear START_OPENJARVIS_STACK."
+    exit /b 1
+)
+
+call :Log INFO "Launching OpenJarvis backend: %OJ_BACKEND_CMD%"
+start "OpenJarvis - Backend" cmd /k "cd /d ""%PROJECT_FOLDER%"" && %OJ_BACKEND_CMD%"
+
+call :WaitForUrl "%OJ_BACKEND_HEALTH_URL%" "OpenJarvis backend"
+if errorlevel 1 (
+    call :Log ERROR "OpenJarvis backend did not become healthy. Frontend would only get ECONNREFUSED, so the frontend launch is skipped."
+    exit /b 1
+)
+
+if not exist "%OJ_FRONTEND_FOLDER%" (
+    call :Log WARN "Frontend folder not found: %OJ_FRONTEND_FOLDER%. Skipping frontend launch."
+    exit /b 0
+)
+
+where npm >nul 2>&1
+if errorlevel 1 (
+    call :Log WARN "'npm' not found in PATH. Skipping frontend launch. Backend is up at %OJ_BACKEND_HEALTH_URL%."
+    exit /b 0
+)
+
+call :Log INFO "Launching OpenJarvis frontend: %OJ_FRONTEND_CMD%"
+start "OpenJarvis - Frontend" cmd /k "cd /d ""%OJ_FRONTEND_FOLDER%"" && %OJ_FRONTEND_CMD%"
+
+if "%OJ_OPEN_BROWSER%"=="1" (
+    call :Log INFO "Opening browser: %OJ_FRONTEND_URL%"
+    start "" "%OJ_FRONTEND_URL%"
+)
+
+exit /b 0
+
 :SUCCESS
+call :StartOpenJarvisStack
+if errorlevel 1 (
+    call :Log WARN "OpenJarvis web stack did not start cleanly. The Claude window is still up; see messages above and the log."
+)
 call :Log INFO "Start_Claude_AI.bat completed successfully."
 echo.
 echo Claude launcher completed.

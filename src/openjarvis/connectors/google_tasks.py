@@ -5,7 +5,7 @@ Uses OAuth2 tokens via the shared Google OAuth helper module.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
@@ -92,7 +92,13 @@ class GoogleTasksConnector(BaseConnector):
                 "showHidden": "false",
             }
             if since:
-                params["updatedMin"] = since.isoformat() + "Z"
+                # Google Tasks expects RFC 3339. Normalize to UTC and emit a
+                # single trailing "Z"; a tz-aware datetime would otherwise
+                # produce an invalid "...+00:00Z".
+                dt = since
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                params["updatedMin"] = dt.isoformat() + "Z"
 
             tasks = call_with_token_refresh(
                 creds_path,

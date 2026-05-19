@@ -301,9 +301,9 @@ def create_app(
             gen = getattr(eng, "generate", None)
             if callable(gen) and mdl:
                 try:
-                    from openjarvis.core.types import Message
+                    from openjarvis.core.types import Message, Role
 
-                    args = ([Message(role="user", content="hi")],)
+                    args = ([Message(role=Role.USER, content="hi")],)
                     kw = {"model": mdl, "max_tokens": 1}
                     if inspect.iscoroutinefunction(gen):
                         asyncio.run(gen(*args, **kw))

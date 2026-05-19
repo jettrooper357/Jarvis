@@ -749,7 +749,11 @@ async def _stream_managed_agent(
     system_prompt = _build_managed_system_prompt(agent_record)
     temperature = config.get("temperature", 0.7)
     max_tokens = config.get("max_tokens", 1024)
-    max_turns = config.get("max_turns", 10)
+    # Default tool-loop budget. One tool + synthesis is 2 turns; 3 leaves
+    # headroom for a single follow-up tool call. Small models can otherwise
+    # re-call the same tool until the old default of 10 was exhausted, each
+    # turn a slow CPU generation. Override per-agent via config "max_turns".
+    max_turns = config.get("max_turns", 3)
 
     # Build conversation messages from history + current input
     llm_messages: List[Message] = []
@@ -1122,11 +1126,19 @@ async def _stream_managed_agent(
         if persist_state["persisted"]:
             return
         persist_state["persisted"] = True
-        if persist_state["content"]:
+        # Persist whenever we have content OR tool results — a tool that
+        # returned useful data must never be silently dropped just because
+        # the model produced no final text.
+        final_content = persist_state["content"]
+        if not final_content and persist_state["tool_calls"]:
+            final_content = _fallback_response_from_tool_calls(
+                persist_state["tool_calls"]
+            )
+        if final_content:
             try:
                 manager.store_agent_response(
                     agent_id,
-                    persist_state["content"],
+                    final_content,
                     tool_calls=persist_state["tool_calls"] or None,
                 )
             except Exception as store_exc:
@@ -1136,7 +1148,7 @@ async def _stream_managed_agent(
                     exc_info=True,
                 )
         try:
-            content = persist_state["content"] or ""
+            content = final_content or ""
             manager.add_learning_log(
                 agent_id,
                 "query_complete",
@@ -1217,6 +1229,18 @@ async def _stream_managed_agent(
 
             except Exception as exc:
                 logger.error("Managed agent stream error: %s", exc, exc_info=True)
+                # Don't silently drop tool results when the synthesis turn
+                # fails (common with very small models): surface the tool
+                # output as the answer and persist it so the reply survives
+                # the post-send reload.
+                fallback = (
+                    _fallback_response_from_tool_calls(collected_tool_calls)
+                    if collected_tool_calls
+                    else ""
+                )
+                final_text = fallback or f"Error: {exc}"
+                persist_state["content"] = collected_content + final_text
+                persist_state["tool_calls"] = list(collected_tool_calls)
                 error_data = {
                     "id": chunk_id,
                     "object": "chat.completion.chunk",
@@ -1224,7 +1248,7 @@ async def _stream_managed_agent(
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"content": f"Error: {exc}"},
+                            "delta": {"content": final_text},
                             "finish_reason": "stop",
                         }
                     ],
@@ -1391,6 +1415,27 @@ async def _stream_managed_agent(
                         )
                     )
 
+                # Re-anchor the model on the user's actual request so it
+                # synthesizes an answer FROM the tool results instead of
+                # drifting into meta/"routing" talk — small models
+                # otherwise parrot the system prompt ("I'll determine the
+                # appropriate response based on routing guidelines...").
+                # Ephemeral: not persisted to history.
+                messages_for_llm.append(
+                    Message(
+                        role=Role.USER,
+                        content=(
+                            "Use the tool results above to answer my "
+                            f"original request directly: {user_content!r}. "
+                            "If you still genuinely need another tool, "
+                            "call it; otherwise give the final answer now. "
+                            "Do not restate your instructions, do not "
+                            "describe routing or classification, and do "
+                            "not ask me to repeat the request."
+                        ),
+                    )
+                )
+
                 # Continue to next turn (loop back to stream_full)
                 collected_content += turn_content
                 # Mirror to shared state so BackgroundTask can persist
@@ -1424,6 +1469,38 @@ async def _stream_managed_agent(
             persist_state["content"] = collected_content
             persist_state["tool_calls"] = list(collected_tool_calls)
             break
+
+        # Loop exhausted (hit max_turns) without ever taking a final
+        # no-tool-call turn. The break-path fallback above only fires
+        # when the model ends a turn with no tool calls; if the model
+        # kept calling tools until the turn budget ran out,
+        # collected_content is still empty and _persist_final would
+        # store nothing — the user gets a blank chat with no reply even
+        # though the tools returned useful data. Apply the same fallback
+        # here so tool results are never silently dropped. Idempotent
+        # with the break path: on a normal exit collected_content is
+        # already populated, so the guard below is False.
+        if not collected_content.strip() and collected_tool_calls:
+            fallback_content = _fallback_response_from_tool_calls(
+                collected_tool_calls
+            )
+            if fallback_content:
+                collected_content = fallback_content
+                fallback_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": fallback_content},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(fallback_chunk)}\n\n"
+        persist_state["content"] = collected_content
+        persist_state["tool_calls"] = list(collected_tool_calls)
 
         # Final chunk with finish_reason
         final_data = {
