@@ -87,13 +87,23 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM --- 5b. Ollama fast model store (best-effort; needs admin for the VHD) ----
+REM  Moves OLLAMA_MODELS off the slow /mnt/f mount onto a native ext4 VHD on
+REM  F:. Skips cleanly if not run as Administrator -- the -nommap model still
+REM  works on /mnt/f (slow one-time load). See scripts\setup-ollama-store.*
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\setup-ollama-store.ps1"
+
 REM --- 6. Backend -------------------------------------------------------------
 REM  cmd.exe /k keeps the spawned window open at a cmd prompt after wsl/bash
 REM  exits, so any error output from the inner command stays visible.
 REM  The speech extras pin huggingface_hub<1.0 / transformers<5 (see
 REM  pyproject.toml conflicts) -- needed for kokoro to import cleanly.
 REM  Default model for the OpenJarvis backend. qwen2.5-coder:7b: reliable
-REM  tool-calling + code, fits the CPU/RAM budget. Change here to switch.
+REM  tool-calling + code, fits the CPU/RAM budget. mmap is disabled in the
+REM  Ollama engine (src/openjarvis/engine/ollama.py: use_mmap=false) because
+REM  while OLLAMA_MODELS is on /mnt/f, mmap'd page-faults over the Windows
+REM  mount make inference ~100x too slow. (A derived -nommap model can't be
+REM  used: `ollama create` fails with chtimes EPERM on /mnt/f.)
 set "BACKEND_BASH=UV_PROJECT_ENVIRONMENT=%VENV% uv run --extra server --extra speech --extra speech-tts-kokoro jarvis serve --model qwen2.5-coder:7b"
 echo.
 echo  Starting OpenJarvis backend  (http://localhost:8000)

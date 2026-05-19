@@ -60,6 +60,10 @@ REM on every /v1 and /health proxy call. Edit the values; do not rewrite
 REM the script.
 SET "START_OPENJARVIS_STACK=1"
 REM Default model for the OpenJarvis backend (reliable tool-calling + code).
+REM mmap is disabled in the Ollama engine (use_mmap=false) so weights load
+REM fully into RAM once instead of paging per-token over the slow /mnt/f
+REM mount. Phase 2 (setup-ollama-store.ps1) moves the store to a fast ext4
+REM VHD; the engine option is harmless there.
 SET "OJ_BACKEND_CMD=uv run jarvis serve --model qwen2.5-coder:7b"
 SET "OJ_BACKEND_HEALTH_URL=http://localhost:8000/health"
 SET "OJ_FRONTEND_FOLDER=%PROJECT_FOLDER%\frontend"
@@ -181,6 +185,13 @@ if errorlevel 1 goto FAIL
 
 call :PrepareOllama
 if errorlevel 1 goto FAIL
+
+REM Phase 2: move the Ollama model store onto a native ext4 VHD (fast).
+REM Best-effort and runs AFTER :PrepareOllama so it wins the OLLAMA_MODELS
+REM override. Needs admin; if skipped, the -nommap model still runs on
+REM /mnt/f. See scripts\setup-ollama-store.ps1 / .sh.
+call :Log INFO "Configuring fast Ollama model store (setup-ollama-store.ps1)."
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\setup-ollama-store.ps1"
 
 call :ValidateClaudeLocalModel
 if errorlevel 1 goto FAIL

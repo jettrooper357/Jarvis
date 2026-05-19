@@ -76,6 +76,16 @@ class OllamaEngine(InferenceEngine):
                 "temperature": temperature,
                 "num_predict": max_tokens,
                 "num_ctx": kwargs.get("num_ctx", 2048),
+                # Default off: while OLLAMA_MODELS is on the /mnt/f drvfs
+                # mount, mmap'd weight page-faults cross the Windows<->WSL
+                # bridge and inference is ~100x too slow (286s/26tok seen).
+                # use_mmap=false loads weights fully into RAM once (fits the
+                # 15 GiB box); harmless on a native ext4 store. A derived
+                # "-nommap" model can't be used here because `ollama create`
+                # fails with "chtimes ... operation not permitted" on
+                # /mnt/f, so this per-request option is the only mechanism.
+                # Override via kwargs once on fast storage if desired.
+                "use_mmap": kwargs.get("use_mmap", False),
             },
             # Keep the model resident between turns. On a CPU-only box the
             # cold reload (multi-GB read from disk) is the single biggest
@@ -204,6 +214,16 @@ class OllamaEngine(InferenceEngine):
                 "temperature": temperature,
                 "num_predict": max_tokens,
                 "num_ctx": kwargs.get("num_ctx", 2048),
+                # Default off: while OLLAMA_MODELS is on the /mnt/f drvfs
+                # mount, mmap'd weight page-faults cross the Windows<->WSL
+                # bridge and inference is ~100x too slow (286s/26tok seen).
+                # use_mmap=false loads weights fully into RAM once (fits the
+                # 15 GiB box); harmless on a native ext4 store. A derived
+                # "-nommap" model can't be used here because `ollama create`
+                # fails with "chtimes ... operation not permitted" on
+                # /mnt/f, so this per-request option is the only mechanism.
+                # Override via kwargs once on fast storage if desired.
+                "use_mmap": kwargs.get("use_mmap", False),
             },
             # Keep the model resident between turns. On a CPU-only box the
             # cold reload (multi-GB read from disk) is the single biggest
@@ -284,6 +304,16 @@ class OllamaEngine(InferenceEngine):
                 "temperature": temperature,
                 "num_predict": max_tokens,
                 "num_ctx": kwargs.get("num_ctx", 2048),
+                # Default off: while OLLAMA_MODELS is on the /mnt/f drvfs
+                # mount, mmap'd weight page-faults cross the Windows<->WSL
+                # bridge and inference is ~100x too slow (286s/26tok seen).
+                # use_mmap=false loads weights fully into RAM once (fits the
+                # 15 GiB box); harmless on a native ext4 store. A derived
+                # "-nommap" model can't be used here because `ollama create`
+                # fails with "chtimes ... operation not permitted" on
+                # /mnt/f, so this per-request option is the only mechanism.
+                # Override via kwargs once on fast storage if desired.
+                "use_mmap": kwargs.get("use_mmap", False),
             },
             # Keep the model resident between turns. On a CPU-only box the
             # cold reload (multi-GB read from disk) is the single biggest
