@@ -48,6 +48,9 @@ def _format_task(task: Dict[str, Any]) -> str:
         f"priority={task.get('priority', '')}",
         f"complete={task.get('percent_complete', 0)}%",
     ]
+    category = str(task.get("category", "") or "").strip()
+    if category:
+        parts.append(f"category={category}")
     parent = str(task.get("parent_task_id", "") or "").strip()
     if parent:
         parts.append(f"parent_task_id={parent}")
@@ -178,6 +181,13 @@ class ProjectCreateTaskTool(BaseTool):
                         "description": "Optional parent task ID for a subtask.",
                     },
                     "type": {"type": "string", "description": "Task type."},
+                    "category": {
+                        "type": "string",
+                        "description": (
+                            "Optional category label grouping this task with "
+                            "others under the same name in the project."
+                        ),
+                    },
                     "status": {"type": "string", "description": "Task status."},
                     "assigned_to": {
                         "type": "string",
@@ -211,6 +221,7 @@ class ProjectCreateTaskTool(BaseTool):
                 "description",
                 "parent_task_id",
                 "type",
+                "category",
                 "status",
                 "assigned_to",
                 "owner",
@@ -294,4 +305,604 @@ class ProjectListTool(BaseTool):
             success=True,
             content="Projects:\n" + "\n".join(lines),
             metadata={"projects": projects},
+        )
+
+
+def _format_milestone(milestone: Dict[str, Any]) -> str:
+    return (
+        f"id={milestone.get('id', '')} | "
+        f"name={milestone.get('name', '')} | "
+        f"date={milestone.get('date', '') or 'TBD'} | "
+        f"done={bool(milestone.get('done'))}"
+    )
+
+
+@ToolRegistry.register("project_update_task")
+class ProjectUpdateTaskTool(BaseTool):
+    """Edit an existing project task or subtask."""
+
+    tool_id = "project_update_task"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="project_update_task",
+            description=(
+                "Update fields on an existing task or subtask (status, "
+                "percent_complete, assignee, priority, dates, category, "
+                "etc.). Use this to record progress when given an update."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task ID."},
+                    "title": {"type": "string", "description": "New title."},
+                    "description": {
+                        "type": "string",
+                        "description": "New description.",
+                    },
+                    "status": {"type": "string", "description": "New status."},
+                    "category": {
+                        "type": "string",
+                        "description": "Category label ('' clears it).",
+                    },
+                    "priority": {"type": "string", "description": "Priority."},
+                    "assigned_to": {
+                        "type": "string",
+                        "description": "Assignee name.",
+                    },
+                    "owner": {"type": "string", "description": "Owner."},
+                    "percent_complete": {
+                        "type": "integer",
+                        "description": "Completion percent 0-100.",
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "ISO start date.",
+                    },
+                    "due_date": {
+                        "type": "string",
+                        "description": "ISO due date.",
+                    },
+                    "parent_task_id": {
+                        "type": "string",
+                        "description": "Re-parent under this task ID.",
+                    },
+                    "type": {"type": "string", "description": "Task type."},
+                },
+                "required": ["task_id"],
+            },
+            category="project",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        task_id = str(params.get("task_id", "") or "").strip()
+        if not task_id:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content="task_id is required.",
+            )
+        fields = {
+            key: params.get(key)
+            for key in (
+                "title",
+                "description",
+                "status",
+                "category",
+                "priority",
+                "assigned_to",
+                "owner",
+                "percent_complete",
+                "start_date",
+                "due_date",
+                "parent_task_id",
+                "type",
+            )
+            if params.get(key) is not None
+        }
+        if not fields:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content="No fields to update were provided.",
+            )
+        try:
+            task = _project_store().update_task(task_id, **fields)
+        except KeyError:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content=f"Task not found: {task_id}",
+            )
+        return ToolResult(
+            tool_name=self.spec.name,
+            success=True,
+            content=f"Updated task: {_format_task(task)}",
+            metadata={"project_task_id": task["id"], "task": task},
+        )
+
+
+@ToolRegistry.register("project_delete_task")
+class ProjectDeleteTaskTool(BaseTool):
+    """Delete a project task or subtask (cascades to its subtasks/notes)."""
+
+    tool_id = "project_delete_task"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="project_delete_task",
+            description=(
+                "Delete a task or subtask. This also removes its subtasks "
+                "and notes. Use deliberately — it cannot be undone."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task ID."},
+                },
+                "required": ["task_id"],
+            },
+            category="project",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        task_id = str(params.get("task_id", "") or "").strip()
+        if not task_id:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content="task_id is required.",
+            )
+        store = _project_store()
+        if store.get_task(task_id) is None:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content=f"Task not found: {task_id}",
+            )
+        store.delete_task(task_id)
+        return ToolResult(
+            tool_name=self.spec.name,
+            success=True,
+            content=f"Deleted task: {task_id}",
+            metadata={"deleted_task_id": task_id},
+        )
+
+
+@ToolRegistry.register("project_add_note")
+class ProjectAddNoteTool(BaseTool):
+    """Add a progress/status note to a task."""
+
+    tool_id = "project_add_note"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="project_add_note",
+            description=(
+                "Add a note to a task. Use this to log progress, decisions, "
+                "or status whenever you are given an update on the work."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task ID."},
+                    "content": {
+                        "type": "string",
+                        "description": "The note text.",
+                    },
+                    "author": {
+                        "type": "string",
+                        "description": "Optional note author.",
+                    },
+                    "type": {
+                        "type": "string",
+                        "description": "Note type (e.g. Comment, Update).",
+                    },
+                },
+                "required": ["task_id", "content"],
+            },
+            category="project",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        task_id = str(params.get("task_id", "") or "").strip()
+        content = str(params.get("content", "") or "").strip()
+        if not task_id or not content:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content="task_id and content are required.",
+            )
+        fields = {
+            key: params.get(key)
+            for key in ("content", "author", "type")
+            if params.get(key) is not None
+        }
+        try:
+            note = _project_store().add_note(task_id, **fields)
+        except KeyError:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content=f"Task not found: {task_id}",
+            )
+        return ToolResult(
+            tool_name=self.spec.name,
+            success=True,
+            content=f"Added note to task {task_id}.",
+            metadata={"task_id": task_id, "note_id": note["id"], "note": note},
+        )
+
+
+@ToolRegistry.register("project_add_milestone")
+class ProjectAddMilestoneTool(BaseTool):
+    """Add a milestone to a project."""
+
+    tool_id = "project_add_milestone"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="project_add_milestone",
+            description="Add a milestone (name + optional date) to a project.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project ID.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Milestone name.",
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Optional target date.",
+                    },
+                },
+                "required": ["project_id", "name"],
+            },
+            category="project",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        project_id = str(params.get("project_id", "") or "").strip()
+        name = str(params.get("name", "") or "").strip()
+        if not project_id or not name:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content="project_id and name are required.",
+            )
+        try:
+            milestone = _project_store().add_milestone(
+                project_id, name, str(params.get("date", "") or "")
+            )
+        except KeyError:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content=f"Project not found: {project_id}",
+            )
+        return ToolResult(
+            tool_name=self.spec.name,
+            success=True,
+            content=f"Added milestone: {_format_milestone(milestone)}",
+            metadata={"project_id": project_id, "milestone": milestone},
+        )
+
+
+@ToolRegistry.register("project_update_milestone")
+class ProjectUpdateMilestoneTool(BaseTool):
+    """Edit a project milestone (name, date, or done state)."""
+
+    tool_id = "project_update_milestone"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="project_update_milestone",
+            description="Update a milestone's name, date, or done status.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project ID.",
+                    },
+                    "milestone_id": {
+                        "type": "string",
+                        "description": "Milestone ID.",
+                    },
+                    "name": {"type": "string", "description": "New name."},
+                    "date": {"type": "string", "description": "New date."},
+                    "done": {
+                        "type": "boolean",
+                        "description": "Mark complete/incomplete.",
+                    },
+                },
+                "required": ["project_id", "milestone_id"],
+            },
+            category="project",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        project_id = str(params.get("project_id", "") or "").strip()
+        milestone_id = str(params.get("milestone_id", "") or "").strip()
+        if not project_id or not milestone_id:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content="project_id and milestone_id are required.",
+            )
+        fields = {
+            key: params.get(key)
+            for key in ("name", "date", "done")
+            if params.get(key) is not None
+        }
+        try:
+            milestone = _project_store().update_milestone(
+                project_id, milestone_id, **fields
+            )
+        except KeyError as exc:
+            missing = str(exc).strip("'")
+            target = (
+                f"Project not found: {project_id}"
+                if missing == project_id
+                else f"Milestone not found: {milestone_id}"
+            )
+            return ToolResult(
+                tool_name=self.spec.name, success=False, content=target
+            )
+        return ToolResult(
+            tool_name=self.spec.name,
+            success=True,
+            content=f"Updated milestone: {_format_milestone(milestone)}",
+            metadata={"project_id": project_id, "milestone": milestone},
+        )
+
+
+@ToolRegistry.register("project_delete_milestone")
+class ProjectDeleteMilestoneTool(BaseTool):
+    """Delete a project milestone."""
+
+    tool_id = "project_delete_milestone"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="project_delete_milestone",
+            description="Remove a milestone from a project.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project ID.",
+                    },
+                    "milestone_id": {
+                        "type": "string",
+                        "description": "Milestone ID.",
+                    },
+                },
+                "required": ["project_id", "milestone_id"],
+            },
+            category="project",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        project_id = str(params.get("project_id", "") or "").strip()
+        milestone_id = str(params.get("milestone_id", "") or "").strip()
+        if not project_id or not milestone_id:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content="project_id and milestone_id are required.",
+            )
+        try:
+            _project_store().delete_milestone(project_id, milestone_id)
+        except KeyError as exc:
+            missing = str(exc).strip("'")
+            target = (
+                f"Project not found: {project_id}"
+                if missing == project_id
+                else f"Milestone not found: {milestone_id}"
+            )
+            return ToolResult(
+                tool_name=self.spec.name, success=False, content=target
+            )
+        return ToolResult(
+            tool_name=self.spec.name,
+            success=True,
+            content=f"Deleted milestone: {milestone_id}",
+            metadata={
+                "project_id": project_id,
+                "deleted_milestone_id": milestone_id,
+            },
+        )
+
+
+@ToolRegistry.register("project_add_category")
+class ProjectAddCategoryTool(BaseTool):
+    """Create a category label on a project."""
+
+    tool_id = "project_add_category"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="project_add_category",
+            description=(
+                "Create a category on a project so tasks/subtasks can be "
+                "grouped under it. The category shows even before any task "
+                "uses it."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project ID.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Category name.",
+                    },
+                },
+                "required": ["project_id", "name"],
+            },
+            category="project",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        project_id = str(params.get("project_id", "") or "").strip()
+        name = str(params.get("name", "") or "").strip()
+        if not project_id or not name:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content="project_id and name are required.",
+            )
+        try:
+            categories = _project_store().add_category(project_id, name)
+        except KeyError:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content=f"Project not found: {project_id}",
+            )
+        return ToolResult(
+            tool_name=self.spec.name,
+            success=True,
+            content=f"Categories for {project_id}: {', '.join(categories)}",
+            metadata={"project_id": project_id, "categories": categories},
+        )
+
+
+@ToolRegistry.register("project_rename_category")
+class ProjectRenameCategoryTool(BaseTool):
+    """Rename a category (propagates to all tasks using it)."""
+
+    tool_id = "project_rename_category"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="project_rename_category",
+            description=(
+                "Rename a project category. Every task/subtask currently "
+                "labelled with the old name is moved to the new name."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project ID.",
+                    },
+                    "old_name": {
+                        "type": "string",
+                        "description": "Existing category name.",
+                    },
+                    "new_name": {
+                        "type": "string",
+                        "description": "New category name.",
+                    },
+                },
+                "required": ["project_id", "old_name", "new_name"],
+            },
+            category="project",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        project_id = str(params.get("project_id", "") or "").strip()
+        old_name = str(params.get("old_name", "") or "").strip()
+        new_name = str(params.get("new_name", "") or "").strip()
+        if not project_id or not old_name or not new_name:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content="project_id, old_name and new_name are required.",
+            )
+        try:
+            categories = _project_store().rename_category(
+                project_id, old_name, new_name
+            )
+        except KeyError:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content=f"Project not found: {project_id}",
+            )
+        return ToolResult(
+            tool_name=self.spec.name,
+            success=True,
+            content=(
+                f"Renamed category '{old_name}' to '{new_name}'. "
+                f"Categories: {', '.join(categories)}"
+            ),
+            metadata={"project_id": project_id, "categories": categories},
+        )
+
+
+@ToolRegistry.register("project_delete_category")
+class ProjectDeleteCategoryTool(BaseTool):
+    """Delete a category; tasks using it become uncategorized."""
+
+    tool_id = "project_delete_category"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="project_delete_category",
+            description=(
+                "Delete a project category. Tasks/subtasks that used it "
+                "become uncategorized; the tasks themselves are kept."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project ID.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Category name to delete.",
+                    },
+                },
+                "required": ["project_id", "name"],
+            },
+            category="project",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        project_id = str(params.get("project_id", "") or "").strip()
+        name = str(params.get("name", "") or "").strip()
+        if not project_id or not name:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content="project_id and name are required.",
+            )
+        try:
+            categories = _project_store().delete_category(project_id, name)
+        except KeyError:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content=f"Project not found: {project_id}",
+            )
+        return ToolResult(
+            tool_name=self.spec.name,
+            success=True,
+            content=(
+                f"Deleted category '{name}'. "
+                f"Remaining: {', '.join(categories) or '(none)'}"
+            ),
+            metadata={"project_id": project_id, "categories": categories},
         )

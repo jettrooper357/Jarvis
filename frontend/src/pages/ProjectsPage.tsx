@@ -1,4 +1,13 @@
-import { useEffect, useMemo, useState } from 'react';
+import {
+  type MouseEvent as ReactMouseEvent,
+  createContext,
+  useContext,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { useNavigate } from 'react-router';
 import {
   Activity,
@@ -22,12 +31,28 @@ import {
   Plus,
   Search,
   Sparkles,
+  Tag,
   Target,
   Trash2,
   Zap,
 } from 'lucide-react';
-import { createProject } from '../lib/projects-api';
-import type { Project } from '../lib/projects-api';
+import {
+  createProject,
+  createTask,
+  deleteProject,
+  getDashboard,
+  getProjectBundle,
+  updateProject,
+  updateTask,
+} from '../lib/projects-api';
+import type {
+  Milestone as ApiMilestone,
+  Project,
+  ProjectDashboard,
+  ProjectStatus,
+  Task,
+  TaskStatus,
+} from '../lib/projects-api';
 import { PROJECT_STATUSES } from '../components/Project/projectUtils';
 import { fetchManagedAgents, type ManagedAgent } from '../lib/api';
 
@@ -50,6 +75,8 @@ type GanttItem = {
   parentId?: string;
   blocker?: boolean;
   milestone?: number;
+  // Optional grouping label for tasks/subtasks. null/undefined = uncategorized.
+  category?: string;
 };
 
 const weeks = [
@@ -66,252 +93,190 @@ const weeks = [
   'Jun 23',
 ];
 
-const initialGanttItems: GanttItem[] = [
-  {
-    id: 'signal84',
-    projectId: 'signal84',
-    name: 'Signal84 Core',
-    agent: 'Atlas',
-    status: 'In Progress',
-    progress: 72,
-    start: 0,
-    end: 6.2,
-    accent: 'cyan',
-    level: 0,
-    type: 'project',
-    milestone: 8.1,
-  },
-  {
-    id: 'requirements',
-    projectId: 'signal84',
-    name: 'Requirements & Design',
-    agent: 'Atlas',
-    status: 'Done',
-    progress: 100,
-    start: 0,
-    end: 2.5,
-    accent: 'green',
-    level: 1,
-    type: 'task',
-    parentId: 'signal84',
-  },
-  {
-    id: 'core-engine',
-    projectId: 'signal84',
-    name: 'Core Engine Development',
-    agent: 'Aether',
-    status: 'In Progress',
-    progress: 70,
-    start: 1.4,
-    end: 5.4,
-    accent: 'cyan',
-    level: 1,
-    type: 'task',
-    parentId: 'signal84',
-    milestone: 7.6,
-  },
-  {
-    id: 'engine-parser',
-    projectId: 'signal84',
-    name: 'Event Parser Module',
-    agent: 'Aether',
-    status: 'Done',
-    progress: 100,
-    start: 1.5,
-    end: 3.0,
-    accent: 'green',
-    level: 2,
-    type: 'task',
-    parentId: 'core-engine',
-  },
-  {
-    id: 'engine-api',
-    projectId: 'signal84',
-    name: 'API Orchestration Layer',
-    agent: 'Aether',
-    status: 'In Progress',
-    progress: 54,
-    start: 3.0,
-    end: 5.5,
-    accent: 'cyan',
-    level: 2,
-    type: 'task',
-    parentId: 'core-engine',
-  },
-  {
-    id: 'integration',
-    projectId: 'signal84',
-    name: 'Integration & Testing',
-    agent: 'Orion',
-    status: 'In Progress',
-    progress: 45,
-    start: 3.2,
-    end: 7.1,
-    accent: 'cyan',
-    level: 1,
-    type: 'task',
-    parentId: 'signal84',
-    blocker: true,
-    milestone: 8.8,
-  },
-  {
-    id: 'integration-harness',
-    projectId: 'signal84',
-    name: 'Integration Harness',
-    agent: 'Orion',
-    status: 'In Progress',
-    progress: 38,
-    start: 3.6,
-    end: 6.1,
-    accent: 'cyan',
-    level: 2,
-    type: 'task',
-    parentId: 'integration',
-  },
-  {
-    id: 'rate-limit-tests',
-    projectId: 'signal84',
-    name: 'Rate-limit Test Scenarios',
-    agent: 'Orion',
-    status: 'Blocked',
-    progress: 20,
-    start: 5.8,
-    end: 7.2,
-    accent: 'red',
-    level: 2,
-    type: 'task',
-    parentId: 'integration',
-    blocker: true,
-  },
-  {
-    id: 'launch',
-    projectId: 'signal84',
-    name: 'Launch',
-    agent: 'Nova',
-    status: 'Pending',
-    progress: 0,
-    start: 8.2,
-    end: 10.2,
-    accent: 'purple',
-    level: 1,
-    type: 'task',
-    parentId: 'signal84',
-  },
-  {
-    id: 'esp',
-    projectId: 'esp',
-    name: 'ESP Web Modernization',
-    agent: 'Icarus',
-    status: 'In Progress',
-    progress: 58,
-    start: 0.1,
-    end: 5.7,
-    accent: 'cyan',
-    level: 0,
-    type: 'project',
-    milestone: 6.7,
-  },
-  {
-    id: 'invoice',
-    projectId: 'invoice',
-    name: 'Invoice Service',
-    agent: 'Nyx',
-    status: 'At Risk',
-    progress: 35,
-    start: 0.9,
-    end: 5.3,
-    accent: 'amber',
-    level: 0,
-    type: 'project',
-    blocker: true,
-  },
-  {
-    id: 'mapping',
-    projectId: 'invoice',
-    name: 'Data Mapping',
-    agent: 'Nyx',
-    status: 'At Risk',
-    progress: 42,
-    start: 1.1,
-    end: 3.8,
-    accent: 'amber',
-    level: 1,
-    type: 'task',
-    parentId: 'invoice',
-  },
-  {
-    id: 'stored-proc',
-    projectId: 'invoice',
-    name: 'Stored Procedure Refactor',
-    agent: 'Icarus',
-    status: 'Pending',
-    progress: 15,
-    start: 5.1,
-    end: 8.4,
-    accent: 'amber',
-    level: 1,
-    type: 'task',
-    parentId: 'invoice',
-    milestone: 9.1,
-  },
-  {
-    id: 'commcore',
-    projectId: 'commcore',
-    name: 'CommCore Migration',
-    agent: 'Orion',
-    status: 'Blocked',
-    progress: 20,
-    start: 1.0,
-    end: 4.9,
-    accent: 'red',
-    level: 0,
-    type: 'project',
-    blocker: true,
-    milestone: 9.2,
-  },
-  {
-    id: 'api-review',
-    projectId: 'commcore',
-    name: 'API Contract Review',
-    agent: 'Atlas',
-    status: 'Blocked',
-    progress: 25,
-    start: 5.1,
-    end: 7.7,
-    accent: 'red',
-    level: 1,
-    type: 'task',
-    parentId: 'commcore',
-  },
-  {
-    id: 'jarvisux',
-    projectId: 'jarvisux',
-    name: 'Jarvis UX',
-    agent: 'Nova',
-    status: 'In Progress',
-    progress: 82,
-    start: 0.4,
-    end: 10.0,
-    accent: 'green',
-    level: 0,
-    type: 'project',
-    milestone: 10.6,
-  },
-  {
-    id: 'regression',
-    projectId: 'jarvisux',
-    name: 'Regression Testing',
-    agent: 'Orion',
-    status: 'In Progress',
-    progress: 64,
-    start: 6.1,
-    end: 9.0,
-    accent: 'cyan',
-    level: 1,
-    type: 'task',
-    parentId: 'jarvisux',
-  },
+// --- Live data layer: SQLite ProjectStore (via REST) → Gantt model ------
+//
+// The Projects Command Center reads the same store as Mission Control and
+// the agent tools, so the three never disagree. The Gantt's time axis is
+// derived from the real task/project dates instead of a fixed window.
+
+type Axis = {
+  labels: string[];
+  // Denominator for bar math; kept at 11 to preserve the original scale.
+  denom: number;
+  pos: (iso?: string | null, fallback?: number) => number;
+  todayPos: number;
+};
+
+const _AXIS_MONTHS = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
 ];
+const _DAY = 86_400_000;
+const _clamp = (n: number, lo: number, hi: number) =>
+  Math.max(lo, Math.min(hi, n));
+const _fmtAxis = (t: number) => {
+  const d = new Date(t);
+  return `${_AXIS_MONTHS[d.getMonth()]} ${d.getDate()}`;
+};
+
+function buildAxis(times: number[]): Axis {
+  const valid = times.filter((t) => Number.isFinite(t));
+  let min = valid.length ? Math.min(...valid) : Date.now() - 7 * _DAY;
+  let max = valid.length ? Math.max(...valid) : Date.now() + 63 * _DAY;
+  if (!(max > min)) {
+    min = Date.now() - 7 * _DAY;
+    max = Date.now() + 63 * _DAY;
+  }
+  const pad = (max - min) * 0.04 || _DAY;
+  min -= pad;
+  max += pad;
+  const span = max - min;
+  const labels = Array.from({ length: 11 }, (_, i) =>
+    _fmtAxis(min + span * (i / 10)),
+  );
+  const pos = (iso?: string | null, fallback = 0) => {
+    if (!iso) return fallback;
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return fallback;
+    return _clamp(((t - min) / span) * 10, 0, 10);
+  };
+  return { labels, denom: 11, pos, todayPos: pos(new Date().toISOString(), 4) };
+}
+
+const DEFAULT_AXIS: Axis = {
+  labels: weeks,
+  denom: 11,
+  pos: (_iso, fallback = 0) => fallback,
+  todayPos: 4.15,
+};
+const AxisContext = createContext<Axis>(DEFAULT_AXIS);
+const useAxis = () => useContext(AxisContext);
+
+const PROJECT_STATUS_MAP: Record<ProjectStatus, Status> = {
+  Planning: 'Pending',
+  Active: 'In Progress',
+  'At Risk': 'At Risk',
+  Delayed: 'Blocked',
+  Complete: 'Done',
+};
+const TASK_STATUS_MAP: Record<TaskStatus, Status> = {
+  Backlog: 'Pending',
+  Ready: 'Pending',
+  'In Progress': 'In Progress',
+  Blocked: 'Blocked',
+  Review: 'At Risk',
+  Done: 'Done',
+  Cancelled: 'Done',
+};
+const STATUS_ACCENT: Record<Status, Accent> = {
+  'In Progress': 'cyan',
+  Done: 'green',
+  'At Risk': 'amber',
+  Blocked: 'red',
+  Pending: 'purple',
+};
+const STATUS_TO_TASK: Record<Status, TaskStatus> = {
+  'In Progress': 'In Progress',
+  Done: 'Done',
+  Blocked: 'Blocked',
+  'At Risk': 'Review',
+  Pending: 'Backlog',
+};
+const STATUS_TO_PROJECT: Record<Status, ProjectStatus> = {
+  'In Progress': 'Active',
+  Done: 'Complete',
+  'At Risk': 'At Risk',
+  Blocked: 'Delayed',
+  Pending: 'Planning',
+};
+
+function buildGanttData(
+  projects: Project[],
+  tasksByProject: Record<string, Task[]>,
+): {
+  items: GanttItem[];
+  milestonesByProject: Record<string, Milestone[]>;
+  axis: Axis;
+} {
+  const times: number[] = [];
+  const pushTime = (iso?: string | null) => {
+    if (iso) {
+      const t = Date.parse(iso);
+      if (Number.isFinite(t)) times.push(t);
+    }
+  };
+  for (const p of projects) {
+    pushTime(p.start_date);
+    pushTime(p.target_date);
+    for (const t of tasksByProject[p.id] ?? []) {
+      pushTime(t.start_date);
+      pushTime(t.due_date);
+    }
+  }
+  const axis = buildAxis(times);
+  const items: GanttItem[] = [];
+  const milestonesByProject: Record<string, Milestone[]> = {};
+  for (const p of projects) {
+    const pStatus = PROJECT_STATUS_MAP[p.status] ?? 'Pending';
+    const pStart = axis.pos(p.start_date, 0);
+    const pEnd = Math.max(pStart + 0.5, axis.pos(p.target_date, 10));
+    items.push({
+      id: p.id,
+      projectId: p.id,
+      name: p.name,
+      agent: p.owner || 'Unassigned',
+      status: pStatus,
+      progress: p.progress ?? 0,
+      start: pStart,
+      end: pEnd,
+      accent: STATUS_ACCENT[pStatus],
+      level: 0,
+      type: 'project',
+    });
+    const tasks = tasksByProject[p.id] ?? [];
+    const byId = new Map(tasks.map((t) => [t.id, t]));
+    const depthCache = new Map<string, number>();
+    const depth = (t: Task): number => {
+      if (!t.parent_task_id) return 1;
+      const cached = depthCache.get(t.id);
+      if (cached) return cached;
+      const parent = byId.get(t.parent_task_id);
+      const d = parent ? depth(parent) + 1 : 1;
+      depthCache.set(t.id, d);
+      return d;
+    };
+    for (const t of tasks) {
+      const tStatus = TASK_STATUS_MAP[t.status] ?? 'Pending';
+      const start = axis.pos(t.start_date, pStart);
+      const end = Math.max(start + 0.4, axis.pos(t.due_date, pEnd));
+      items.push({
+        id: t.id,
+        projectId: p.id,
+        name: t.title,
+        agent: t.assigned_to || t.owner || 'Unassigned',
+        status: tStatus,
+        progress: t.percent_complete ?? 0,
+        start,
+        end,
+        accent: STATUS_ACCENT[tStatus],
+        level: depth(t),
+        type: 'task',
+        parentId: t.parent_task_id || p.id,
+        blocker: t.status === 'Blocked',
+        category: (t.category || '').trim() || undefined,
+      });
+    }
+    milestonesByProject[p.id] = (p.milestones ?? []).map(
+      (m: ApiMilestone, i: number) => ({
+        id: m.id || `ms-${p.id}-${i}`,
+        name: m.name || 'Milestone',
+        date: m.date || 'TBD',
+        done: Boolean(m.done),
+      }),
+    );
+  }
+  return { items, milestonesByProject, axis };
+}
 
 const accentMap: Record<Accent, { text: string; bg: string; glow: string }> = {
   cyan: {
@@ -346,6 +311,11 @@ const panelStyle = {
     'linear-gradient(180deg, rgba(13,22,34,.86), rgba(5,10,18,.9))',
   border: '1px solid rgba(55, 211, 255, .16)',
   boxShadow: '0 18px 40px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,255,255,.04)',
+};
+
+const inputBox = {
+  background: 'rgba(0,0,0,.34)',
+  border: '1px solid rgba(74,210,255,.18)',
 };
 
 function StatusBadge({ status }: { status: Status }) {
@@ -428,9 +398,10 @@ function ProjectKpiCard({
 }
 
 function TaskBar({ item }: { item: GanttItem }) {
+  const axis = useAxis();
   const colors = accentMap[item.accent];
-  const left = (item.start / 11) * 100;
-  const width = Math.max(4, ((item.end - item.start) / 11) * 100);
+  const left = (item.start / axis.denom) * 100;
+  const width = Math.max(4, ((item.end - item.start) / axis.denom) * 100);
   return (
     <>
       <button
@@ -460,7 +431,7 @@ function TaskBar({ item }: { item: GanttItem }) {
           className="absolute top-[9px] h-4 w-4 rotate-45 transition hover:scale-110"
           title={`${item.name} milestone`}
           style={{
-            left: `${(item.milestone / 11) * 100}%`,
+            left: `${(item.milestone / axis.denom) * 100}%`,
             background: colors.text,
             boxShadow: `0 0 18px ${colors.glow}`,
           }}
@@ -473,11 +444,13 @@ function TaskBar({ item }: { item: GanttItem }) {
 function EditItemModal({
   item,
   agents,
+  categories,
   onSave,
   onClose,
 }: {
   item: GanttItem;
   agents: ManagedAgent[];
+  categories: string[];
   onSave: (item: GanttItem) => void;
   onClose: () => void;
 }) {
@@ -592,6 +565,20 @@ function EditItemModal({
               ))}
             </select>
           </label>
+          {item.type === 'task' && (
+            <label className="md:col-span-2">
+              <span className="mb-1 block text-xs text-slate-500">
+                Category
+              </span>
+              <CategorySelect
+                value={draft.category ?? ''}
+                categories={categories}
+                onChange={(next) =>
+                  set('category', next ? next : undefined)
+                }
+              />
+            </label>
+          )}
           <label>
             <span className="mb-1 block text-xs text-slate-500">
               Progress
@@ -692,6 +679,7 @@ function GanttRow({
   hasChildren,
   expanded,
   onToggle,
+  onContextMenu,
 }: {
   item: GanttItem;
   selected: boolean;
@@ -700,6 +688,7 @@ function GanttRow({
   hasChildren: boolean;
   expanded: boolean;
   onToggle: (id: string) => void;
+  onContextMenu: (event: ReactMouseEvent, item: GanttItem) => void;
 }) {
   const isProject = item.type === 'project';
   return (
@@ -713,6 +702,12 @@ function GanttRow({
       }}
       onClick={() => onSelect(item)}
       onDoubleClick={() => onEdit(item)}
+      onContextMenu={(event) => onContextMenu(event, item)}
+      draggable={!isProject}
+      onDragStart={(event) => {
+        event.dataTransfer.setData('text/plain', item.id);
+        event.dataTransfer.effectAllowed = 'move';
+      }}
     >
       <div
         className="flex min-w-0 items-center gap-2 px-3 text-xs"
@@ -743,6 +738,14 @@ function GanttRow({
         >
           {item.name}
         </span>
+        {item.category && (
+          <span
+            className="shrink-0 rounded px-1.5 py-0.5 text-[10px]"
+            style={{ background: 'rgba(74,210,255,.12)', color: '#9edff5' }}
+          >
+            {item.category}
+          </span>
+        )}
         {item.blocker && <AlertTriangle size={12} className="text-red-400" />}
         <Info size={11} style={{ color: 'rgba(148, 220, 255, .55)' }} />
       </div>
@@ -769,6 +772,214 @@ function GanttRow({
   );
 }
 
+// Inline editor for renaming a category. Self-contained state so it always
+// starts from the current name; the doneRef guard stops Enter/Escape from
+// double-firing with the blur handler.
+function CategoryNameEditor({
+  initial,
+  onCommit,
+  onCancel,
+}: {
+  initial: string;
+  onCommit: (next: string) => void;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState(initial);
+  const doneRef = useRef(false);
+  const finish = (commit: boolean) => {
+    if (doneRef.current) return;
+    doneRef.current = true;
+    if (commit) onCommit(value);
+    else onCancel();
+  };
+  return (
+    <input
+      autoFocus
+      value={value}
+      onClick={(event) => event.stopPropagation()}
+      onChange={(event) => setValue(event.target.value)}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          finish(true);
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          finish(false);
+        }
+      }}
+      onBlur={() => finish(true)}
+      placeholder="Category name"
+      className="rounded px-1.5 py-0.5 text-[11px] uppercase tracking-[0.12em] text-slate-100"
+      style={inputBox}
+    />
+  );
+}
+
+// Slim collapsible group header that clusters a project's tasks by category.
+function CategoryRow({
+  label,
+  editInitial,
+  count,
+  open,
+  editing,
+  onToggle,
+  onContextMenu,
+  onRename,
+  onCancelRename,
+  onDropItem,
+}: {
+  label: string;
+  editInitial: string;
+  count: number;
+  open: boolean;
+  editing: boolean;
+  onToggle: () => void;
+  onContextMenu: (event: ReactMouseEvent) => void;
+  onRename: (next: string) => void;
+  onCancelRename: () => void;
+  onDropItem: (itemId: string) => void;
+}) {
+  const [over, setOver] = useState(false);
+  return (
+    <div
+      className="flex min-w-[920px] items-center gap-2 border-t px-3 py-1.5 text-[11px] transition"
+      style={{
+        paddingLeft: 28,
+        borderColor: 'rgba(74, 210, 255, .09)',
+        background: over ? 'rgba(36,217,255,.22)' : 'rgba(28,210,255,.06)',
+        boxShadow: over ? 'inset 0 0 0 1px rgba(36,217,255,.6)' : undefined,
+        color: '#9edff5',
+        cursor: editing ? 'default' : 'pointer',
+      }}
+      onClick={editing ? undefined : onToggle}
+      onContextMenu={onContextMenu}
+      onDragOver={(event) => {
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'move';
+        if (!over) setOver(true);
+      }}
+      onDragLeave={() => setOver(false)}
+      onDrop={(event) => {
+        event.preventDefault();
+        setOver(false);
+        const itemId = event.dataTransfer.getData('text/plain');
+        if (itemId) onDropItem(itemId);
+      }}
+    >
+      {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+      <Tag size={12} />
+      {editing ? (
+        <CategoryNameEditor
+          initial={editInitial}
+          onCommit={onRename}
+          onCancel={onCancelRename}
+        />
+      ) : (
+        <>
+          <span className="font-semibold uppercase tracking-[0.12em]">
+            {label}
+          </span>
+          <span className="text-slate-500">({count})</span>
+        </>
+      )}
+    </div>
+  );
+}
+
+type GanttMenuTarget =
+  | { kind: 'item'; item: GanttItem }
+  | { kind: 'category'; project: GanttItem; category: string; label: string };
+type GanttMenuState = { x: number; y: number; target: GanttMenuTarget };
+
+type GanttDisplayRow =
+  | { kind: 'item'; item: GanttItem }
+  | {
+      kind: 'category';
+      id: string;
+      project: GanttItem;
+      category: string;
+      label: string;
+      count: number;
+    };
+
+function GanttContextMenu({
+  state,
+  onClose,
+  onAction,
+}: {
+  state: GanttMenuState;
+  onClose: () => void;
+  onAction: (action: string) => void;
+}) {
+  const { target } = state;
+  const actions: { key: string; label: string; danger?: boolean }[] =
+    target.kind === 'category'
+      ? [
+          { key: 'rename-cat', label: 'Edit name' },
+          { key: 'add-task-cat', label: `Add Task in “${target.label}”` },
+        ]
+      : target.item.type === 'project'
+        ? [
+            { key: 'add-task', label: 'Add Task' },
+            { key: 'add-category', label: 'Add Category' },
+            { key: 'add-milestone', label: 'Add Milestone' },
+            { key: 'edit', label: 'Edit…' },
+            { key: 'delete-project', label: 'Delete Project…', danger: true },
+          ]
+        : [
+            { key: 'add-subtask', label: 'Add Subtask' },
+            { key: 'add-milestone', label: 'Add Milestone' },
+            { key: 'edit', label: 'Edit…' },
+          ];
+  return (
+    <div
+      className="fixed inset-0 z-50"
+      onClick={onClose}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+    >
+      <div
+        className="absolute min-w-[180px] rounded-lg p-1 text-xs"
+        style={{
+          left: Math.min(state.x, window.innerWidth - 210),
+          top: Math.min(state.y, window.innerHeight - 170),
+          ...panelStyle,
+          border: '1px solid rgba(74,210,255,.32)',
+          boxShadow:
+            '0 18px 50px rgba(0,0,0,.55), 0 0 28px rgba(36,217,255,.14)',
+        }}
+        onClick={(event) => event.stopPropagation()}
+      >
+        {actions.map((action) => (
+          <button
+            key={action.key}
+            className={
+              action.danger
+                ? 'flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-red-300 hover:bg-red-500/10'
+                : 'flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-slate-200 hover:bg-cyan-400/10'
+            }
+            onClick={() => onAction(action.key)}
+          >
+            {action.key === 'delete-project' ? (
+              <Trash2 size={12} className="text-red-300" />
+            ) : action.key === 'edit' || action.key === 'rename-cat' ? (
+              <Info size={12} className="text-cyan-300" />
+            ) : action.key === 'add-category' ? (
+              <Tag size={12} className="text-cyan-300" />
+            ) : (
+              <Plus size={12} className="text-cyan-300" />
+            )}
+            {action.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function GanttChart({
   items,
   selectedId,
@@ -776,6 +987,13 @@ function GanttChart({
   onEdit,
   view,
   onViewChange,
+  onRequestAdd,
+  onRequestAddMilestone,
+  onRequestAddCategory,
+  onRenameCategory,
+  onAssignCategory,
+  onDeleteProject,
+  extraCategoriesByProject,
 }: {
   items: GanttItem[];
   selectedId: string;
@@ -783,7 +1001,27 @@ function GanttChart({
   onEdit: (item: GanttItem) => void;
   view: string;
   onViewChange: (value: string) => void;
+  onRequestAdd: (
+    parent: GanttItem,
+    kind: 'task' | 'subtask',
+    presetCategory?: string,
+  ) => void;
+  onRequestAddMilestone: (projectId: string) => void;
+  onRequestAddCategory: (projectId: string) => void;
+  onRenameCategory: (
+    project: GanttItem,
+    oldName: string,
+    newName: string,
+  ) => void;
+  onAssignCategory: (
+    itemId: string,
+    project: GanttItem,
+    category: string,
+  ) => void;
+  onDeleteProject: (project: GanttItem) => void;
+  extraCategoriesByProject: Record<string, string[]>;
 }) {
+  const axis = useAxis();
   // Projects collapsed by default — only top-level project rows show on
   // load; expanding a project reveals its tasks.
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
@@ -803,33 +1041,124 @@ function GanttChart({
     }
     return counts;
   }, [items]);
-  const visibleItems = useMemo(() => {
+  // Build the rendered row list: project → category headers → tasks/subtasks.
+  // Tasks/subtasks keep their parent→child nesting; top-level tasks of a
+  // project are clustered under collapsible category headers.
+  const rows = useMemo<GanttDisplayRow[]>(() => {
     if (viewFilter === 'blocked') {
-      // Show every blocked row regardless of collapse state — the point
-      // of this view is to surface blockers directly.
-      return items.filter((item) => item.status === 'Blocked');
+      // Blocked view stays a flat surfacing of every blocker.
+      return items
+        .filter((item) => item.status === 'Blocked')
+        .map((item) => ({ kind: 'item' as const, item }));
     }
     const scoped =
       viewFilter === 'all'
         ? items
         : items.filter((item) => item.projectId === viewFilter);
-    const visible: GanttItem[] = [];
-    const isVisible = (item: GanttItem) => {
-      let parentId = item.parentId;
-      while (parentId) {
-        if (!expanded[parentId]) return false;
-        parentId = scoped.find((candidate) => candidate.id === parentId)
-          ?.parentId;
+    const childrenOf = (id: string) =>
+      scoped.filter((candidate) => candidate.parentId === id);
+    const out: GanttDisplayRow[] = [];
+    const pushSubtree = (task: GanttItem) => {
+      out.push({ kind: 'item', item: task });
+      if (expanded[task.id] ?? false) {
+        for (const child of childrenOf(task.id)) pushSubtree(child);
       }
-      return true;
     };
-    for (const item of scoped) {
-      if (isVisible(item)) visible.push(item);
+    for (const project of scoped.filter((i) => i.type === 'project')) {
+      out.push({ kind: 'item', item: project });
+      if (!(expanded[project.id] ?? false)) continue;
+      const topTasks = scoped.filter(
+        (i) => i.parentId === project.id && i.type === 'task',
+      );
+      const order: string[] = [];
+      const groups = new Map<string, GanttItem[]>();
+      for (const task of topTasks) {
+        const key = (task.category && task.category.trim()) || '';
+        if (!groups.has(key)) {
+          groups.set(key, []);
+          order.push(key);
+        }
+        groups.get(key)!.push(task);
+      }
+      // Explicitly-created categories show as empty headers until tasks
+      // are added or dragged into them.
+      for (const name of extraCategoriesByProject[project.projectId] ?? []) {
+        const key = name.trim();
+        if (key && !groups.has(key)) {
+          groups.set(key, []);
+          order.push(key);
+        }
+      }
+      const named = order.filter((key) => key !== '');
+      const finalOrder = groups.has('') ? [...named, ''] : named;
+      for (const key of finalOrder) {
+        const group = groups.get(key)!;
+        const catId = `cat:${project.id}:${key || '__uncat__'}`;
+        out.push({
+          kind: 'category',
+          id: catId,
+          project,
+          category: key,
+          label: key || 'Uncategorized',
+          count: group.length,
+        });
+        // Categories default to open so tasks are visible once a project
+        // is expanded.
+        if (!(expanded[catId] ?? true)) continue;
+        for (const task of group) pushSubtree(task);
+      }
     }
-    return visible;
-  }, [expanded, items, viewFilter]);
+    return out;
+  }, [expanded, items, viewFilter, extraCategoriesByProject]);
   const toggleExpanded = (id: string) =>
     setExpanded((current) => ({ ...current, [id]: !current[id] }));
+  const toggleCategory = (id: string) =>
+    setExpanded((current) => ({ ...current, [id]: !(current[id] ?? true) }));
+  const openRow = (id: string) =>
+    setExpanded((current) => ({ ...current, [id]: true }));
+
+  const [menu, setMenu] = useState<GanttMenuState | null>(null);
+  const [editingCatId, setEditingCatId] = useState<string | null>(null);
+  const closeMenu = () => setMenu(null);
+  const handleRowContextMenu = (event: ReactMouseEvent, item: GanttItem) => {
+    event.preventDefault();
+    setMenu({
+      x: event.clientX,
+      y: event.clientY,
+      target: { kind: 'item', item },
+    });
+  };
+  const handleMenuAction = (action: string) => {
+    if (!menu) return;
+    const { target } = menu;
+    if (target.kind === 'category') {
+      if (action === 'rename-cat') {
+        openRow(target.project.id);
+        setEditingCatId(
+          `cat:${target.project.id}:${target.category || '__uncat__'}`,
+        );
+      } else {
+        openRow(target.project.id);
+        onRequestAdd(target.project, 'task', target.category || undefined);
+      }
+    } else if (action === 'edit') {
+      onEdit(target.item);
+    } else if (action === 'add-milestone') {
+      onRequestAddMilestone(target.item.projectId);
+    } else if (action === 'add-category') {
+      openRow(target.item.id);
+      onRequestAddCategory(target.item.projectId);
+    } else if (action === 'add-task') {
+      openRow(target.item.id);
+      onRequestAdd(target.item, 'task');
+    } else if (action === 'add-subtask') {
+      openRow(target.item.id);
+      onRequestAdd(target.item, 'subtask');
+    } else if (action === 'delete-project') {
+      onDeleteProject(target.item);
+    }
+    closeMenu();
+  };
 
   return (
     <section className="rounded-lg" style={panelStyle}>
@@ -868,14 +1197,15 @@ function GanttChart({
           </button>
         </div>
       </div>
-      <div className="overflow-x-auto">
+      <div className="max-h-[56vh] overflow-auto">
         <div className="min-w-[920px]">
           <div
-            className="grid border-b text-[11px]"
+            className="sticky top-0 z-10 grid border-b text-[11px]"
             style={{
               gridTemplateColumns: '250px 92px 108px 54px minmax(430px,1fr)',
               borderColor: 'rgba(74, 210, 255, .12)',
               color: '#9eb0bf',
+              background: 'rgba(9,15,25,.98)',
             }}
           >
             <div className="px-3 py-2">Project / Task</div>
@@ -883,13 +1213,14 @@ function GanttChart({
             <div className="py-2">Status</div>
             <div className="py-2">%</div>
             <div className="relative grid grid-cols-11 border-l" style={{ borderColor: 'rgba(74, 210, 255, .12)' }}>
-              {weeks.map((week, idx) => (
+              {axis.labels.map((week, idx) => (
                 <div
-                  key={week}
+                  key={`${week}-${idx}`}
                   className="border-r px-1 py-2 text-center"
                   style={{
                     borderColor: 'rgba(74, 210, 255, .08)',
-                    color: idx === 4 ? '#27d9ff' : '#9eb0bf',
+                    color:
+                      Math.round(axis.todayPos) === idx ? '#27d9ff' : '#9eb0bf',
                   }}
                 >
                   {week}
@@ -898,25 +1229,62 @@ function GanttChart({
               <div
                 className="absolute bottom-0 top-0 w-px"
                 style={{
-                  left: `${(4.15 / 11) * 100}%`,
+                  left: `${(axis.todayPos / axis.denom) * 100}%`,
                   background: '#1bcfff',
                   boxShadow: '0 0 14px rgba(27,207,255,.7)',
                 }}
               />
             </div>
           </div>
-          {visibleItems.map((item) => (
-            <GanttRow
-              key={item.id}
-              item={item}
-              selected={selectedId === item.id}
-              onSelect={onSelect}
-              onEdit={onEdit}
-              hasChildren={Boolean(childCountByParent[item.id])}
-              expanded={expanded[item.id] ?? false}
-              onToggle={toggleExpanded}
-            />
-          ))}
+          {rows.map((row) =>
+            row.kind === 'category' ? (
+              <CategoryRow
+                key={row.id}
+                label={row.label}
+                editInitial={row.category}
+                count={row.count}
+                open={expanded[row.id] ?? true}
+                editing={editingCatId === row.id}
+                onRename={(next) => {
+                  setEditingCatId(null);
+                  const trimmed = next.trim();
+                  if (trimmed && trimmed !== row.category) {
+                    onRenameCategory(row.project, row.category, trimmed);
+                  }
+                }}
+                onCancelRename={() => setEditingCatId(null)}
+                onDropItem={(itemId) =>
+                  onAssignCategory(itemId, row.project, row.category)
+                }
+                onToggle={() => toggleCategory(row.id)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  setMenu({
+                    x: event.clientX,
+                    y: event.clientY,
+                    target: {
+                      kind: 'category',
+                      project: row.project,
+                      category: row.category,
+                      label: row.label,
+                    },
+                  });
+                }}
+              />
+            ) : (
+              <GanttRow
+                key={row.item.id}
+                item={row.item}
+                selected={selectedId === row.item.id}
+                onSelect={onSelect}
+                onEdit={onEdit}
+                hasChildren={Boolean(childCountByParent[row.item.id])}
+                expanded={expanded[row.item.id] ?? false}
+                onToggle={toggleExpanded}
+                onContextMenu={handleRowContextMenu}
+              />
+            ),
+          )}
         </div>
       </div>
       <div className="flex flex-wrap gap-4 border-t px-4 py-3 text-[11px]" style={{ borderColor: 'rgba(74, 210, 255, .12)', color: '#b8c7d5' }}>
@@ -937,6 +1305,13 @@ function GanttChart({
           </span>
         ))}
       </div>
+      {menu && (
+        <GanttContextMenu
+          state={menu}
+          onClose={closeMenu}
+          onAction={handleMenuAction}
+        />
+      )}
     </section>
   );
 }
@@ -979,6 +1354,7 @@ function ProjectDetailsPanel({
   onAddMilestone,
   onToggleMilestone,
   onDeleteMilestone,
+  onDeleteProject,
 }: {
   project: GanttItem | undefined;
   agents: ManagedAgent[];
@@ -986,12 +1362,16 @@ function ProjectDetailsPanel({
   onAddMilestone: (name: string, date: string) => void;
   onToggleMilestone: (id: string) => void;
   onDeleteMilestone: (id: string) => void;
+  onDeleteProject: (project: GanttItem) => void;
 }) {
+  const axis = useAxis();
   const visibleAgents = agents.slice(0, 3);
   const [newName, setNewName] = useState('');
   const [newDate, setNewDate] = useState('');
   const dueDate = project
-    ? `${weeks[Math.min(Math.round(project.end), weeks.length - 1)]}, 2025`
+    ? axis.labels[
+        _clamp(Math.round(project.end), 0, axis.labels.length - 1)
+      ] || '—'
     : '—';
   const submitMilestone = () => {
     const name = newName.trim();
@@ -1024,7 +1404,19 @@ function ProjectDetailsPanel({
             </div>
           </div>
         </div>
-        <ProgressRing value={project?.progress ?? 0} />
+        <div className="flex items-center gap-2">
+          {project && (
+            <button
+              type="button"
+              onClick={() => onDeleteProject(project)}
+              className="rounded-md p-2 text-slate-500 transition hover:bg-red-500/10 hover:text-red-300"
+              title="Delete project"
+            >
+              <Trash2 size={15} />
+            </button>
+          )}
+          <ProgressRing value={project?.progress ?? 0} />
+        </div>
       </div>
       <div className="space-y-4">
         <div>
@@ -1134,71 +1526,93 @@ function ProjectDetailsPanel({
 }
 
 function TaskInspectorPanel({ selected }: { selected: GanttItem }) {
+  const fieldStyle = {
+    background: 'rgba(0,0,0,.28)',
+    border: '1px solid rgba(74,210,255,.16)',
+  };
+  const accent = accentMap[selected.accent];
   return (
     <section className="rounded-lg p-4" style={panelStyle}>
-      <div className="mb-3 flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-white">Task Inspector</h3>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <h3 className="text-sm font-semibold text-white">Task Inspector</h3>
+          <span
+            className="truncate rounded-full px-2 py-0.5 text-[11px]"
+            style={{
+              color: accent.text,
+              background: accent.glow,
+              border: `1px solid ${accent.glow}`,
+            }}
+          >
+            {selected.name}
+          </span>
+          <span className="hidden text-[11px] text-slate-500 sm:inline">
+            selected from timeline
+          </span>
+        </div>
         <MoreVertical size={15} className="text-slate-500" />
       </div>
-      <div className="space-y-3 text-xs">
+      <div className="grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
         <label className="block">
           <span className="mb-1 block text-slate-500">Task</span>
-          <input value={selected.name} readOnly className="w-full rounded-md px-2 py-1.5 text-slate-100" style={{ background: 'rgba(0,0,0,.28)', border: '1px solid rgba(74,210,255,.16)' }} />
+          <input value={selected.name} readOnly className="w-full rounded-md px-2 py-1.5 text-slate-100" style={fieldStyle} />
         </label>
-        <div className="grid grid-cols-2 gap-2">
-          <label>
-            <span className="mb-1 block text-slate-500">Status</span>
-            <select value={selected.status} onChange={() => {}} className="w-full rounded-md px-2 py-1.5" style={{ background: 'rgba(0,0,0,.28)', border: '1px solid rgba(74,210,255,.16)', color: accentMap[selected.accent].text }}>
-              <option>{selected.status}</option>
-            </select>
-          </label>
-          <label>
-            <span className="mb-1 block text-slate-500">Priority</span>
-            <select value={selected.blocker ? 'High' : 'Medium'} onChange={() => {}} className="w-full rounded-md px-2 py-1.5 text-slate-100" style={{ background: 'rgba(0,0,0,.28)', border: '1px solid rgba(74,210,255,.16)' }}>
-              <option>{selected.blocker ? 'High' : 'Medium'}</option>
-            </select>
-          </label>
-          <label>
-            <span className="mb-1 block text-slate-500">Assignee</span>
-            <select value={selected.agent} onChange={() => {}} className="w-full rounded-md px-2 py-1.5 text-slate-100" style={{ background: 'rgba(0,0,0,.28)', border: '1px solid rgba(74,210,255,.16)' }}>
-              <option>{selected.agent}</option>
-            </select>
-          </label>
-          <label>
-            <span className="mb-1 block text-slate-500">Start</span>
-            <input value="Apr 22, 2025" readOnly className="w-full rounded-md px-2 py-1.5 text-slate-100" style={{ background: 'rgba(0,0,0,.28)', border: '1px solid rgba(74,210,255,.16)' }} />
-          </label>
-          <label>
-            <span className="mb-1 block text-slate-500">End</span>
-            <input value="May 23, 2025" readOnly className="w-full rounded-md px-2 py-1.5 text-slate-100" style={{ background: 'rgba(0,0,0,.28)', border: '1px solid rgba(74,210,255,.16)' }} />
-          </label>
-        </div>
-        <div>
-          <div className="mb-1 flex justify-between text-slate-500">
-            <span>Progress</span>
-            <span style={{ color: accentMap[selected.accent].text }}>{selected.progress}%</span>
-          </div>
-          <div className="h-2 rounded-full bg-slate-800">
-            <div className="h-full rounded-full" style={{ width: `${selected.progress}%`, background: accentMap[selected.accent].text }} />
-          </div>
-        </div>
         <label className="block">
+          <span className="mb-1 block text-slate-500">Status</span>
+          <select value={selected.status} onChange={() => {}} className="w-full rounded-md px-2 py-1.5" style={{ ...fieldStyle, color: accent.text }}>
+            <option>{selected.status}</option>
+          </select>
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-slate-500">Priority</span>
+          <select value={selected.blocker ? 'High' : 'Medium'} onChange={() => {}} className="w-full rounded-md px-2 py-1.5 text-slate-100" style={fieldStyle}>
+            <option>{selected.blocker ? 'High' : 'Medium'}</option>
+          </select>
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-slate-500">Assignee</span>
+          <select value={selected.agent} onChange={() => {}} className="w-full rounded-md px-2 py-1.5 text-slate-100" style={fieldStyle}>
+            <option>{selected.agent}</option>
+          </select>
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-slate-500">Start</span>
+          <input value="Apr 22, 2025" readOnly className="w-full rounded-md px-2 py-1.5 text-slate-100" style={fieldStyle} />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-slate-500">End</span>
+          <input value="May 23, 2025" readOnly className="w-full rounded-md px-2 py-1.5 text-slate-100" style={fieldStyle} />
+        </label>
+      </div>
+      <div className="mt-3 grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)]">
+        <div className="space-y-3 text-xs">
+          <div>
+            <div className="mb-1 flex justify-between text-slate-500">
+              <span>Progress</span>
+              <span style={{ color: accent.text }}>{selected.progress}%</span>
+            </div>
+            <div className="h-2 rounded-full bg-slate-800">
+              <div className="h-full rounded-full" style={{ width: `${selected.progress}%`, background: accent.text }} />
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button className="rounded px-2 py-1 text-[11px] text-slate-200" style={{ background: 'rgba(255,255,255,.06)' }}>
+              Requirements & Design x
+            </button>
+            <button className="flex items-center gap-1 rounded px-2 py-1 text-[11px] text-cyan-200" style={{ border: '1px solid rgba(74,210,255,.22)' }}>
+              <Plus size={12} /> Add dependency
+            </button>
+          </div>
+        </div>
+        <label className="block text-xs">
           <span className="mb-1 block text-slate-500">Notes</span>
           <textarea
             readOnly
             value="Develop core processing engine and API contracts. Confirm rate-limit mitigation before integration hardening."
-            className="h-16 w-full resize-none rounded-md px-2 py-1.5 text-slate-200"
-            style={{ background: 'rgba(0,0,0,.28)', border: '1px solid rgba(74,210,255,.16)' }}
+            className="h-[4.5rem] w-full resize-none rounded-md px-2 py-1.5 text-slate-200"
+            style={fieldStyle}
           />
         </label>
-        <div className="flex flex-wrap items-center gap-2">
-          <button className="rounded px-2 py-1 text-[11px] text-slate-200" style={{ background: 'rgba(255,255,255,.06)' }}>
-            Requirements & Design x
-          </button>
-          <button className="flex items-center gap-1 rounded px-2 py-1 text-[11px] text-cyan-200" style={{ border: '1px solid rgba(74,210,255,.22)' }}>
-            <Plus size={12} /> Add dependency
-          </button>
-        </div>
       </div>
     </section>
   );
@@ -1233,84 +1647,172 @@ function AgentActivityPanel({ agents }: { agents: ManagedAgent[] }) {
   );
 }
 
-function MilestoneTimeline() {
+function _relTime(epochSeconds: number): string {
+  const secs = Date.now() / 1000 - epochSeconds;
+  if (!Number.isFinite(secs) || secs < 0) return '';
+  if (secs < 60) return 'just now';
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
+  return `${Math.floor(secs / 86400)}d ago`;
+}
+
+function MilestoneTimeline({ milestones }: { milestones: Milestone[] }) {
+  const shown = milestones.slice(0, 6);
   return (
     <section className="rounded-lg p-4" style={panelStyle}>
       <div className="mb-4 flex justify-between">
         <h3 className="text-sm font-semibold text-white">Milestones</h3>
-        <button className="text-xs text-cyan-300">View all</button>
+        <span className="text-xs text-slate-500">{milestones.length} total</span>
       </div>
-      <div className="relative flex justify-between px-2 pt-5 text-center text-[11px] text-slate-400">
-        <div className="absolute left-8 right-8 top-7 h-px bg-slate-700" />
-        {[
-          ['Apr 21', 'Requirements Complete', true],
-          ['May 23', 'Core Engine MVP', true],
-          ['Jun 13', 'Integration Complete', false],
-          ['Jun 27', 'Production Launch', false],
-        ].map(([date, name, done]) => (
-          <button key={String(name)} className="relative max-w-[92px]">
-            <span className="mx-auto mb-3 block h-4 w-4 rotate-45" style={{ background: done ? '#28f0a0' : '#8793a1', boxShadow: done ? '0 0 16px rgba(40,240,160,.28)' : undefined }} />
-            <span className="block text-slate-300">{date}</span>
-            <span className="block">{name}</span>
-          </button>
-        ))}
-      </div>
+      {shown.length === 0 ? (
+        <div className="px-2 py-4 text-xs text-slate-500">
+          No milestones for this project yet.
+        </div>
+      ) : (
+        <div className="relative flex justify-between px-2 pt-5 text-center text-[11px] text-slate-400">
+          <div className="absolute left-8 right-8 top-7 h-px bg-slate-700" />
+          {shown.map((m) => (
+            <div key={m.id} className="relative max-w-[92px]">
+              <span
+                className="mx-auto mb-3 block h-4 w-4 rotate-45"
+                style={{
+                  background: m.done ? '#28f0a0' : '#8793a1',
+                  boxShadow: m.done ? '0 0 16px rgba(40,240,160,.28)' : undefined,
+                }}
+              />
+              <span className="block text-slate-300">{m.date || 'TBD'}</span>
+              <span className="block">{m.name}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </section>
   );
 }
 
-function RiskList() {
+function RiskList({
+  items,
+  atRiskProjects,
+}: {
+  items: GanttItem[];
+  atRiskProjects: { id: string; name: string; status: string }[];
+}) {
+  const blocked = items.filter(
+    (i) => i.type === 'task' && i.status === 'Blocked',
+  );
+  const atRiskTasks = items.filter(
+    (i) => i.type === 'task' && i.status === 'At Risk',
+  );
+  const empty =
+    blocked.length === 0 &&
+    atRiskTasks.length === 0 &&
+    atRiskProjects.length === 0;
   return (
     <section className="rounded-lg p-4" style={panelStyle}>
       <div className="mb-3 flex justify-between">
-        <h3 className="text-sm font-semibold text-white">Dependencies & Risks</h3>
-        <button className="text-xs text-cyan-300">View all</button>
+        <h3 className="text-sm font-semibold text-white">
+          Dependencies & Risks
+        </h3>
+        <span className="text-xs text-slate-500">
+          {blocked.length + atRiskTasks.length + atRiskProjects.length}
+        </span>
       </div>
-      <div className="mb-3 text-xs">
-        <div className="mb-1 text-slate-500">Critical Path</div>
-        {[
-          'Core Engine Development -> Integration & Testing',
-          'Invoice Service -> Shared Library',
-          'CommCore Migration -> Data Migration',
-        ].map((item) => (
-          <button key={item} className="mb-1 block w-full rounded px-2 py-1 text-left text-slate-300 hover:bg-cyan-400/10">
-            <GitBranch size={12} className="mr-1 inline text-cyan-300" />
-            {item}
-          </button>
-        ))}
-      </div>
-      {[
-        ['3rd-party API rate limits', 'High', 'red'],
-        ['Data migration complexity', 'Medium', 'amber'],
-      ].map(([risk, severity, accent]) => (
-        <button key={risk} className="mb-1 flex w-full items-center justify-between rounded px-2 py-1 text-xs hover:bg-cyan-400/10">
-          <span className="text-slate-300">{risk}</span>
-          <span style={{ color: accentMap[accent as Accent].text }}>{severity}</span>
-        </button>
-      ))}
+      {empty && (
+        <div className="px-2 py-3 text-xs text-slate-500">
+          No blocked or at-risk work. 🎉
+        </div>
+      )}
+      {blocked.length > 0 && (
+        <div className="mb-3 text-xs">
+          <div className="mb-1 text-slate-500">Blocked</div>
+          {blocked.slice(0, 5).map((t) => (
+            <div
+              key={t.id}
+              className="mb-1 flex w-full items-center justify-between rounded px-2 py-1 hover:bg-cyan-400/10"
+            >
+              <span className="flex min-w-0 items-center gap-1 text-slate-300">
+                <GitBranch
+                  size={12}
+                  className="shrink-0 text-cyan-300"
+                />
+                <span className="truncate">{t.name}</span>
+              </span>
+              <span style={{ color: accentMap.red.text }}>High</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {(atRiskTasks.length > 0 || atRiskProjects.length > 0) && (
+        <div className="text-xs">
+          <div className="mb-1 text-slate-500">At risk</div>
+          {atRiskProjects.map((p) => (
+            <div
+              key={`p-${p.id}`}
+              className="mb-1 flex w-full items-center justify-between rounded px-2 py-1 hover:bg-cyan-400/10"
+            >
+              <span className="truncate text-slate-300">
+                {p.name} (project)
+              </span>
+              <span style={{ color: accentMap.amber.text }}>{p.status}</span>
+            </div>
+          ))}
+          {atRiskTasks.slice(0, 5).map((t) => (
+            <div
+              key={t.id}
+              className="mb-1 flex w-full items-center justify-between rounded px-2 py-1 hover:bg-cyan-400/10"
+            >
+              <span className="truncate text-slate-300">{t.name}</span>
+              <span style={{ color: accentMap.amber.text }}>Medium</span>
+            </div>
+          ))}
+        </div>
+      )}
     </section>
   );
 }
 
-function RecentActivity() {
+function RecentActivity({
+  tasks,
+  projectName,
+}: {
+  tasks: Task[];
+  projectName: (id: string) => string;
+}) {
+  const recent = [...tasks]
+    .filter((t) => Number.isFinite(t.updated_at))
+    .sort((a, b) => b.updated_at - a.updated_at)
+    .slice(0, 6);
   return (
     <section className="rounded-lg p-4" style={panelStyle}>
       <div className="mb-3 flex justify-between">
         <h3 className="text-sm font-semibold text-white">Recent Activity</h3>
-        <button className="text-xs text-cyan-300">View all</button>
+        <span className="text-xs text-slate-500">live</span>
       </div>
-      {[
-        ['Aether updated Core Engine Development progress to 70%', '2m ago'],
-        ['Orion completed task Requirements & Design', '1h ago'],
-        ['Atlas added milestone Core Engine MVP', '3h ago'],
-        ['Nyx flagged risk on Invoice Service', '4h ago'],
-      ].map(([text, time]) => (
-        <button key={text} className="mb-2 flex w-full gap-2 rounded text-left text-xs hover:bg-cyan-400/10">
-          <Activity size={13} className="mt-0.5 text-cyan-300" />
-          <span className="flex-1 text-slate-300">{text}</span>
-          <span className="text-[10px] text-slate-500">{time}</span>
-        </button>
-      ))}
+      {recent.length === 0 ? (
+        <div className="px-2 py-3 text-xs text-slate-500">
+          No recent task activity.
+        </div>
+      ) : (
+        recent.map((t) => (
+          <div
+            key={t.id}
+            className="mb-2 flex w-full gap-2 rounded text-left text-xs"
+          >
+            <Activity size={13} className="mt-0.5 shrink-0 text-cyan-300" />
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-slate-300">
+                {(t.assigned_to || t.owner || 'Unassigned')} · {t.title}
+              </span>
+              <span className="block truncate text-[10px] text-slate-500">
+                {t.status} · {projectName(t.project_id)}
+              </span>
+            </span>
+            <span className="shrink-0 text-[10px] text-slate-500">
+              {_relTime(t.updated_at)}
+            </span>
+          </div>
+        ))
+      )}
     </section>
   );
 }
@@ -1373,10 +1875,11 @@ function WorkloadChart({
 
 function CreateProjectPanel({
   onClose,
+  onCreated,
 }: {
   onClose: () => void;
+  onCreated: () => void;
 }) {
-  const navigate = useNavigate();
   const [name, setName] = useState('');
   const [owner, setOwner] = useState('');
   const [status, setStatus] = useState<Project['status']>('Planning');
@@ -1386,13 +1889,12 @@ function CreateProjectPanel({
     if (!name.trim()) return;
     setBusy(true);
     try {
-      const project = await createProject({
+      await createProject({
         name: name.trim(),
         owner: owner.trim(),
         status,
       });
-      onClose();
-      navigate(`/projects/${project.id}`);
+      onCreated();
     } finally {
       setBusy(false);
     }
@@ -1439,161 +1941,556 @@ function CreateProjectPanel({
   );
 }
 
+// Category picker shared by the quick-add and edit dialogs. Lists the
+// project's existing categories and lets the user define a new one inline.
+function CategorySelect({
+  value,
+  categories,
+  onChange,
+}: {
+  value: string;
+  categories: string[];
+  onChange: (next: string) => void;
+}) {
+  const ADD = '__add__';
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState('');
+  const commit = () => {
+    const next = draft.trim();
+    if (next) onChange(next);
+    setAdding(false);
+    setDraft('');
+  };
+  if (adding) {
+    return (
+      <div className="flex items-center gap-1">
+        <input
+          autoFocus
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              event.preventDefault();
+              commit();
+            }
+            if (event.key === 'Escape') setAdding(false);
+          }}
+          placeholder="New category name"
+          className="w-full rounded-md px-3 py-2 text-sm text-slate-100"
+          style={inputBox}
+        />
+        <button
+          type="button"
+          onClick={commit}
+          className="rounded-md px-3 py-2 text-xs text-cyan-200"
+          style={{ border: '1px solid rgba(74,210,255,.22)' }}
+        >
+          Add
+        </button>
+      </div>
+    );
+  }
+  return (
+    <select
+      value={value}
+      onChange={(event) => {
+        if (event.target.value === ADD) {
+          setDraft('');
+          setAdding(true);
+          return;
+        }
+        onChange(event.target.value);
+      }}
+      className="w-full rounded-md px-3 py-2 text-sm text-slate-100"
+      style={inputBox}
+    >
+      <option value="">Uncategorized</option>
+      {categories.map((category) => (
+        <option key={category} value={category}>
+          {category}
+        </option>
+      ))}
+      <option value={ADD}>+ Add new category…</option>
+    </select>
+  );
+}
+
+// Lightweight modal for manually adding a task, subtask, or milestone from
+// the Gantt right-click menu. Keeps the polished look of the other dialogs.
+function QuickAddModal({
+  mode,
+  parentName,
+  categories,
+  presetCategory,
+  onSubmit,
+  onClose,
+}: {
+  mode: 'task' | 'subtask' | 'milestone' | 'category';
+  parentName: string;
+  categories: string[];
+  presetCategory?: string;
+  onSubmit: (data: { name: string; category?: string; date?: string }) => void;
+  onClose: () => void;
+}) {
+  const noun =
+    mode === 'milestone'
+      ? 'Milestone'
+      : mode === 'subtask'
+        ? 'Subtask'
+        : mode === 'category'
+          ? 'Category'
+          : 'Task';
+  const [name, setName] = useState('');
+  const [category, setCategory] = useState(presetCategory ?? '');
+  const [date, setDate] = useState('');
+  const submit = () => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    onSubmit(
+      mode === 'milestone'
+        ? { name: trimmed, date: date.trim() || 'TBD' }
+        : mode === 'category'
+          ? { name: trimmed }
+          : { name: trimmed, category: category.trim() || undefined },
+    );
+    onClose();
+  };
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md rounded-xl p-5"
+        style={{
+          ...panelStyle,
+          border: '1px solid rgba(74, 210, 255, .32)',
+          boxShadow:
+            '0 24px 80px rgba(0,0,0,.55), 0 0 36px rgba(36,217,255,.16)',
+        }}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="mb-1 text-xs uppercase tracking-[0.18em] text-cyan-300">
+          New {noun}
+        </div>
+        <h2 className="mb-4 truncate text-base font-semibold text-white">
+          in {parentName}
+        </h2>
+        <div className="space-y-3">
+          <label className="block">
+            <span className="mb-1 block text-xs text-slate-500">
+              {noun} name
+            </span>
+            <input
+              autoFocus
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  submit();
+                }
+              }}
+              className="w-full rounded-md px-3 py-2 text-sm text-slate-100"
+              style={inputBox}
+            />
+          </label>
+          {(mode === 'task' || mode === 'subtask') && (
+            <label className="block">
+              <span className="mb-1 block text-xs text-slate-500">
+                Category
+              </span>
+              <CategorySelect
+                value={category}
+                categories={categories}
+                onChange={setCategory}
+              />
+            </label>
+          )}
+          {mode === 'milestone' && (
+            <label className="block">
+              <span className="mb-1 block text-xs text-slate-500">Date</span>
+              <input
+                value={date}
+                onChange={(event) => setDate(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    submit();
+                  }
+                }}
+                placeholder="e.g. Jun 13"
+                className="w-full rounded-md px-3 py-2 text-sm text-slate-100"
+                style={inputBox}
+              />
+            </label>
+          )}
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            className="rounded-md px-4 py-2 text-xs text-slate-300"
+            style={{ border: '1px solid rgba(74,210,255,.18)' }}
+            onClick={onClose}
+          >
+            Cancel
+          </button>
+          <button
+            className="rounded-md px-4 py-2 text-xs font-semibold"
+            style={{
+              background: 'linear-gradient(180deg, #2be1ff, #1398c8)',
+              color: '#031018',
+            }}
+            onClick={submit}
+          >
+            Add {noun}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function ProjectsPage() {
   const navigate = useNavigate();
-  const [items, setItems] = useState<GanttItem[]>(initialGanttItems);
+  const [items, setItems] = useState<GanttItem[]>([]);
+  const [rawProjects, setRawProjects] = useState<Project[]>([]);
+  const [rawTasks, setRawTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<ManagedAgent[]>([]);
-  const [selected, setSelected] = useState<GanttItem>(
-    initialGanttItems.find((item) => item.id === 'core-engine') ||
-      initialGanttItems[0],
-  );
+  const [selected, setSelected] = useState<GanttItem | null>(null);
   const [editing, setEditing] = useState<GanttItem | null>(null);
   const [creating, setCreating] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [dash, setDash] = useState<ProjectDashboard | null>(null);
+  const [axis, setAxis] = useState<Axis>(DEFAULT_AXIS);
+  // Pending "quick add" request from the Gantt right-click menu.
+  const [addReq, setAddReq] = useState<{
+    mode: 'task' | 'subtask' | 'milestone' | 'category';
+    parent?: GanttItem;
+    projectId: string;
+    presetCategory?: string;
+  } | null>(null);
   // Gantt scope filter, shared so the details panel tracks the dropdown.
   const [ganttView, setGanttView] = useState<string>('all');
   const [milestonesByProject, setMilestonesByProject] = useState<
     Record<string, Milestone[]>
-  >({
-    signal84: [
-      { id: 'sig-m1', name: 'Requirements Complete', date: 'Apr 21', done: true },
-      { id: 'sig-m2', name: 'Core Engine MVP', date: 'May 23', done: true },
-      { id: 'sig-m3', name: 'Integration Complete', date: 'Jun 13', done: false },
-      { id: 'sig-m4', name: 'Production Launch', date: 'Jun 27', done: false },
-    ],
-  });
+  >({});
+  const selectedIdRef = useRef<string | null>(null);
+
+  // Single source of truth: load projects/tasks from the SQLite store
+  // (same data Mission Control and the agent tools use).
+  const reload = useCallback(async (preferId?: string) => {
+    try {
+      const bundle = await getProjectBundle();
+      const projs = bundle.projects;
+      const tasksByProject = bundle.tasks_by_project;
+      const built = buildGanttData(projs, tasksByProject);
+      setRawProjects(projs);
+      setRawTasks(Object.values(tasksByProject).flat());
+      setItems(built.items);
+      setMilestonesByProject(built.milestonesByProject);
+      setAxis(built.axis);
+      const wantId = preferId ?? selectedIdRef.current;
+      const nextSel =
+        built.items.find((i) => i.id === wantId) ??
+        built.items.find((i) => i.type === 'project') ??
+        built.items[0] ??
+        null;
+      selectedIdRef.current = nextSel?.id ?? null;
+      setSelected(nextSel);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load projects');
+    } finally {
+      setLoading(false);
+    }
+    try {
+      setDash(await getDashboard());
+    } catch {
+      /* KPIs are best-effort */
+    }
+  }, []);
+
+  useEffect(() => {
+    setLoading(true);
+    reload();
+    fetchManagedAgents()
+      .then((loaded) =>
+        setAgents(loaded.filter((a) => a.status !== 'archived')),
+      )
+      .catch(() => setAgents([]));
+  }, [reload]);
+
+  // Run a write, surface any error, then re-sync from the DB so the page
+  // always matches the store (and Mission Control).
+  const mutate = useCallback(
+    async (op: () => Promise<unknown>, selectId?: string) => {
+      try {
+        await op();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Action failed');
+      } finally {
+        await reload(selectId);
+      }
+    },
+    [reload],
+  );
+
+  const handleSelect = useCallback((it: GanttItem) => {
+    selectedIdRef.current = it.id;
+    setSelected(it);
+  }, []);
 
   const projects = useMemo(
     () => items.filter((item) => item.type === 'project'),
     [items],
   );
-  // The details panel follows the Gantt dropdown; for "All"/"Blocked"
-  // it falls back to the project of the currently selected row.
   const activeProject = useMemo(() => {
     if (ganttView !== 'all' && ganttView !== 'blocked') {
       const byView = projects.find((p) => p.projectId === ganttView);
       if (byView) return byView;
     }
     return (
-      projects.find((p) => p.projectId === selected.projectId) || projects[0]
+      projects.find((p) => p.projectId === selected?.projectId) || projects[0]
     );
-  }, [projects, ganttView, selected.projectId]);
+  }, [projects, ganttView, selected]);
   const activeProjectId = activeProject?.projectId ?? '';
   const activeMilestones = milestonesByProject[activeProjectId] ?? [];
 
-  const addMilestone = (name: string, date: string) => {
-    if (!activeProjectId) return;
-    setMilestonesByProject((current) => ({
-      ...current,
-      [activeProjectId]: [
-        ...(current[activeProjectId] ?? []),
-        { id: `ms-${Date.now()}`, name, date, done: false },
-      ],
-    }));
-  };
+  const extraCategoriesByProject = useMemo(() => {
+    const map: Record<string, string[]> = {};
+    for (const p of rawProjects) map[p.id] = p.categories ?? [];
+    return map;
+  }, [rawProjects]);
+  const categoriesForProject = (projectId: string) =>
+    Array.from(
+      new Set([
+        ...items
+          .filter(
+            (item) =>
+              item.projectId === projectId &&
+              item.type === 'task' &&
+              item.category &&
+              item.category.trim(),
+          )
+          .map((item) => item.category!.trim()),
+        ...(extraCategoriesByProject[projectId] ?? []),
+      ]),
+    ).sort((a, b) => a.localeCompare(b));
+
+  const persistMilestones = (projectId: string, list: Milestone[]) =>
+    mutate(() => updateProject(projectId, { milestones: list }));
+  const addProjectMilestone = (
+    projectId: string,
+    name: string,
+    date: string,
+  ) =>
+    persistMilestones(projectId, [
+      ...(milestonesByProject[projectId] ?? []),
+      { id: `ms-${Date.now()}`, name, date, done: false },
+    ]);
+  const addMilestone = (name: string, date: string) =>
+    addProjectMilestone(activeProjectId, name, date);
   const toggleMilestone = (id: string) => {
     if (!activeProjectId) return;
-    setMilestonesByProject((current) => ({
-      ...current,
-      [activeProjectId]: (current[activeProjectId] ?? []).map((m) =>
+    persistMilestones(
+      activeProjectId,
+      (milestonesByProject[activeProjectId] ?? []).map((m) =>
         m.id === id ? { ...m, done: !m.done } : m,
       ),
-    }));
+    );
   };
   const deleteMilestone = (id: string) => {
     if (!activeProjectId) return;
-    setMilestonesByProject((current) => ({
-      ...current,
-      [activeProjectId]: (current[activeProjectId] ?? []).filter(
-        (m) => m.id !== id,
-      ),
-    }));
+    persistMilestones(
+      activeProjectId,
+      (milestonesByProject[activeProjectId] ?? []).filter((m) => m.id !== id),
+    );
   };
 
-  useEffect(() => {
-    fetchManagedAgents()
-      .then((loadedAgents) => {
-        const activeAgents = loadedAgents.filter(
-          (agent) => agent.status !== 'archived',
-        );
-        setAgents(activeAgents);
-        if (activeAgents.length) {
-          setItems((current) => {
-            const realNames = new Set(activeAgents.map((agent) => agent.name));
-            const remapped = current.map((item, index) =>
-              realNames.has(item.agent)
-                ? item
-                : {
-                    ...item,
-                    agent: activeAgents[index % activeAgents.length].name,
-                  },
-            );
-            setSelected((selectedItem) => {
-              const next = remapped.find((item) => item.id === selectedItem.id);
-              return next || selectedItem;
-            });
-            return remapped;
-          });
-        }
-      })
-      .catch(() => setAgents([]));
-  }, []);
+  const addCategory = (projectId: string, name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const existing = extraCategoriesByProject[projectId] ?? [];
+    if (existing.includes(trimmed)) return;
+    mutate(() =>
+      updateProject(projectId, { categories: [...existing, trimmed] }),
+    );
+  };
+
+  const requestAdd = (
+    parent: GanttItem,
+    kind: 'task' | 'subtask',
+    presetCategory?: string,
+  ) =>
+    setAddReq({
+      mode: kind,
+      parent,
+      projectId: parent.projectId,
+      presetCategory,
+    });
+  const requestAddMilestone = (projectId: string) =>
+    setAddReq({ mode: 'milestone', projectId });
+  const requestAddCategory = (projectId: string) =>
+    setAddReq({ mode: 'category', projectId });
+
+  const submitQuickAdd = (data: {
+    name: string;
+    category?: string;
+    date?: string;
+  }) => {
+    if (!addReq) return;
+    if (addReq.mode === 'milestone') {
+      addProjectMilestone(addReq.projectId, data.name, data.date || 'TBD');
+      return;
+    }
+    if (addReq.mode === 'category') {
+      addCategory(addReq.projectId, data.name);
+      return;
+    }
+    const parent = addReq.parent;
+    if (!parent) return;
+    mutate(async () => {
+      const created = await createTask(parent.projectId, {
+        title: data.name,
+        parent_task_id: parent.type === 'task' ? parent.id : null,
+        category: data.category || addReq.presetCategory || '',
+      });
+      selectedIdRef.current = created.id;
+    }, undefined);
+  };
+
+  const renameProjectCategory = (
+    project: GanttItem,
+    oldName: string,
+    newName: string,
+  ) => {
+    const existing = extraCategoriesByProject[project.projectId] ?? [];
+    const rebuilt = Array.from(
+      new Set(
+        [
+          ...existing.map((c) => (c === oldName ? newName : c)),
+          newName,
+        ].filter((n) => n.trim()),
+      ),
+    );
+    const tasksToMove = items.filter(
+      (i) =>
+        i.type === 'task' &&
+        i.projectId === project.projectId &&
+        (i.category?.trim() ?? '') === oldName,
+    );
+    mutate(async () => {
+      await updateProject(project.projectId, { categories: rebuilt });
+      await Promise.all(
+        tasksToMove.map((t) => updateTask(t.id, { category: newName })),
+      );
+    });
+  };
+
+  // Drag-and-drop: move a task/subtask into the dropped-on category.
+  // Dropping on the "Uncategorized" header clears the category.
+  const assignItemCategory = (
+    itemId: string,
+    _project: GanttItem,
+    category: string,
+  ) => {
+    mutate(
+      () => updateTask(itemId, { category: category.trim() }),
+      itemId,
+    );
+  };
 
   const saveEditedItem = (next: GanttItem) => {
-    setItems((current) =>
-      current.map((item) => (item.id === next.id ? next : item)),
+    if (next.type === 'project') {
+      mutate(
+        () =>
+          updateProject(next.id, {
+            name: next.name,
+            owner: next.agent === 'Unassigned' ? '' : next.agent,
+            progress: next.progress,
+            status: STATUS_TO_PROJECT[next.status],
+          }),
+        next.id,
+      );
+      return;
+    }
+    mutate(
+      () =>
+        updateTask(next.id, {
+          title: next.name,
+          status: STATUS_TO_TASK[next.status],
+          assigned_to: next.agent === 'Unassigned' ? '' : next.agent,
+          percent_complete: next.progress,
+          category: next.category ?? '',
+        }),
+      next.id,
     );
-    setSelected((current) => (current.id === next.id ? next : current));
   };
 
-  const stats = useMemo(
-    () => [
+  const deleteSelectedProject = (project: GanttItem) => {
+    const ok = window.confirm(
+      `Delete "${project.name}" and all of its tasks, subtasks, notes, and milestones?`,
+    );
+    if (!ok) return;
+    selectedIdRef.current = null;
+    if (ganttView === project.projectId) setGanttView('all');
+    setSelected(null);
+    mutate(() => deleteProject(project.projectId));
+  };
+
+  const stats = useMemo(() => {
+    const d = dash;
+    const pct = (n: number, total: number) =>
+      total ? `${Math.round((n / total) * 100)}% of tasks` : '—';
+    return [
       {
         label: 'Active Projects',
-        value: '5',
-        support: '+1 this week',
+        value: String(d?.projects_active ?? rawProjects.length),
+        support: `${d?.projects_total ?? rawProjects.length} total`,
         accent: 'cyan' as Accent,
         icon: <BriefcaseBusiness size={18} />,
       },
       {
         label: 'Total Tasks',
-        value: '128',
-        support: '+14 this week',
+        value: String(d?.tasks_total ?? 0),
+        support: d ? `${d.projects_total} projects` : '—',
         accent: 'cyan' as Accent,
         icon: <ListChecks size={18} />,
       },
       {
         label: 'In Progress',
-        value: '68',
-        support: '53% of tasks',
+        value: String(d?.tasks_in_progress ?? 0),
+        support: d ? pct(d.tasks_in_progress, d.tasks_total) : '—',
         accent: 'green' as Accent,
         icon: <Activity size={18} />,
       },
       {
         label: 'Blocked',
-        value: '7',
-        support: '5% of tasks',
+        value: String(d?.tasks_blocked ?? 0),
+        support: d ? pct(d.tasks_blocked, d.tasks_total) : '—',
         accent: 'red' as Accent,
         icon: <AlertTriangle size={18} />,
       },
       {
-        label: 'Due This Week',
-        value: '18',
-        support: '14% of tasks',
+        label: 'Overdue',
+        value: String(d?.tasks_overdue ?? 0),
+        support: d ? pct(d.tasks_overdue, d.tasks_total) : '—',
         accent: 'amber' as Accent,
         icon: <CalendarDays size={18} />,
       },
       {
         label: 'Active Agents',
         value: String(agents.length),
-        support: agents.length ? 'Real managed agents' : 'No agents loaded',
+        support: agents.length ? 'Managed agents' : 'No agents loaded',
         accent: 'purple' as Accent,
         icon: <Bot size={18} />,
       },
-    ],
-    [agents.length],
-  );
+    ];
+  }, [dash, rawProjects.length, agents.length]);
 
   return (
+    <AxisContext.Provider value={axis}>
     <div
       className="flex-1 overflow-y-auto px-5 py-6 lg:px-7"
       style={{
@@ -1655,28 +2552,88 @@ export function ProjectsPage() {
               </button>
             </div>
           </div>
-          {creating && <CreateProjectPanel onClose={() => setCreating(false)} />}
+          {creating && (
+            <CreateProjectPanel
+              onClose={() => setCreating(false)}
+              onCreated={() => {
+                setCreating(false);
+                reload();
+              }}
+            />
+          )}
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-6">
             {stats.map((stat) => (
               <ProjectKpiCard key={stat.label} {...stat} />
             ))}
           </div>
+          {error && (
+            <div
+              className="mt-3 rounded-lg px-4 py-2 text-xs"
+              style={{
+                background: 'rgba(255,78,97,.1)',
+                border: '1px solid rgba(255,78,97,.32)',
+                color: '#ff9aa6',
+              }}
+            >
+              {error}
+            </div>
+          )}
+          {loading && !items.length && (
+            <div className="mt-3 text-xs text-slate-400">
+              Loading projects from the database…
+            </div>
+          )}
+          {!loading && !error && !projects.length && (
+            <div className="mt-3 text-xs text-slate-400">
+              No projects yet. Use “New Project” to create one — it’s stored
+              in the shared project database.
+            </div>
+          )}
         </header>
 
         <main className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
           <div className="min-w-0 space-y-4">
             <GanttChart
               items={items}
-              selectedId={selected.id}
-              onSelect={setSelected}
+              selectedId={selected?.id ?? ''}
+              onSelect={handleSelect}
               onEdit={setEditing}
               view={ganttView}
               onViewChange={setGanttView}
+              onRequestAdd={requestAdd}
+              onRequestAddMilestone={requestAddMilestone}
+              onRequestAddCategory={requestAddCategory}
+              onRenameCategory={renameProjectCategory}
+              onAssignCategory={assignItemCategory}
+              onDeleteProject={deleteSelectedProject}
+              extraCategoriesByProject={extraCategoriesByProject}
             />
+            {selected ? (
+              <TaskInspectorPanel selected={selected} />
+            ) : (
+              <section className="rounded-lg p-4" style={panelStyle}>
+                <h3 className="text-sm font-semibold text-white">
+                  Task Inspector
+                </h3>
+                <p className="mt-2 text-xs text-slate-400">
+                  {loading
+                    ? 'Loading project data…'
+                    : 'Select a task in the timeline to inspect it.'}
+                </p>
+              </section>
+            )}
             <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-4">
-              <MilestoneTimeline />
-              <RiskList />
-              <RecentActivity />
+              <MilestoneTimeline milestones={activeMilestones} />
+              <RiskList
+                items={items}
+                atRiskProjects={dash?.at_risk_projects ?? []}
+              />
+              <RecentActivity
+                tasks={rawTasks}
+                projectName={(id) =>
+                  rawProjects.find((p) => p.id === id)?.name || 'Project'
+                }
+              />
               <WorkloadChart agents={agents} items={items} />
             </div>
           </div>
@@ -1688,8 +2645,8 @@ export function ProjectsPage() {
               onAddMilestone={addMilestone}
               onToggleMilestone={toggleMilestone}
               onDeleteMilestone={deleteMilestone}
+              onDeleteProject={deleteSelectedProject}
             />
-            <TaskInspectorPanel selected={selected} />
             <AgentActivityPanel agents={agents} />
           </aside>
         </main>
@@ -1698,10 +2655,27 @@ export function ProjectsPage() {
         <EditItemModal
           item={editing}
           agents={agents}
+          categories={categoriesForProject(editing.projectId)}
           onSave={saveEditedItem}
           onClose={() => setEditing(null)}
         />
       )}
+      {addReq && (
+        <QuickAddModal
+          mode={addReq.mode}
+          parentName={
+            addReq.mode === 'milestone' || addReq.mode === 'category'
+              ? projects.find((p) => p.projectId === addReq.projectId)?.name ||
+                'project'
+              : addReq.parent?.name || 'project'
+          }
+          categories={categoriesForProject(addReq.projectId)}
+          presetCategory={addReq.presetCategory}
+          onSubmit={submitQuickAdd}
+          onClose={() => setAddReq(null)}
+        />
+      )}
     </div>
+    </AxisContext.Provider>
   );
 }

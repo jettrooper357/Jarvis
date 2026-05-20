@@ -16,9 +16,9 @@ from openjarvis.server.connectors_router import (
     create_connectors_router,
     start_connector_autosync_loop,
 )
-from openjarvis.server.projects_router import create_projects_router
 from openjarvis.server.dashboard import dashboard_router
 from openjarvis.server.digest_routes import create_digest_router
+from openjarvis.server.projects_router import create_projects_router
 from openjarvis.server.routes import router
 from openjarvis.server.upload_router import router as upload_router
 
@@ -220,6 +220,62 @@ def create_app(
     app.state.agent = agent
     app.state.bus = bus
     app.state.engine_name = engine_name
+
+    # Auto-attach the cloud engine when API keys are present, so cloud
+    # models (gpt-*, claude-*, …) route to the provider for *every* path
+    # (chat and agent), not just when the desktop app calls
+    # /v1/cloud/reload. Without this, a cloud model selected with a saved
+    # key still reaches the local Ollama engine and fails.
+    try:
+        import os as _os
+        from pathlib import Path as _Path
+
+        keys_path = _Path.home() / ".openjarvis" / "cloud-keys.env"
+        if keys_path.exists():
+            for _raw in keys_path.read_text().splitlines():
+                _line = _raw.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _v = _line.split("=", 1)
+                    _os.environ[_k.strip()] = _v.strip()
+        _key_names = (
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OPENROUTER_API_KEY",
+        )
+        if any(_os.environ.get(_n) for _n in _key_names):
+            from openjarvis.engine.cloud import CloudEngine
+            from openjarvis.engine.multi import MultiEngine
+
+            _cloud = CloudEngine()
+            if _cloud.health():
+                _outer = app.state.engine
+                _inner = getattr(_outer, "_inner", _outer)
+                if isinstance(_inner, MultiEngine):
+                    _inner._engines = [
+                        (k, e) for k, e in _inner._engines if k != "cloud"
+                    ] + [("cloud", _cloud)]
+                    _inner._refresh_map()
+                else:
+                    _nm = engine_name or "local"
+                    _multi = MultiEngine(
+                        [(_nm, _inner), ("cloud", _cloud)]
+                    )
+                    if hasattr(_outer, "_inner"):
+                        _outer._inner = _multi
+                    else:
+                        app.state.engine = _multi
+                    app.state.engine_name = "multi"
+                if app.state.agent is not None and hasattr(
+                    app.state.agent, "_engine"
+                ):
+                    app.state.agent._engine = app.state.engine
+                logger.info(
+                    "Cloud engine auto-attached (API keys detected)"
+                )
+    except Exception:
+        logger.debug("Cloud engine auto-attach skipped", exc_info=True)
     app.state.agent_name = agent_name or (
         getattr(agent, "agent_id", None) if agent else None
     )

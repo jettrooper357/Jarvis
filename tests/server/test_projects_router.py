@@ -69,9 +69,29 @@ def test_update_missing_project_404(client):
     assert r.status_code == 404
 
 
+def test_delete_missing_project_404(client):
+    assert client.delete("/v1/projects/nope").status_code == 404
+
+
 def test_create_project_rejects_non_object_body(client):
     r = client.post("/v1/projects", json=["not", "an", "object"])
     assert r.status_code == 400
+
+
+def test_project_bundle_returns_projects_and_tasks(client):
+    pid = _new_project(client, progress=10)["id"]
+    task = client.post(
+        f"/v1/projects/{pid}/tasks",
+        json={"title": "Build", "percent_complete": 80},
+    ).json()
+
+    bundle = client.get("/v1/projects/bundle")
+
+    assert bundle.status_code == 200
+    data = bundle.json()
+    assert data["projects"][0]["id"] == pid
+    assert data["projects"][0]["progress"] == 80
+    assert data["tasks_by_project"][pid][0]["id"] == task["id"]
 
 
 # --- tasks / subtasks ---------------------------------------------------

@@ -74,6 +74,10 @@ def create_projects_router():
     async def dashboard():
         return _get_store().dashboard()
 
+    @router.get("/bundle")
+    async def project_bundle():
+        return _get_store().list_projects_with_tasks()
+
     @router.get("/mission-control")
     async def mission_control(request: Request):
         """One-call aggregate for the Mission Control view.
@@ -203,7 +207,9 @@ def create_projects_router():
 
     @router.delete("/{project_id}")
     async def delete_project(project_id: str):
-        _get_store().delete_project(project_id)
+        deleted = _get_store().delete_project(project_id)
+        if not deleted:
+            raise HTTPException(404, f"Project '{project_id}' not found")
         return {"deleted": True, "id": project_id}
 
     @router.post("/{project_id}/ai-summary")

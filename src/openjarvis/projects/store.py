@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS projects (
     progress    INTEGER NOT NULL DEFAULT 0,
     tags        TEXT NOT NULL DEFAULT '[]',
     milestones  TEXT NOT NULL DEFAULT '[]',
+    categories  TEXT NOT NULL DEFAULT '[]',
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL
 );
@@ -46,6 +47,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     title           TEXT NOT NULL,
     description     TEXT NOT NULL DEFAULT '',
     type            TEXT NOT NULL DEFAULT 'Feature',
+    category        TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL DEFAULT 'Backlog',
     assigned_to     TEXT NOT NULL DEFAULT '',
     owner           TEXT NOT NULL DEFAULT '',
@@ -75,8 +77,16 @@ CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
 CREATE INDEX IF NOT EXISTS idx_notes_task ON notes(task_id);
 """
 
-_JSON_PROJECT_FIELDS = ("team", "tags", "milestones")
+_JSON_PROJECT_FIELDS = ("team", "tags", "milestones", "categories")
 _JSON_TASK_FIELDS = ("dependencies",)
+
+# Columns added after the original schema shipped; created on existing DBs
+# via a lightweight idempotent migration (CREATE TABLE IF NOT EXISTS will
+# not add columns to a table that already exists).
+_ADDED_COLUMNS = {
+    "projects": (("categories", "TEXT NOT NULL DEFAULT '[]'"),),
+    "tasks": (("category", "TEXT NOT NULL DEFAULT ''"),),
+}
 
 
 def _now() -> float:
@@ -101,7 +111,23 @@ class ProjectStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the initial schema to old DBs."""
+        for table, columns in _ADDED_COLUMNS.items():
+            existing = {
+                r["name"]
+                for r in self._conn.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+            }
+            for name, decl in columns:
+                if name not in existing:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {decl}"
+                    )
 
     # -- serialization helpers -------------------------------------------
 
@@ -131,12 +157,27 @@ class ProjectStore:
         rows = self._conn.execute(
             "SELECT * FROM projects ORDER BY created_at DESC"
         ).fetchall()
+        progress = self._project_progress_map()
         out = []
         for r in rows:
             p = self._row_to_project(r)
-            p["progress"] = self._rollup_progress(p["id"], p.get("progress", 0))
+            p["progress"] = progress.get(p["id"], int(p.get("progress") or 0))
             out.append(p)
         return out
+
+    def list_projects_with_tasks(self) -> Dict[str, Any]:
+        """Return all projects and tasks in one DB pass for dashboard pages."""
+        projects = self.list_projects()
+        rows = self._conn.execute(
+            "SELECT * FROM tasks ORDER BY project_id, sort_order, created_at"
+        ).fetchall()
+        tasks_by_project: Dict[str, List[Dict[str, Any]]] = {
+            p["id"]: [] for p in projects
+        }
+        for row in rows:
+            task = self._row_to_task(row)
+            tasks_by_project.setdefault(task["project_id"], []).append(task)
+        return {"projects": projects, "tasks_by_project": tasks_by_project}
 
     def get_project(self, project_id: str) -> Optional[Dict[str, Any]]:
         r = self._conn.execute(
@@ -203,9 +244,12 @@ class ProjectStore:
             self._conn.commit()
         return self.get_project(project_id)  # type: ignore[return-value]
 
-    def delete_project(self, project_id: str) -> None:
-        self._conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    def delete_project(self, project_id: str) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM projects WHERE id = ?", (project_id,)
+        )
         self._conn.commit()
+        return cur.rowcount > 0
 
     # -- tasks -----------------------------------------------------------
 
@@ -230,10 +274,11 @@ class ProjectStore:
         now = _now()
         self._conn.execute(
             "INSERT INTO tasks (id, project_id, parent_task_id, title, "
-            "description, type, status, assigned_to, owner, priority, "
-            "start_date, due_date, percent_complete, estimate_hours, "
-            "dependencies, sort_order, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "description, type, category, status, assigned_to, owner, "
+            "priority, start_date, due_date, percent_complete, "
+            "estimate_hours, dependencies, sort_order, created_at, "
+            "updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 tid,
                 project_id,
@@ -241,6 +286,7 @@ class ProjectStore:
                 str(fields.get("title") or "Untitled Task"),
                 str(fields.get("description") or ""),
                 str(fields.get("type") or "Feature"),
+                str(fields.get("category") or ""),
                 str(fields.get("status") or "Backlog"),
                 str(fields.get("assigned_to") or ""),
                 str(fields.get("owner") or ""),
@@ -271,6 +317,7 @@ class ProjectStore:
                 "title",
                 "description",
                 "type",
+                "category",
                 "status",
                 "assigned_to",
                 "owner",
@@ -352,6 +399,113 @@ class ProjectStore:
         self._conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
         self._conn.commit()
 
+    # -- milestones (stored as a JSON list on the project) ---------------
+
+    def list_milestones(self, project_id: str) -> List[Dict[str, Any]]:
+        project = self.get_project(project_id)
+        if not project:
+            raise KeyError(project_id)
+        return list(project.get("milestones") or [])
+
+    def add_milestone(
+        self, project_id: str, name: str, date: str = "", done: bool = False
+    ) -> Dict[str, Any]:
+        milestones = self.list_milestones(project_id)
+        milestone = {
+            "id": _gen_id(),
+            "name": str(name or "Untitled Milestone"),
+            "date": str(date or ""),
+            "done": bool(done),
+        }
+        milestones.append(milestone)
+        self.update_project(project_id, milestones=milestones)
+        return milestone
+
+    def update_milestone(
+        self, project_id: str, milestone_id: str, **fields: Any
+    ) -> Dict[str, Any]:
+        milestones = self.list_milestones(project_id)
+        for milestone in milestones:
+            if milestone.get("id") == milestone_id:
+                for key in ("name", "date", "done"):
+                    if key in fields and fields[key] is not None:
+                        milestone[key] = (
+                            bool(fields[key])
+                            if key == "done"
+                            else str(fields[key])
+                        )
+                self.update_project(project_id, milestones=milestones)
+                return milestone
+        raise KeyError(milestone_id)
+
+    def delete_milestone(self, project_id: str, milestone_id: str) -> None:
+        milestones = self.list_milestones(project_id)
+        kept = [m for m in milestones if m.get("id") != milestone_id]
+        if len(kept) == len(milestones):
+            raise KeyError(milestone_id)
+        self.update_project(project_id, milestones=kept)
+
+    # -- categories ------------------------------------------------------
+    # A category is a project-scoped label. Tasks/subtasks reference it via
+    # ``tasks.category``; the project's ``categories`` list also keeps
+    # explicitly-created categories that have no tasks yet.
+
+    def list_categories(self, project_id: str) -> List[str]:
+        project = self.get_project(project_id)
+        if not project:
+            raise KeyError(project_id)
+        names = list(project.get("categories") or [])
+        for task in self.list_tasks(project_id):
+            cat = str(task.get("category") or "").strip()
+            if cat and cat not in names:
+                names.append(cat)
+        return sorted(names, key=str.casefold)
+
+    def add_category(self, project_id: str, name: str) -> List[str]:
+        project = self.get_project(project_id)
+        if not project:
+            raise KeyError(project_id)
+        clean = str(name or "").strip()
+        if not clean:
+            raise ValueError("category name is required")
+        registry = list(project.get("categories") or [])
+        if clean not in registry:
+            registry.append(clean)
+            self.update_project(project_id, categories=registry)
+        return self.list_categories(project_id)
+
+    def rename_category(
+        self, project_id: str, old_name: str, new_name: str
+    ) -> List[str]:
+        project = self.get_project(project_id)
+        if not project:
+            raise KeyError(project_id)
+        clean = str(new_name or "").strip()
+        if not clean:
+            raise ValueError("new category name is required")
+        registry = [
+            clean if c == old_name else c
+            for c in (project.get("categories") or [])
+        ]
+        if clean not in registry:
+            registry.append(clean)
+        self.update_project(project_id, categories=registry)
+        for task in self.list_tasks(project_id):
+            if str(task.get("category") or "").strip() == old_name:
+                self.update_task(task["id"], category=clean)
+        return self.list_categories(project_id)
+
+    def delete_category(self, project_id: str, name: str) -> List[str]:
+        project = self.get_project(project_id)
+        if not project:
+            raise KeyError(project_id)
+        registry = [c for c in (project.get("categories") or []) if c != name]
+        self.update_project(project_id, categories=registry)
+        for task in self.list_tasks(project_id):
+            if str(task.get("category") or "").strip() == name:
+                self.update_task(task["id"], category="")
+        return self.list_categories(project_id)
+
     # -- analytics -------------------------------------------------------
 
     def _rollup_progress(self, project_id: str, explicit: int) -> int:
@@ -364,6 +518,17 @@ class ProjectStore:
         if row and row["avg"] is not None:
             return int(round(row["avg"]))
         return int(explicit or 0)
+
+    def _project_progress_map(self) -> Dict[str, int]:
+        rows = self._conn.execute(
+            "SELECT project_id, AVG(percent_complete) AS avg FROM tasks "
+            "WHERE parent_task_id IS NULL GROUP BY project_id"
+        ).fetchall()
+        return {
+            row["project_id"]: int(round(row["avg"]))
+            for row in rows
+            if row["avg"] is not None
+        }
 
     def dashboard(self) -> Dict[str, Any]:
         """Portfolio KPIs for the dashboard widgets."""

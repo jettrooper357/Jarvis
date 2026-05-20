@@ -268,3 +268,273 @@ class TestModelsEndpointExtended:
         assert resp.status_code == 200
         # The endpoint returns whatever list_models() gives
         assert resp.json()["object"] == "list"
+
+
+class TestCloudAgentRouting:
+    class FakeLocalEngine:
+        engine_id = "ollama"
+        is_cloud = False
+
+        def __init__(self):
+            self.generated_models = []
+
+        def health(self):
+            return True
+
+        def list_models(self):
+            return ["qwen3.5:4b"]
+
+        def generate(self, messages, *, model, **kwargs):
+            self.generated_models.append(model)
+            return {"content": f"local:{model}", "usage": {}}
+
+        async def stream(self, messages, *, model, **kwargs):
+            yield f"local:{model}"
+
+        def close(self):
+            pass
+
+    def test_create_app_cloud_auto_attach_updates_agent_engine(self, monkeypatch):
+        """Agent streams must use the cloud-aware app engine after startup wrap."""
+
+        class FakeCloudEngine:
+            engine_id = "cloud"
+            is_cloud = True
+
+            def health(self):
+                return True
+
+            def list_models(self):
+                return ["gpt-4o"]
+
+            def generate(self, messages, *, model, **kwargs):
+                return {"content": f"cloud:{model}", "usage": {}}
+
+            def close(self):
+                pass
+
+        import openjarvis.engine.cloud as cloud_module
+
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        monkeypatch.setattr(cloud_module, "CloudEngine", FakeCloudEngine)
+
+        local_engine = self.FakeLocalEngine()
+        agent = MagicMock()
+        agent._engine = local_engine
+
+        app = create_app(
+            local_engine,
+            "qwen3.5:4b",
+            agent=agent,
+            engine_name="ollama",
+        )
+
+        assert app.state.engine_name == "multi"
+        assert agent._engine is app.state.engine
+        result = agent._engine.generate([], model="gpt-4o")
+        assert result["content"] == "cloud:gpt-4o"
+        assert local_engine.generated_models == []
+
+    def test_cloud_reload_updates_agent_engine(self, monkeypatch):
+        """Hot reload must move existing agents off the stale Ollama engine."""
+
+        class FakeCloudEngine:
+            engine_id = "cloud"
+            is_cloud = True
+
+            def health(self):
+                return True
+
+            def list_models(self):
+                return ["gpt-4o"]
+
+            def generate(self, messages, *, model, **kwargs):
+                return {"content": f"cloud:{model}", "usage": {}}
+
+            def close(self):
+                pass
+
+        import openjarvis.engine.cloud as cloud_module
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(cloud_module, "CloudEngine", FakeCloudEngine)
+
+        local_engine = self.FakeLocalEngine()
+        agent = MagicMock()
+        agent._engine = local_engine
+        app = create_app(
+            local_engine,
+            "qwen3.5:4b",
+            agent=agent,
+            engine_name="ollama",
+        )
+        client = TestClient(app)
+
+        resp = client.post("/v1/cloud/reload")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+        assert app.state.engine_name == "multi"
+        assert agent._engine is app.state.engine
+        result = agent._engine.generate([], model="gpt-4o")
+        assert result["content"] == "cloud:gpt-4o"
+        assert local_engine.generated_models == []
+
+    def test_save_cloud_key_writes_file_and_updates_agent_engine(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """Browser key saves must reach the Python server, not only localStorage."""
+
+        class FakeCloudEngine:
+            engine_id = "cloud"
+            is_cloud = True
+
+            def health(self):
+                return True
+
+            def list_models(self):
+                return ["gpt-4o"]
+
+            def generate(self, messages, *, model, **kwargs):
+                return {"content": f"cloud:{model}", "usage": {}}
+
+            def close(self):
+                pass
+
+        import pathlib
+
+        import openjarvis.engine.cloud as cloud_module
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(cloud_module, "CloudEngine", FakeCloudEngine)
+        (tmp_path / ".openjarvis").mkdir()
+
+        local_engine = self.FakeLocalEngine()
+        agent = MagicMock()
+        agent._engine = local_engine
+        app = create_app(
+            local_engine,
+            "qwen3.5:4b",
+            agent=agent,
+            engine_name="ollama",
+        )
+        client = TestClient(app)
+
+        resp = client.post(
+            "/v1/cloud/keys",
+            json={"keyName": "OPENAI_API_KEY", "keyValue": "sk-test"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+        keys_path = tmp_path / ".openjarvis" / "cloud-keys.env"
+        assert keys_path.read_text() == "OPENAI_API_KEY=sk-test\n"
+        assert agent._engine is app.state.engine
+        result = agent._engine.generate([], model="gpt-4o")
+        assert result["content"] == "cloud:gpt-4o"
+        assert local_engine.generated_models == []
+
+    def test_cloud_stream_bypasses_agent_ollama_engine(self, monkeypatch):
+        """Cloud chat streams should not pass through an Ollama-backed agent."""
+
+        async def fake_stream_cloud(model, messages, temperature, max_tokens):
+            yield f"cloud:{model}"
+
+        import openjarvis.server.cloud_router as cloud_router
+
+        monkeypatch.setattr(cloud_router, "stream_cloud", fake_stream_cloud)
+
+        local_engine = self.FakeLocalEngine()
+        agent = MagicMock()
+        agent._engine = local_engine
+
+        app = create_app(
+            local_engine,
+            "qwen3.5:4b",
+            agent=agent,
+            bus=MagicMock(),
+            engine_name="ollama",
+        )
+        client = TestClient(app)
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+
+        assert resp.status_code == 200
+        assert "cloud:gpt-4o-mini" in resp.text
+        agent.run.assert_not_called()
+        assert local_engine.generated_models == []
+
+    def test_removing_cloud_key_detaches_stale_cloud_engine(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """Switching back to local must remove cloud routing from MultiEngine."""
+
+        class FakeCloudEngine:
+            engine_id = "cloud"
+            is_cloud = True
+
+            def health(self):
+                import os
+
+                return bool(os.environ.get("OPENAI_API_KEY"))
+
+            def list_models(self):
+                return ["gpt-4o"]
+
+            def generate(self, messages, *, model, **kwargs):
+                return {"content": f"cloud:{model}", "usage": {}}
+
+            def close(self):
+                pass
+
+        import pathlib
+
+        import openjarvis.engine.cloud as cloud_module
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(cloud_module, "CloudEngine", FakeCloudEngine)
+        (tmp_path / ".openjarvis").mkdir()
+
+        local_engine = self.FakeLocalEngine()
+        agent = MagicMock()
+        agent._engine = local_engine
+        app = create_app(
+            local_engine,
+            "qwen3.5:4b",
+            agent=agent,
+            engine_name="ollama",
+        )
+        client = TestClient(app)
+
+        add_resp = client.post(
+            "/v1/cloud/keys",
+            json={"keyName": "OPENAI_API_KEY", "keyValue": "sk-test"},
+        )
+        assert add_resp.status_code == 200
+        assert add_resp.json()["status"] == "ok"
+        assert app.state.engine_name == "multi"
+
+        remove_resp = client.post(
+            "/v1/cloud/keys",
+            json={"keyName": "OPENAI_API_KEY", "keyValue": ""},
+        )
+
+        assert remove_resp.status_code == 200
+        assert remove_resp.json()["status"] == "no_cloud"
+        assert app.state.engine_name == "ollama"
+        assert app.state.engine is local_engine
+        assert agent._engine is local_engine
+        assert "OPENAI_API_KEY" not in __import__("os").environ

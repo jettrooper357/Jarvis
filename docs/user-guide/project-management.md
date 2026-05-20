@@ -23,7 +23,9 @@ browser-local silo — project data is server-side so agents can query it.
 | Concept | Description |
 |---|---|
 | **Project** | Portfolio entry: name, description, owner, team, start/target dates, status (`Planning`, `Active`, `At Risk`, `Delayed`, `Complete`), progress, tags, milestones. |
-| **Task** | Belongs to a project; can nest under a `parent_task_id` (subtasks). Has type, status (`Backlog`, `Ready`, `In Progress`, `Blocked`, `Review`, `Done`, `Cancelled`), assignee, owner, priority, dates, percent complete, dependencies. |
+| **Task** | Belongs to a project; can nest under a `parent_task_id` (subtasks). Has type, optional `category`, status (`Backlog`, `Ready`, `In Progress`, `Blocked`, `Review`, `Done`, `Cancelled`), assignee, owner, priority, dates, percent complete, dependencies. |
+| **Category** | Optional project-scoped label that groups tasks/subtasks under the same name. Stored on the project so an explicitly-created category persists even before any task uses it. |
+| **Milestone** | Named target (with optional date and done flag) tracked on the project. |
 | **Note** | Attached to a task: `Comment`, `Decision`, `Action Item`, or `Update`, with an optional AI summary. |
 
 Project progress automatically rolls up from the average `percent_complete`
@@ -109,6 +111,25 @@ The connector also reads optional extra local project folders
 (`.json`/`.md`/`.yaml`) listed in its editable JSON config
 (`~/.openjarvis/connectors/project_management.json`, editable from the Data
 Sources page).
+
+### Project tools (write actions)
+
+Project-capable agents (manager/chief tier — see role tiers above) also get a
+write toolset so they can maintain the plan and log progress directly,
+instead of only answering from knowledge:
+
+- `project_create`, `project_create_task` (tasks/subtasks, with optional
+  `category`), `project_update_task`, `project_delete_task`
+- `project_add_note` — log a progress/status note whenever the agent is
+  given an update on the work
+- `project_add_milestone`, `project_update_milestone`,
+  `project_delete_milestone`
+- `project_add_category`, `project_rename_category` (propagates to every
+  task using the old name), `project_delete_category` (tasks become
+  uncategorized; the tasks are kept)
+
+These act on the same SQLite `ProjectStore` as the UI and REST API, so
+changes show up everywhere.
 
 ### `project-status-report` skill
 

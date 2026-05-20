@@ -106,6 +106,27 @@ export async function fetchRecommendedModel(): Promise<{ model: string; reason: 
   return res.json();
 }
 
+export async function saveCloudKey(keyName: string, keyValue: string): Promise<void> {
+  if (isTauri()) {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('save_cloud_key', { keyName, keyValue });
+      return;
+    } catch {
+      // Fall through to the HTTP API for dev/browser parity.
+    }
+  }
+  const res = await fetch(`${getBase()}/v1/cloud/keys`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ keyName, keyValue }),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => res.statusText);
+    throw new Error(`Failed to save cloud key: ${detail}`);
+  }
+}
+
 export async function pullModel(modelName: string): Promise<void> {
   // In Tauri, go through the Rust backend directly (avoids CORS / timeout
   // issues with long model downloads via fetch).
@@ -148,7 +169,7 @@ export async function deleteModel(modelName: string): Promise<void> {
   }
 }
 
-const _CLOUD_PREFIXES = ['gpt-', 'o1-', 'o3-', 'o4-', 'claude-', 'gemini-', 'openrouter/'];
+const _CLOUD_PREFIXES = ['gpt-', 'o1-', 'o3-', 'o4-', 'chatgpt-', 'claude-', 'gemini-', 'openrouter/', 'MiniMax-', 'codex/'];
 
 export async function preloadModel(modelName: string): Promise<void> {
   // Cloud models don't need Ollama preloading

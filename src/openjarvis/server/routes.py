@@ -99,7 +99,11 @@ _CONNECTOR_STOP_WORDS = {
 
 def _connector_query_candidates(query: str) -> list[str]:
     cleaned = re.sub(r"[^a-zA-Z0-9\s]+", " ", query.casefold())
-    tokens = [token for token in cleaned.split() if token and token not in _CONNECTOR_STOP_WORDS]
+    tokens = [
+        token
+        for token in cleaned.split()
+        if token and token not in _CONNECTOR_STOP_WORDS
+    ]
     candidates: list[str] = []
     if tokens:
         focused = " ".join(tokens)
@@ -124,8 +128,9 @@ def _recent_connector_results(store: Any, *, max_results: int = 5) -> list[Any]:
         """,
         (max_results,),
     ).fetchall()
-    from openjarvis.tools.storage._stubs import RetrievalResult
     import json
+
+    from openjarvis.tools.storage._stubs import RetrievalResult
 
     results = []
     for row in rows:
@@ -231,8 +236,10 @@ def _inject_connector_knowledge_context(
         role=Role.SYSTEM,
         content=(
             "The following recent context was retrieved from synced connector data. "
-            "Use it directly when answering questions about latest news or synced feeds. "
-            "If the retrieved items do not actually cover the requested topic, say that clearly "
+            "Use it directly when answering questions about latest news or synced "
+            "feeds. "
+            "If the retrieved items do not actually cover the requested topic, say "
+            "that clearly "
             "and summarize only what is present in the synced feeds.\n\n"
             + "\n\n".join(context_lines)
         ),
@@ -363,7 +370,11 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             )
 
     if request_body.stream:
+        from openjarvis.server.cloud_router import is_cloud_model
+
         bus = getattr(request.app.state, "bus", None)
+        if is_cloud_model(model):
+            return await _handle_stream(engine, model, request_body, complexity_info)
         # Route streaming chat through the agent whenever one is available so
         # the chat box can use the agent's tools (web_search, etc.) and answer
         # with live data. Tradeoff: the bridge runs agent.run() synchronously
@@ -699,6 +710,20 @@ async def pull_model(request: Request):
     if not model_name:
         raise HTTPException(status_code=400, detail="'model' field is required")
 
+    from openjarvis.server.cloud_router import get_provider
+
+    provider = get_provider(model_name)
+    if provider:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{model_name!r} is a {provider} cloud model — it is not "
+                "pulled via Ollama. Add the API key (Settings → API Keys) "
+                "and reload the cloud engine; the model is then used "
+                "directly."
+            ),
+        )
+
     engine = request.app.state.engine
     engine_name = getattr(request.app.state, "engine_name", "")
     # Only Ollama supports pulling
@@ -763,6 +788,50 @@ async def delete_model(model_name: str, request: Request):
     return {"status": "deleted", "model": model_name}
 
 
+@router.post("/v1/cloud/keys")
+async def save_cloud_key(request: Request):
+    """Persist a cloud API key from the web UI and reload cloud routing."""
+    import os
+    from pathlib import Path
+
+    allowed_keys = {
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "OPENROUTER_API_KEY",
+        "MINIMAX_API_KEY",
+    }
+    body = await request.json()
+    key_name = str(body.get("keyName", "")).strip()
+    key_value = str(body.get("keyValue", "")).strip()
+    if key_name not in allowed_keys:
+        raise HTTPException(status_code=400, detail="Unsupported cloud key")
+
+    keys_path = Path.home() / ".openjarvis" / "cloud-keys.env"
+    keys_path.parent.mkdir(parents=True, exist_ok=True)
+    values: dict[str, str] = {}
+    if keys_path.exists():
+        for raw_line in keys_path.read_text().splitlines():
+            line = raw_line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                if k.strip() in allowed_keys and v.strip():
+                    values[k.strip()] = v.strip()
+
+    if key_value:
+        values[key_name] = key_value.replace("\r", "").replace("\n", "")
+        os.environ[key_name] = values[key_name]
+    else:
+        values.pop(key_name, None)
+        os.environ.pop(key_name, None)
+
+    keys_path.write_text(
+        "\n".join(f"{k}={values[k]}" for k in sorted(values)) + ("\n" if values else "")
+    )
+    return await reload_cloud_engine(request)
+
+
 @router.post("/v1/cloud/reload")
 async def reload_cloud_engine(request: Request):
     """Hot-reload cloud API keys and (re-)initialize the cloud engine.
@@ -773,14 +842,59 @@ async def reload_cloud_engine(request: Request):
     import os
     from pathlib import Path
 
-    # Re-read ~/.openjarvis/cloud-keys.env and update the running process env.
+    key_names = (
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "OPENROUTER_API_KEY",
+        "MINIMAX_API_KEY",
+        "OPENAI_CODEX_API_KEY",
+    )
+
+    # Re-read ~/.openjarvis/cloud-keys.env and make the running process env
+    # match it exactly for cloud keys, including removals.
     keys_path = Path.home() / ".openjarvis" / "cloud-keys.env"
+    found_keys: set[str] = set()
     if keys_path.exists():
         for raw_line in keys_path.read_text().splitlines():
             line = raw_line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
-                os.environ[k.strip()] = v.strip()
+                key = k.strip()
+                if key in key_names and v.strip():
+                    os.environ[key] = v.strip()
+                    found_keys.add(key)
+    for key in key_names:
+        if key not in found_keys:
+            os.environ.pop(key, None)
+
+    def _set_agent_engine() -> None:
+        agent = getattr(request.app.state, "agent", None)
+        if agent is not None and hasattr(agent, "_engine"):
+            agent._engine = request.app.state.engine
+
+    def _detach_cloud_engine() -> None:
+        from openjarvis.engine.multi import MultiEngine
+
+        outer = request.app.state.engine
+        inner = getattr(outer, "_inner", outer)
+        if not isinstance(inner, MultiEngine):
+            _set_agent_engine()
+            return
+
+        remaining = [(k, e) for k, e in inner._engines if k != "cloud"]
+        if len(remaining) == 1:
+            replacement = remaining[0][1]
+            if hasattr(outer, "_inner"):
+                outer._inner = replacement
+            else:
+                request.app.state.engine = replacement
+            request.app.state.engine_name = remaining[0][0]
+        else:
+            inner._engines = remaining
+            inner._refresh_map()
+        _set_agent_engine()
 
     # Try to build a fresh CloudEngine.
     try:
@@ -789,6 +903,7 @@ async def reload_cloud_engine(request: Request):
 
         cloud = CloudEngine()
         if not cloud.health():
+            _detach_cloud_engine()
             return {
                 "status": "no_cloud",
                 "message": "No cloud models available (check API keys)",
@@ -816,6 +931,7 @@ async def reload_cloud_engine(request: Request):
         else:
             request.app.state.engine = new_multi
         request.app.state.engine_name = "multi"
+    _set_agent_engine()
 
     return {"status": "ok", "message": "Cloud engine reloaded"}
 
@@ -1024,7 +1140,9 @@ async def telegram_health():
             "configured": True,
             "status": "invalid_token",
             "message": "Telegram rejected the saved bot token.",
-            "detail": str(payload.get("description") or response.text or "Unauthorized"),
+            "detail": str(
+                payload.get("description") or response.text or "Unauthorized"
+            ),
         }
 
     if response.status_code >= 300:

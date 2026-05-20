@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { Search, Cpu, X, Download, Loader2, Trash2, Check, Cloud, Key, Eye, EyeOff } from 'lucide-react';
 import { useAppStore } from '../lib/store';
-import { pullModel, deleteModel, fetchModels, preloadModel, isTauri } from '../lib/api';
+import { pullModel, deleteModel, fetchModels, preloadModel, saveCloudKey } from '../lib/api';
 
 /** Popular models that users can download from the catalogue. */
 const CATALOGUE_MODELS = [
@@ -104,6 +104,7 @@ export function CommandPalette() {
   const setSelectedModel = useAppStore((s) => s.setSelectedModel);
   const setModels = useAppStore((s) => s.setModels);
   const setCommandPaletteOpen = useAppStore((s) => s.setCommandPaletteOpen);
+  const syncedKeysRef = useRef(false);
 
   const installedIds = new Set(models.map((m) => m.id));
 
@@ -120,6 +121,26 @@ export function CommandPalette() {
 
   useEffect(() => {
     inputRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    if (syncedKeysRef.current) return;
+    syncedKeysRef.current = true;
+    const storedKeys = CLOUD_PROVIDERS
+      .map((provider) => ({
+        provider,
+        value: (apiKeys[provider.storageKey] || '').trim(),
+      }))
+      .filter((entry) => entry.value);
+    if (storedKeys.length === 0) return;
+
+    Promise.allSettled(
+      storedKeys.map(({ provider, value }) =>
+        saveCloudKey(provider.envKey, value),
+      ),
+    ).then(() => {
+      refreshModels();
+    });
   }, []);
 
   useEffect(() => {
@@ -213,13 +234,7 @@ export function CommandPalette() {
     setStoredKey(provider.storageKey, value);
     setApiKeys((prev) => ({ ...prev, [provider.storageKey]: value }));
 
-    // Also save to Tauri backend so the server process picks up the key
-    if (isTauri()) {
-      try {
-        const { invoke } = await import('@tauri-apps/api/core');
-        await invoke('save_cloud_key', { keyName: provider.envKey, keyValue: value });
-      } catch {}
-    }
+    await saveCloudKey(provider.envKey, value);
 
     useAppStore.getState().addLogEntry({
       timestamp: Date.now(), level: 'info', category: 'model',

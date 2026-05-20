@@ -23,6 +23,28 @@ from openjarvis.engine._stubs import StreamChunk
 
 logger = logging.getLogger(__name__)
 
+# Model-name prefixes served by cloud providers. The Ollama engine must
+# never try to *pull* these — doing so produces a confusing
+# "pull model manifest: file does not exist". Kept in sync with
+# engine.multi._CLOUD_PREFIXES / server.cloud_router prefixes.
+_CLOUD_MODEL_PREFIXES = (
+    "gpt-",
+    "o1-",
+    "o3-",
+    "o4-",
+    "chatgpt-",
+    "claude-",
+    "gemini-",
+    "openrouter/",
+    "minimax-",
+    "codex/",
+)
+
+
+def _is_cloud_model(model: str) -> bool:
+    name = (model or "").strip().lower()
+    return any(name.startswith(p) for p in _CLOUD_MODEL_PREFIXES)
+
 
 @EngineRegistry.register("ollama")
 class OllamaEngine(InferenceEngine):
@@ -46,6 +68,18 @@ class OllamaEngine(InferenceEngine):
         self._client = httpx.Client(base_url=self._host, timeout=timeout)
         # Last stream usage — captured from Ollama's final chunk
         self._last_stream_usage: Dict[str, int] = {}
+
+    @staticmethod
+    def _keep_alive(kwargs: Dict[str, Any]) -> Any:
+        """Return Ollama keep_alive with a bounded default."""
+        if "keep_alive" in kwargs:
+            return kwargs["keep_alive"]
+        value = os.environ.get("OPENJARVIS_OLLAMA_KEEP_ALIVE", "5m").strip()
+        if value == "-1":
+            return -1
+        if value == "0":
+            return 0
+        return value or "5m"
 
     def generate(
         self,
@@ -87,10 +121,9 @@ class OllamaEngine(InferenceEngine):
                 # Override via kwargs once on fast storage if desired.
                 "use_mmap": kwargs.get("use_mmap", False),
             },
-            # Keep the model resident between turns. On a CPU-only box the
-            # cold reload (multi-GB read from disk) is the single biggest
-            # interactive-latency source; -1 = never auto-unload.
-            "keep_alive": kwargs.get("keep_alive", -1),
+            # Keep the model warm briefly, then let Ollama unload the multi-GB
+            # runner so WSL memory returns after idle periods.
+            "keep_alive": self._keep_alive(kwargs),
         }
         # Disable extended thinking by default (Qwen3.5 etc.).
         # When enabled, thinking tokens consume the entire budget and
@@ -225,10 +258,9 @@ class OllamaEngine(InferenceEngine):
                 # Override via kwargs once on fast storage if desired.
                 "use_mmap": kwargs.get("use_mmap", False),
             },
-            # Keep the model resident between turns. On a CPU-only box the
-            # cold reload (multi-GB read from disk) is the single biggest
-            # interactive-latency source; -1 = never auto-unload.
-            "keep_alive": kwargs.get("keep_alive", -1),
+            # Keep the model warm briefly, then let Ollama unload the multi-GB
+            # runner so WSL memory returns after idle periods.
+            "keep_alive": self._keep_alive(kwargs),
         }
         try:
             async with httpx.AsyncClient(
@@ -315,10 +347,9 @@ class OllamaEngine(InferenceEngine):
                 # Override via kwargs once on fast storage if desired.
                 "use_mmap": kwargs.get("use_mmap", False),
             },
-            # Keep the model resident between turns. On a CPU-only box the
-            # cold reload (multi-GB read from disk) is the single biggest
-            # interactive-latency source; -1 = never auto-unload.
-            "keep_alive": kwargs.get("keep_alive", -1),
+            # Keep the model warm briefly, then let Ollama unload the multi-GB
+            # runner so WSL memory returns after idle periods.
+            "keep_alive": self._keep_alive(kwargs),
         }
         if "think" not in kwargs:
             payload["think"] = False
@@ -512,6 +543,16 @@ class OllamaEngine(InferenceEngine):
         model = (model or "").strip()
         if not model:
             return
+        if _is_cloud_model(model):
+            # A cloud model reached the local engine — never pull it via
+            # Ollama. Fail with an actionable message instead of the cryptic
+            # "pull model manifest: file does not exist".
+            raise RuntimeError(
+                f"{model!r} is a cloud model and cannot be pulled by Ollama. "
+                "Add the provider API key (Settings → API Keys, or "
+                "~/.openjarvis/cloud-keys.env), reload the cloud engine, then "
+                "select the model again."
+            )
         try:
             installed = self.list_models()
         except Exception:

@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router';
-import { ChevronLeft, Plus, GanttChartSquare, Sparkles } from 'lucide-react';
+import { ChevronLeft, Plus, GanttChartSquare, Sparkles, Trash2 } from 'lucide-react';
 import {
   getProject,
   listTasks,
   createTask,
   updateTask,
   deleteTask,
+  deleteProject,
   getAiSummary,
 } from '../lib/projects-api';
 import type { Project, Task } from '../lib/projects-api';
@@ -69,6 +70,16 @@ export function ProjectDetailPage() {
     } finally {
       setSummarizing(false);
     }
+  };
+
+  const removeProject = async () => {
+    if (!project) return;
+    const ok = window.confirm(
+      `Delete "${project.name}" and all of its tasks, subtasks, notes, and milestones?`,
+    );
+    if (!ok) return;
+    await deleteProject(project.id);
+    navigate('/projects');
   };
 
   if (!project) {
@@ -141,6 +152,17 @@ export function ProjectDetailPage() {
               }}
             >
               <GanttChartSquare size={14} /> Timeline
+            </button>
+            <button
+              onClick={removeProject}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs cursor-pointer"
+              style={{
+                background: 'rgba(220,38,38,.08)',
+                border: '1px solid rgba(220,38,38,.35)',
+                color: 'var(--color-error)',
+              }}
+            >
+              <Trash2 size={14} /> Delete
             </button>
           </div>
         </header>

@@ -2230,6 +2230,47 @@ function AgentConfigGrid({ agent, onAgentUpdated }: { agent: ManagedAgent; onAge
   );
 }
 
+// Skills have no server-side category, so group them by name keywords for
+// the Capability Inspector. Order is intentional (most relevant first).
+const SKILL_GROUPS: { label: string; match: (n: string) => boolean }[] = [
+  { label: 'Project', match: (n) => n.includes('project') },
+  {
+    label: 'Knowledge & Research',
+    match: (n) =>
+      /knowledge|research|topic|search-and-index|arxiv|llm-wiki/.test(n),
+  },
+  {
+    label: 'Documents & Notes',
+    match: (n) =>
+      /doc|pdf|summarize|translate|meeting|notes|todo|digest|email|calendar/.test(
+        n,
+      ),
+  },
+  {
+    label: 'Files',
+    match: (n) => /file|backup|dedup|organiz/.test(n),
+  },
+  {
+    label: 'Code',
+    match: (n) =>
+      /code|codex|dependency-audit|security-scan|test-gen|lint|review/.test(n),
+  },
+  {
+    label: 'Web & Media',
+    match: (n) => /web|blog|polymarket|song|music|image|audio|ascii|art/.test(n),
+  },
+];
+
+function skillGroupLabel(name: string): string {
+  const n = name.toLowerCase();
+  for (const group of SKILL_GROUPS) {
+    if (group.match(n)) return group.label;
+  }
+  return 'Other';
+}
+
+const SKILL_GROUP_ORDER = [...SKILL_GROUPS.map((g) => g.label), 'Other'];
+
 function AgentPresetToolsSection({
   agent,
   templates,
@@ -2267,6 +2308,51 @@ function AgentPresetToolsSection({
   const [saving, setSaving] = useState(false);
   const [presetId, setPresetId] = useState(templateId);
   const [selectedSkills, setSelectedSkills] = useState<string[]>(configuredSkills);
+  const [skillQuery, setSkillQuery] = useState('');
+  const [collapsedSkillGroups, setCollapsedSkillGroups] = useState<Set<string>>(
+    new Set(),
+  );
+  const groupedSkills = useMemo(() => {
+    const q = skillQuery.trim().toLowerCase();
+    const buckets = new Map<string, InstalledSkill[]>();
+    for (const skill of skills) {
+      if (
+        q &&
+        !skill.name.toLowerCase().includes(q) &&
+        !(skill.description || '').toLowerCase().includes(q)
+      ) {
+        continue;
+      }
+      const label = skillGroupLabel(skill.name);
+      if (!buckets.has(label)) buckets.set(label, []);
+      buckets.get(label)!.push(skill);
+    }
+    return SKILL_GROUP_ORDER.filter((label) => buckets.has(label)).map(
+      (label) => ({
+        label,
+        items: buckets
+          .get(label)!
+          .slice()
+          .sort((a, b) => a.name.localeCompare(b.name)),
+      }),
+    );
+  }, [skills, skillQuery]);
+  const setGroupSelected = (names: string[], on: boolean) =>
+    setSelectedSkills((current) => {
+      const set = new Set(current);
+      for (const name of names) {
+        if (on) set.add(name);
+        else set.delete(name);
+      }
+      return Array.from(set);
+    });
+  const toggleSkillGroup = (label: string) =>
+    setCollapsedSkillGroups((current) => {
+      const next = new Set(current);
+      if (next.has(label)) next.delete(label);
+      else next.add(label);
+      return next;
+    });
   const templateName = templateId
     ? (templates.find((tpl) => tpl.id === templateId)?.name || templateId)
     : 'Custom';
@@ -2421,37 +2507,125 @@ function AgentPresetToolsSection({
             </div>
           </div>
           <div>
-            <div className="text-xs mb-2" style={{ color: 'var(--color-text-tertiary)' }}>
-              Assigned skills
-            </div>
-            {skills.length > 0 ? (
-              <div className="grid grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
-                {skills.map((skill) => (
-                  <label
-                    key={skill.name}
-                    className="flex items-start gap-2 p-2 rounded-lg cursor-pointer"
-                    style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selectedSkills.includes(skill.name)}
-                      onChange={() => toggleSkill(skill.name)}
-                    />
-                    <span>
-                      <span className="block text-sm" style={{ color: 'var(--color-text)' }}>
-                        {skill.name}
-                      </span>
-                      <span className="block text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                        {skill.source || 'built-in'}{skill.description ? ` • ${skill.description}` : ''}
-                      </span>
-                    </span>
-                  </label>
-                ))}
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                Assigned skills
               </div>
-            ) : (
+              <div className="flex items-center gap-3 text-xs">
+                <span style={{ color: 'var(--color-text-tertiary)' }}>
+                  {selectedSkills.length} assigned
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setSelectedSkills([])}
+                  disabled={selectedSkills.length === 0}
+                  className="cursor-pointer disabled:opacity-40"
+                  style={{ color: 'var(--color-text-secondary)' }}
+                >
+                  Clear all
+                </button>
+              </div>
+            </div>
+            {skills.length === 0 ? (
               <div className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
                 No installed skills found.
               </div>
+            ) : (
+              <>
+                <input
+                  value={skillQuery}
+                  onChange={(e) => setSkillQuery(e.target.value)}
+                  placeholder="Search skills…"
+                  className="w-full px-3 py-2 mb-2 rounded-lg text-sm"
+                  style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                />
+                {groupedSkills.length === 0 ? (
+                  <div className="text-sm py-2" style={{ color: 'var(--color-text-tertiary)' }}>
+                    No skills match “{skillQuery}”.
+                  </div>
+                ) : (
+                  <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                    {groupedSkills.map((group) => {
+                      const names = group.items.map((s) => s.name);
+                      const open = !collapsedSkillGroups.has(group.label);
+                      return (
+                        <div
+                          key={group.label}
+                          className="rounded-lg"
+                          style={{ border: '1px solid var(--color-border)' }}
+                        >
+                          <div className="flex items-center justify-between px-2 py-1.5">
+                            <button
+                              type="button"
+                              onClick={() => toggleSkillGroup(group.label)}
+                              className="flex items-center gap-1.5 text-xs font-medium cursor-pointer"
+                              style={{ color: 'var(--color-text)' }}
+                            >
+                              <ChevronRight
+                                size={12}
+                                style={{ transform: open ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }}
+                              />
+                              {group.label}
+                              <span style={{ color: 'var(--color-text-tertiary)' }}>
+                                ({group.items.length})
+                              </span>
+                            </button>
+                            <div className="flex items-center gap-3 text-xs">
+                              <button
+                                type="button"
+                                onClick={() => setGroupSelected(names, true)}
+                                className="cursor-pointer"
+                                style={{ color: 'var(--color-accent)' }}
+                              >
+                                All
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setGroupSelected(names, false)}
+                                className="cursor-pointer"
+                                style={{ color: 'var(--color-text-secondary)' }}
+                              >
+                                None
+                              </button>
+                            </div>
+                          </div>
+                          {open && (
+                            <div className="grid grid-cols-2 gap-2 px-2 pb-2">
+                              {group.items.map((skill) => {
+                                const checked = selectedSkills.includes(skill.name);
+                                return (
+                                  <label
+                                    key={skill.name}
+                                    className="flex items-start gap-2 p-2 rounded-lg cursor-pointer"
+                                    style={{
+                                      background: 'var(--color-bg-secondary)',
+                                      border: `1px solid ${checked ? 'var(--color-accent)' : 'var(--color-border)'}`,
+                                    }}
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      onChange={() => toggleSkill(skill.name)}
+                                    />
+                                    <span>
+                                      <span className="block text-sm" style={{ color: 'var(--color-text)' }}>
+                                        {skill.name}
+                                      </span>
+                                      <span className="block text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                                        {skill.source || 'built-in'}{skill.description ? ` • ${skill.description}` : ''}
+                                      </span>
+                                    </span>
+                                  </label>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>

@@ -1,0 +1,78 @@
+[skill]
+name = "project-timeline"
+description = "Connect an agent to the project timeline: review a project's tasks/subtasks/milestones vs schedule, then manage it (create/update/delete tasks, subtasks, milestones, categories, notes)"
+version = "0.1.0"
+author = "openjarvis"
+
+# Assign this skill to the select agents that should own the project
+# timeline. Assignment grants the full project toolset (every tool named
+# in a step below is collected into the agent's runtime tools by
+# openjarvis.agents.capabilities._collect_skill_tool_dependencies).
+#
+# When the skill is *run*, only the first two steps do work: pull the
+# project's data and assess timeline health vs its milestones. The
+# remaining steps exist to register the management toolset; with no
+# arguments they validate-and-return without mutating anything (each
+# project_* tool returns a "required" message instead of acting), so
+# running the skill is non-destructive.
+
+[[skill.steps]]
+tool_name = "project_list"
+arguments_template = '{"query": "{project}", "include_tasks": true}'
+output_key = "project_data"
+
+[[skill.steps]]
+tool_name = "think"
+arguments_template = '{"thought": "Review this project timeline. Compare task/subtask status, percent_complete and due dates against the project milestones. Identify what is on track, what is slipping or blocked relative to milestone dates, and the concrete next actions to keep the timeline. Ground every point in the data; if data is missing or stale, say so. Project data: {project_data}"}'
+output_key = "timeline_review"
+
+# --- toolset registration (inert when run without arguments) ---------
+[[skill.steps]]
+tool_name = "project_create_task"
+arguments_template = "{}"
+output_key = "_grant_create_task"
+
+[[skill.steps]]
+tool_name = "project_update_task"
+arguments_template = "{}"
+output_key = "_grant_update_task"
+
+[[skill.steps]]
+tool_name = "project_delete_task"
+arguments_template = "{}"
+output_key = "_grant_delete_task"
+
+[[skill.steps]]
+tool_name = "project_add_note"
+arguments_template = "{}"
+output_key = "_grant_add_note"
+
+[[skill.steps]]
+tool_name = "project_add_milestone"
+arguments_template = "{}"
+output_key = "_grant_add_milestone"
+
+[[skill.steps]]
+tool_name = "project_update_milestone"
+arguments_template = "{}"
+output_key = "_grant_update_milestone"
+
+[[skill.steps]]
+tool_name = "project_delete_milestone"
+arguments_template = "{}"
+output_key = "_grant_delete_milestone"
+
+[[skill.steps]]
+tool_name = "project_add_category"
+arguments_template = "{}"
+output_key = "_grant_add_category"
+
+[[skill.steps]]
+tool_name = "project_rename_category"
+arguments_template = "{}"
+output_key = "_grant_rename_category"
+
+[[skill.steps]]
+tool_name = "project_delete_category"
+arguments_template = "{}"
+output_key = "_grant_delete_category"

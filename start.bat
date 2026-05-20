@@ -104,7 +104,9 @@ REM  Ollama engine (src/openjarvis/engine/ollama.py: use_mmap=false) because
 REM  while OLLAMA_MODELS is on /mnt/f, mmap'd page-faults over the Windows
 REM  mount make inference ~100x too slow. (A derived -nommap model can't be
 REM  used: `ollama create` fails with chtimes EPERM on /mnt/f.)
-set "BACKEND_BASH=UV_PROJECT_ENVIRONMENT=%VENV% uv run --extra server --extra speech --extra speech-tts-kokoro jarvis serve --model qwen2.5-coder:7b"
+REM  OPENJARVIS_OLLAMA_KEEP_ALIVE=5m lets Ollama unload the multi-GB runner
+REM  after idle periods instead of keeping WSL memory pinned forever.
+set "BACKEND_BASH=OPENJARVIS_OLLAMA_KEEP_ALIVE=5m UV_PROJECT_ENVIRONMENT=%VENV% uv run --extra server --extra speech --extra speech-tts-kokoro jarvis serve --model qwen2.5-coder:7b"
 echo.
 echo  Starting OpenJarvis backend  (http://localhost:8000)
 start "OpenJarvis Backend"  conhost.exe cmd.exe /k wsl.exe --cd "%PROJECT%" -e bash -lc "%BACKEND_BASH%"
@@ -151,7 +153,7 @@ if errorlevel 1 (
     echo           engine in ~/.openjarvis/config.toml.
 )
 echo.
-echo  Close the spawned windows (or Ctrl+C inside) to stop.
+echo  Run stop.bat to stop servers, unload Ollama, and release WSL memory.
 echo.
 
 endlocal

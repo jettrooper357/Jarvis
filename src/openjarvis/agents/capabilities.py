@@ -30,7 +30,20 @@ AUTO_COLLABORATION_TOOLS = (
     "managed_agent_update_task",
     "managed_agent_inspect",
 )
-AUTO_PROJECT_TOOLS = ("project_create", "project_create_task", "project_list")
+AUTO_PROJECT_TOOLS = (
+    "project_create",
+    "project_create_task",
+    "project_list",
+    "project_update_task",
+    "project_delete_task",
+    "project_add_note",
+    "project_add_milestone",
+    "project_update_milestone",
+    "project_delete_milestone",
+    "project_add_category",
+    "project_rename_category",
+    "project_delete_category",
+)
 PROJECT_TOOL_ROLES = (
     "chief orchestrator",
     "chief executive officer",

@@ -18,6 +18,13 @@ export type TaskStatus =
 
 export type TaskPriority = 'Low' | 'Medium' | 'High' | 'Critical';
 
+export interface Milestone {
+  id: string;
+  name: string;
+  date: string;
+  done: boolean;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -29,7 +36,8 @@ export interface Project {
   status: ProjectStatus;
   progress: number;
   tags: string[];
-  milestones: unknown[];
+  milestones: Milestone[];
+  categories: string[];
   created_at: number;
   updated_at: number;
 }
@@ -41,6 +49,7 @@ export interface Task {
   title: string;
   description: string;
   type: string;
+  category: string;
   status: TaskStatus;
   assigned_to: string;
   owner: string;
@@ -79,6 +88,11 @@ export interface ProjectDashboard {
   at_risk_projects: Array<{ id: string; name: string; status: string }>;
 }
 
+export interface ProjectBundle {
+  projects: Project[];
+  tasks_by_project: Record<string, Task[]>;
+}
+
 async function j<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const b = await res.json().catch(() => ({ detail: res.statusText }));
@@ -91,6 +105,10 @@ const base = () => `${getBase()}/v1/projects`;
 
 export async function listProjects(): Promise<Project[]> {
   return (await j<{ projects: Project[] }>(await fetch(base()))).projects;
+}
+
+export async function getProjectBundle(): Promise<ProjectBundle> {
+  return j<ProjectBundle>(await fetch(`${base()}/bundle`));
 }
 
 export async function getProject(id: string): Promise<Project> {
