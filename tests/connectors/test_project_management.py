@@ -102,6 +102,34 @@ def test_update_task_dependencies_json(store: ProjectStore):
     assert upd["status"] == "Done"
 
 
+def test_task_titles_strip_trailing_project_phrase(store: ProjectStore):
+    p = store.create_project(name="Iron Saints Music")
+    task = store.create_task(
+        p["id"],
+        title="Raise One for the Old Guard to the Iron Saints Project",
+    )
+    assert task["title"] == "Raise One for the Old Guard"
+
+    updated = store.update_task(
+        task["id"],
+        title="Raise One for the Old Guard to the Iron Saints Project",
+    )
+    assert updated["title"] == "Raise One for the Old Guard"
+
+
+def test_normalize_task_titles_repairs_existing_rows(store: ProjectStore):
+    p = store.create_project(name="Iron Saints Music")
+    task = store.create_task(p["id"], title="Keep")
+    store._conn.execute(
+        "UPDATE tasks SET title = ? WHERE id = ?",
+        ("Raise One for the Old Guard to the Iron Saints Project", task["id"]),
+    )
+    store._conn.commit()
+
+    assert store.normalize_task_titles() == 1
+    assert store.get_task(task["id"])["title"] == "Raise One for the Old Guard"
+
+
 def test_update_missing_task_raises(store: ProjectStore):
     with pytest.raises(KeyError):
         store.update_task("nope", status="Done")

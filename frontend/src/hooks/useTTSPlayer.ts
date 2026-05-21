@@ -17,8 +17,11 @@ function splitSentences(text: string): string[] {
 }
 
 interface UseTTSPlayerOptions {
+  provider?: string;
   voiceId?: string;
   speed?: number;
+  onStart?: () => void;
+  onIdle?: () => void;
 }
 
 /**
@@ -37,7 +40,12 @@ export function useTTSPlayer(opts: UseTTSPlayerOptions = {}) {
   const queueRef = useRef<Promise<void>>(Promise.resolve());
   const abortRef = useRef<AbortController | null>(null);
   const pendingRef = useRef('');
+  const pendingJobsRef = useRef(0);
   const currentSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const onStartRef = useRef(opts.onStart);
+  const onIdleRef = useRef(opts.onIdle);
+  onStartRef.current = opts.onStart;
+  onIdleRef.current = opts.onIdle;
 
   const ensureCtx = (): AudioContext => {
     if (!ctxRef.current) {
@@ -46,10 +54,10 @@ export function useTTSPlayer(opts: UseTTSPlayerOptions = {}) {
     return ctxRef.current;
   };
 
-  const playWav = useCallback(async (wavBytes: ArrayBuffer): Promise<void> => {
+  const playAudio = useCallback(async (audioBytes: ArrayBuffer): Promise<void> => {
     const ctx = ensureCtx();
     if (ctx.state === 'suspended') await ctx.resume();
-    const buf = await ctx.decodeAudioData(wavBytes.slice(0));
+    const buf = await ctx.decodeAudioData(audioBytes.slice(0));
     return new Promise<void>((resolve) => {
       const src = ctx.createBufferSource();
       src.buffer = buf;
@@ -63,14 +71,15 @@ export function useTTSPlayer(opts: UseTTSPlayerOptions = {}) {
     });
   }, []);
 
-  const synthAndPlay = useCallback(
-    async (text: string, signal: AbortSignal) => {
-      if (!text.trim()) return;
+  const synthesizeAudio = useCallback(
+    async (text: string, signal: AbortSignal): Promise<ArrayBuffer[]> => {
+      if (!text.trim()) return [];
       const res = await fetch(`${getBase()}/v1/speech/synthesize/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           text,
+          provider: opts.provider || 'auto',
           voice_id: opts.voiceId || '',
           speed: opts.speed ?? 1.0,
           output_format: 'wav',
@@ -83,6 +92,7 @@ export function useTTSPlayer(opts: UseTTSPlayerOptions = {}) {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let leftover = '';
+      const chunks: ArrayBuffer[] = [];
       while (!signal.aborted) {
         const { value, done } = await reader.read();
         if (done) break;
@@ -100,16 +110,17 @@ export function useTTSPlayer(opts: UseTTSPlayerOptions = {}) {
               const bin = atob(payload.audio);
               const arr = new Uint8Array(bin.length);
               for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-              if (signal.aborted) return;
-              await playWav(arr.buffer);
+              if (signal.aborted) return chunks;
+              chunks.push(arr.buffer);
             }
           } catch (err) {
             if ((err as Error).name !== 'AbortError') throw err;
           }
         }
       }
+      return chunks;
     },
-    [playWav, opts.voiceId, opts.speed],
+    [opts.provider, opts.voiceId, opts.speed],
   );
 
   const enqueue = useCallback(
@@ -117,22 +128,39 @@ export function useTTSPlayer(opts: UseTTSPlayerOptions = {}) {
       if (!text.trim()) return;
       if (!abortRef.current) abortRef.current = new AbortController();
       const signal = abortRef.current.signal;
+      onStartRef.current?.();
       setIsSpeaking(true);
+      pendingJobsRef.current += 1;
+      // Start synthesis immediately, even while earlier audio is still
+      // playing. Playback remains ordered below, but the next sentence is
+      // usually ready by the time the current one ends.
+      const audioPromise = synthesizeAudio(text, signal);
+      audioPromise.catch(() => {});
       queueRef.current = queueRef.current
-        .then(() => synthAndPlay(text, signal))
+        .then(async () => {
+          const chunks = await audioPromise;
+          for (const chunk of chunks) {
+            if (signal.aborted) return;
+            await playAudio(chunk);
+          }
+        })
         .catch((err) => {
           if ((err as Error).name !== 'AbortError') {
             console.warn('TTS error', err);
           }
         })
         .finally(() => {
+          pendingJobsRef.current = Math.max(0, pendingJobsRef.current - 1);
           if (signal.aborted) return;
           queueMicrotask(() => {
-            if (!currentSourceRef.current) setIsSpeaking(false);
+            if (pendingJobsRef.current === 0 && !currentSourceRef.current) {
+              setIsSpeaking(false);
+              onIdleRef.current?.();
+            }
           });
         });
     },
-    [synthAndPlay],
+    [playAudio, synthesizeAudio],
   );
 
   const speak = useCallback((text: string) => enqueue(text), [enqueue]);
@@ -165,7 +193,9 @@ export function useTTSPlayer(opts: UseTTSPlayerOptions = {}) {
     } catch {}
     currentSourceRef.current = null;
     queueRef.current = Promise.resolve();
+    pendingJobsRef.current = 0;
     setIsSpeaking(false);
+    onIdleRef.current?.();
   }, []);
 
   useEffect(

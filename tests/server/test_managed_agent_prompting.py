@@ -42,7 +42,41 @@ def test_project_manager_prompt_has_skill_guardrail():
     assert "knowledge_search" in prompt
 
 
-def test_plain_agent_prompt_has_no_project_guidance():
+def test_managed_system_prompt_includes_personality():
+    prompt = _build_managed_system_prompt(
+        {
+            "id": "worker",
+            "name": "Worker",
+            "config": {
+                "instruction": "Summarize the morning news.",
+                "personality": "Dry, witty British butler. Calls the user 'sir'.",
+            },
+        }
+    )
+
+    assert "Dry, witty British butler" in prompt
+    # Personality block is labeled so the model knows it shapes voice, not task.
+    assert "Personality" in prompt
+    # Instruction is still present.
+    assert "Summarize the morning news." in prompt
+
+
+def test_managed_system_prompt_omits_empty_personality():
+    prompt = _build_managed_system_prompt(
+        {
+            "id": "worker",
+            "name": "Worker",
+            "config": {"personality": "   "},
+        }
+    )
+
+    assert "Personality" not in prompt
+
+
+def test_plain_agent_prompt_has_no_specialist_guidance():
+    """A plain agent gets the today-anchor and generic baseline triage, but
+    none of the role-specialist blocks (chief, project/workflow manager,
+    information officer)."""
     prompt = _build_managed_system_prompt(
         {
             "id": "worker",
@@ -51,5 +85,11 @@ def test_plain_agent_prompt_has_no_project_guidance():
         }
     )
 
-    assert prompt == "Be helpful."
-    assert "project_create" not in prompt
+    # User-supplied system prompt is preserved.
+    assert "Be helpful." in prompt
+    # Today-anchor is always prepended.
+    assert "Today is" in prompt
+    # No role-specialist blocks.
+    assert "Project creation is not a delegated task" not in prompt
+    assert "CRITICAL — task creation discipline" not in prompt
+    assert "information/research authority" not in prompt

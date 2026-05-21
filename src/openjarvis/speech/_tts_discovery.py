@@ -14,7 +14,14 @@ if TYPE_CHECKING:
     from openjarvis.speech.tts import TTSBackend
 
 
-DISCOVERY_ORDER = ["kokoro", "cartesia", "openai"]
+DISCOVERY_ORDER = ["kokoro", "cartesia", "elevenlabs", "openai_tts"]
+PROVIDER_LABELS = {
+    "auto": "Auto",
+    "kokoro": "Kokoro (local)",
+    "cartesia": "Cartesia",
+    "elevenlabs": "ElevenLabs",
+    "openai_tts": "OpenAI",
+}
 
 
 def _create_backend(
@@ -35,7 +42,12 @@ def _create_backend(
             if not api_key:
                 return None
             return backend_cls(api_key=api_key)
-        if key == "openai":
+        if key == "elevenlabs":
+            api_key = os.environ.get("ELEVENLABS_API_KEY", "")
+            if not api_key:
+                return None
+            return backend_cls(api_key=api_key)
+        if key == "openai_tts":
             api_key = os.environ.get("OPENAI_API_KEY", "")
             if not api_key:
                 return None
@@ -62,4 +74,35 @@ def get_tts_backend(config: "JarvisConfig") -> Optional["TTSBackend"]:
     return None
 
 
-__all__ = ["get_tts_backend"]
+def create_tts_backend(key: str, config: "JarvisConfig") -> Optional["TTSBackend"]:
+    """Create a specific TTS backend by provider key."""
+    import openjarvis.speech  # noqa: F401 — trigger registration
+
+    if key == "auto":
+        return get_tts_backend(config)
+    return _create_backend(key, config)
+
+
+def list_tts_providers(config: "JarvisConfig") -> list[dict[str, object]]:
+    """Return provider availability for the web UI."""
+    providers: list[dict[str, object]] = []
+    for key in DISCOVERY_ORDER:
+        backend = _create_backend(key, config)
+        healthy = False
+        if backend is not None:
+            try:
+                healthy = bool(backend.health())
+            except Exception:
+                healthy = False
+        providers.append(
+            {
+                "id": key,
+                "label": PROVIDER_LABELS.get(key, key),
+                "configured": backend is not None,
+                "healthy": healthy,
+            }
+        )
+    return providers
+
+
+__all__ = ["create_tts_backend", "get_tts_backend", "list_tts_providers"]

@@ -15,6 +15,7 @@ def test_harness_creates_and_runs_agent(scenario_harness: ScenarioHarness):
             "instruction": "Say hello.",
         },
     )
+    h.manager.send_message(agent["id"], "Say hello.", mode="queued")
     h.executor.execute_tick(agent["id"])
     updated = h.manager.get_agent(agent["id"])
     assert updated["status"] == "idle"

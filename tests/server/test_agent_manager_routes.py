@@ -243,6 +243,11 @@ class TestAgentManagerRoutes:
         client = TestClient(app)
 
         agent = manager.create_agent(name="runner", agent_type="monitor_operative")
+        manager.create_task(
+            agent["id"],
+            description="Runnable work for run-now route",
+            status="active",
+        )
 
         class _ImmediateThread:
             def __init__(self, target=None, daemon=None):
@@ -411,6 +416,25 @@ class TestAgentManagerStreaming:
         assert "agent_to_user" in directions
         agent_msg = next(m for m in messages if m["direction"] == "agent_to_user")
         assert "persist me" in agent_msg["content"]
+
+    def test_send_message_stream_records_completed_task(self, manager, stream_client):
+        """A streamed chat turn creates an active task and completes it on reply."""
+        agent = manager.create_agent(
+            name="streamer_task",
+            agent_type="simple",
+        )
+        resp = stream_client.post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "top 10 news", "stream": True},
+        )
+        assert resp.status_code == 200
+        assert "data: [DONE]" in resp.text
+
+        tasks = manager.list_tasks(agent["id"])
+        assert len(tasks) == 1
+        assert tasks[0]["description"] == "top 10 news"
+        assert tasks[0]["status"] == "completed"
+        assert "top 10 news" in tasks[0]["progress"]["response_summary"]
 
     def test_send_message_stream_finish_reason(self, manager, stream_client):
         """The final chunk before [DONE] has finish_reason='stop'."""

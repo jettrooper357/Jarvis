@@ -63,10 +63,11 @@ END;
 
 _INSERT_TRACE = """\
 INSERT INTO traces (
-    trace_id, query, agent, model, engine, result,
+    trace_id, parent_trace_id, run_id,
+    query, agent, model, engine, result,
     outcome, feedback, started_at, ended_at,
     total_tokens, total_latency_seconds, metadata, messages
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _INSERT_STEP = """\
@@ -96,13 +97,28 @@ class TraceStore:
         self._conn.execute(_CREATE_STEPS)
         self._conn.execute(_CREATE_FTS)
         self._conn.execute(_FTS_SYNC_INSERT)
-        # Migrate: add messages column if missing (pre-existing databases)
+        # Migrate: add columns added after initial release. Each is a
+        # separate try/except so adding one to an old DB doesn't skip
+        # the rest.
+        for ddl in (
+            "ALTER TABLE traces ADD COLUMN messages TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE traces ADD COLUMN parent_trace_id TEXT",
+            "ALTER TABLE traces ADD COLUMN run_id TEXT",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass  # Column already exists
         try:
             self._conn.execute(
-                "ALTER TABLE traces ADD COLUMN messages TEXT NOT NULL DEFAULT '[]'"
+                "CREATE INDEX IF NOT EXISTS idx_traces_parent "
+                "ON traces(parent_trace_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_traces_run ON traces(run_id)"
             )
         except sqlite3.OperationalError:
-            pass  # Column already exists
+            pass
         self._conn.commit()
 
     def save(self, trace: Trace) -> None:
@@ -111,6 +127,8 @@ class TraceStore:
             _INSERT_TRACE,
             (
                 trace.trace_id,
+                trace.parent_trace_id,
+                trace.run_id,
                 trace.query,
                 trace.agent,
                 trace.model,
@@ -242,6 +260,27 @@ class TraceStore:
         self._conn.commit()
         return cursor.rowcount > 0
 
+    def list_children(self, parent_trace_id: str) -> List[Trace]:
+        """Return every trace whose parent_trace_id matches *parent_trace_id*.
+
+        Ordered by ``started_at`` so the natural reading order is the
+        order delegations were dispatched.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM traces WHERE parent_trace_id = ? "
+            "ORDER BY started_at ASC",
+            (parent_trace_id,),
+        ).fetchall()
+        return [self._row_to_trace(r) for r in rows]
+
+    def list_by_run(self, run_id: str) -> List[Trace]:
+        """Return every trace sharing *run_id*, ordered by start time."""
+        rows = self._conn.execute(
+            "SELECT * FROM traces WHERE run_id = ? ORDER BY started_at ASC",
+            (run_id,),
+        ).fetchall()
+        return [self._row_to_trace(r) for r in rows]
+
     def close(self) -> None:
         """Close the underlying SQLite connection."""
         self._conn.close()
@@ -267,10 +306,15 @@ class TraceStore:
             for sr in step_rows
         ]
         # messages column (index 14) was added after metadata; handle
-        # databases created before the column existed.
+        # databases created before the column existed. parent_trace_id
+        # (15) and run_id (16) were added later still.
         messages_raw = row[14] if len(row) > 14 else "[]"
+        parent_trace_id = row[15] if len(row) > 15 else None
+        run_id = row[16] if len(row) > 16 else None
         return Trace(
             trace_id=trace_id,
+            parent_trace_id=parent_trace_id,
+            run_id=run_id,
             query=row[2],
             agent=row[3],
             model=row[4],

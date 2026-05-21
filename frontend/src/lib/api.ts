@@ -280,6 +280,13 @@ export interface BuiltinVoice {
   name?: string;
 }
 
+export interface TTSProvider {
+  id: string;
+  label: string;
+  configured: boolean;
+  healthy: boolean;
+}
+
 export interface CustomVoice {
   id: string;
   name: string;
@@ -292,15 +299,18 @@ export interface CustomVoice {
 
 export interface VoicesResponse {
   backend: string | null;
+  provider?: string;
+  providers?: TTSProvider[];
   clone_backend: string | null;
   builtin: BuiltinVoice[];
   custom: CustomVoice[];
 }
 
-export async function fetchSpeechVoices(): Promise<VoicesResponse> {
+export async function fetchSpeechVoices(provider = 'auto'): Promise<VoicesResponse> {
   const empty: VoicesResponse = { backend: null, clone_backend: null, builtin: [], custom: [] };
   try {
-    const res = await fetch(`${getBase()}/v1/speech/voices`);
+    const qs = provider ? `?provider=${encodeURIComponent(provider)}` : '';
+    const res = await fetch(`${getBase()}/v1/speech/voices${qs}`);
     if (!res.ok) return empty;
     const data = await res.json();
     // Tolerate the old shape ({voices: string[], backend}) for any caller
@@ -315,6 +325,8 @@ export async function fetchSpeechVoices(): Promise<VoicesResponse> {
     }
     return {
       backend: data.backend ?? null,
+      provider: data.provider ?? provider,
+      providers: data.providers ?? [],
       clone_backend: data.clone_backend ?? null,
       builtin: data.builtin ?? [],
       custom: data.custom ?? [],
@@ -374,12 +386,13 @@ export async function synthesizeProbe(
   text = 'Hello.',
   voiceId = '',
   speed = 1.0,
+  provider = 'auto',
 ): Promise<{ ok: boolean; bytes: number; reason?: string; blob?: Blob }> {
   try {
     const res = await fetch(`${getBase()}/v1/speech/synthesize`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, output_format: 'wav', voice_id: voiceId, speed }),
+      body: JSON.stringify({ text, output_format: 'wav', voice_id: voiceId, speed, provider }),
     });
     if (!res.ok) {
       let detail = '';
@@ -449,7 +462,7 @@ export interface ManagedAgent {
   auto_tools?: string[];
   effective_tools?: string[];
   knowledge_enabled?: boolean;
-  status: 'idle' | 'running' | 'paused' | 'error' | 'archived' | 'needs_attention' | 'budget_exceeded' | 'stalled';
+  status: 'idle' | 'running' | 'paused' | 'error' | 'archived' | 'needs_attention' | 'budget_exceeded' | 'stalled' | 'input_required' | 'auth_required' | 'waiting_on_tool';
   summary_memory: string;
   created_at: number;
   updated_at: number;
@@ -600,6 +613,86 @@ export async function pauseManagedAgent(agentId: string): Promise<void> {
 export async function resumeManagedAgent(agentId: string): Promise<void> {
   const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}/resume`, { method: 'POST' });
   if (!res.ok) throw new Error(`Failed: ${res.status}`);
+}
+
+export interface ChiefPendingQuestion {
+  question: string;
+  reason: string;
+  expected_response_type: string;
+  options?: string[];
+}
+
+export interface ChiefPendingResponse {
+  pending: boolean;
+  pause_kind?: 'input_required' | 'auth_required';
+  question?: ChiefPendingQuestion;
+  checkpoint_id?: string;
+  run_id?: string | null;
+  turns_so_far?: number;
+}
+
+export async function fetchChiefPending(
+  agentId: string,
+): Promise<ChiefPendingResponse> {
+  const res = await fetch(
+    `${getBase()}/v1/managed-agents/${agentId}/chief-pending`,
+  );
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export interface ChiefResumeResult {
+  agent_id: string;
+  response: string;
+  status: string | null;
+}
+
+export interface TraceTreeNode {
+  id: string;
+  parent_trace_id: string | null;
+  run_id: string | null;
+  agent: string;
+  outcome: string | null;
+  duration: number;
+  started_at: number;
+  model: string;
+  result_preview: string;
+  metadata: Record<string, unknown>;
+  children: TraceTreeNode[];
+}
+
+export async function fetchTraceTree(
+  agentId: string,
+  traceId: string,
+): Promise<TraceTreeNode> {
+  const res = await fetch(
+    `${getBase()}/v1/managed-agents/${agentId}/traces/${traceId}/tree`,
+  );
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(body.detail || `Failed: ${res.status}`);
+  }
+  const data = await res.json();
+  return data.root as TraceTreeNode;
+}
+
+export async function resumeChief(
+  agentId: string,
+  answer: string,
+): Promise<ChiefResumeResult> {
+  const res = await fetch(
+    `${getBase()}/v1/managed-agents/${agentId}/chief-resume`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answer }),
+    },
+  );
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(body.detail || `Failed: ${res.status}`);
+  }
+  return res.json();
 }
 
 export async function fetchAgentTasks(

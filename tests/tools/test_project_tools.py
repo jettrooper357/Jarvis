@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from openjarvis.projects.store import ProjectStore
 from openjarvis.tools.project_tools import (
     ProjectAddCategoryTool,
@@ -37,7 +39,7 @@ def test_project_create_task_returns_project_task_id(monkeypatch, tmp_path):
 
     result = ProjectCreateTaskTool().execute(
         project_id=project["id"],
-        title="Set up launch plan",
+        title="add a task to release a new song called Raise One for the Old Guard",
         status="Backlog",
     )
 
@@ -45,7 +47,25 @@ def test_project_create_task_returns_project_task_id(monkeypatch, tmp_path):
     assert result.metadata["project_id"] == project["id"]
     assert result.metadata["project_task_id"]
     created_task = store.get_task(result.metadata["project_task_id"])
-    assert created_task["title"] == "Set up launch plan"
+    assert created_task["title"] == "Raise One for the Old Guard"
+    today = datetime.now().date()
+    assert created_task["start_date"] == today.isoformat()
+    assert created_task["due_date"] == (today + timedelta(days=1)).isoformat()
+
+
+def test_project_create_task_strips_trailing_project_phrase(monkeypatch, tmp_path):
+    store = ProjectStore(tmp_path / "projects.db")
+    project = store.create_project(name="Iron Saints Music")
+    monkeypatch.setattr("openjarvis.tools.project_tools._project_store", lambda: store)
+
+    result = ProjectCreateTaskTool().execute(
+        project_id=project["id"],
+        title="Raise One for the Old Guard to the Iron Saints Project",
+    )
+
+    assert result.success is True
+    created_task = store.get_task(result.metadata["project_task_id"])
+    assert created_task["title"] == "Raise One for the Old Guard"
 
 
 def test_project_list_tool_filters_projects(monkeypatch, tmp_path):

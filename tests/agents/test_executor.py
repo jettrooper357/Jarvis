@@ -38,11 +38,16 @@ def executor(manager, event_bus):
     return ex
 
 
+def _queue_work(manager, agent_id: str) -> None:
+    manager.send_message(agent_id, "run this tick", mode="queued")
+
+
 class TestExecutorBasic:
     def test_execute_tick_publishes_start_end_events(
         self, executor, manager, event_bus
     ):
         agent = manager.create_agent(name="test", agent_type="monitor_operative")
+        _queue_work(manager, agent["id"])
         events = []
         event_bus.subscribe(EventType.AGENT_TICK_START, lambda e: events.append(e))
         event_bus.subscribe(EventType.AGENT_TICK_END, lambda e: events.append(e))
@@ -57,6 +62,7 @@ class TestExecutorBasic:
 
     def test_execute_tick_updates_run_stats(self, executor, manager):
         agent = manager.create_agent(name="test", agent_type="monitor_operative")
+        _queue_work(manager, agent["id"])
 
         rv = AgentResult(content="result text")
         with patch.object(executor, "_invoke_agent", return_value=rv):
@@ -68,6 +74,7 @@ class TestExecutorBasic:
 
     def test_execute_tick_sets_running_then_idle(self, executor, manager):
         agent = manager.create_agent(name="test", agent_type="monitor_operative")
+        _queue_work(manager, agent["id"])
         statuses = []
 
         original_start = manager.start_tick
@@ -87,6 +94,7 @@ class TestExecutorBasic:
 
     def test_execute_tick_handles_fatal_error(self, executor, manager, event_bus):
         agent = manager.create_agent(name="test", agent_type="monitor_operative")
+        _queue_work(manager, agent["id"])
         errors = []
         event_bus.subscribe(EventType.AGENT_TICK_ERROR, lambda e: errors.append(e))
 
@@ -100,6 +108,7 @@ class TestExecutorBasic:
 
     def test_execute_tick_retries_retryable_error(self, executor, manager):
         agent = manager.create_agent(name="test", agent_type="monitor_operative")
+        _queue_work(manager, agent["id"])
         call_count = 0
 
         def flaky_invoke(*args, **kwargs):
@@ -118,6 +127,7 @@ class TestExecutorBasic:
 
     def test_execute_tick_gives_up_after_max_retries(self, executor, manager):
         agent = manager.create_agent(name="test", agent_type="monitor_operative")
+        _queue_work(manager, agent["id"])
 
         with patch.object(
             executor, "_invoke_agent", side_effect=RetryableError("always fails")
@@ -129,6 +139,7 @@ class TestExecutorBasic:
 
     def test_execute_tick_concurrency_guard(self, executor, manager):
         agent = manager.create_agent(name="test", agent_type="monitor_operative")
+        _queue_work(manager, agent["id"])
         manager.start_tick(agent["id"])  # Simulate already running
 
         # Second tick should handle the ValueError from start_tick
@@ -138,6 +149,29 @@ class TestExecutorBasic:
 
         # Agent should still be running (first tick owns it)
         assert manager.get_agent(agent["id"])["status"] == "running"
+
+    def test_execute_tick_skips_idle_agent_without_work(self, executor, manager):
+        agent = manager.create_agent(name="test", agent_type="monitor_operative")
+
+        with patch.object(executor, "_invoke_agent") as invoke:
+            executor.execute_tick(agent["id"])
+
+        invoke.assert_not_called()
+        updated = manager.get_agent(agent["id"])
+        assert updated["status"] == "idle"
+        assert updated["total_runs"] == 0
+
+    def test_execute_tick_force_bypasses_work_gate(self, executor, manager):
+        agent = manager.create_agent(name="test", agent_type="monitor_operative")
+
+        rv = AgentResult(content="forced result")
+        with patch.object(executor, "_invoke_agent", return_value=rv) as invoke:
+            executor.execute_tick(agent["id"], force=True)
+
+        invoke.assert_called_once()
+        updated = manager.get_agent(agent["id"])
+        assert updated["status"] == "idle"
+        assert updated["total_runs"] == 1
 
 
 def test_finalize_tick_reads_agent_result_metadata(tmp_path):

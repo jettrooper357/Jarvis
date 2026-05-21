@@ -37,7 +37,11 @@ import {
   sendblueRegisterWebhook,
   sendblueTest,
   sendblueHealth,
+  fetchChiefPending,
+  resumeChief,
+  fetchTraceTree,
 } from '../lib/api';
+import type { TraceTreeNode } from '../lib/api';
 import type { AgentTask, ChannelBinding, AgentTemplate, AgentMessage, ManagedAgent, LearningLogEntry, AgentTrace, ToolInfo, InstalledSkill, MissionControlData, MissionControlProject, MissionControlTask } from '../lib/api';
 import { useAgentEvents, type AgentEvent } from '../lib/useAgentEvents';
 import {
@@ -67,6 +71,13 @@ import {
   Check,
   Pencil,
   Maximize2,
+  Search,
+  SlidersHorizontal,
+  PackageCheck,
+  ShieldCheck,
+  Network,
+  Boxes,
+  Eye,
 } from 'lucide-react';
 import { SOURCE_CATALOG } from '../types/connectors';
 import type { ConnectRequest } from '../types/connectors';
@@ -86,7 +97,10 @@ type AgentStatus =
   | 'archived'
   | 'needs_attention'
   | 'budget_exceeded'
-  | 'stalled';
+  | 'stalled'
+  | 'input_required'
+  | 'auth_required'
+  | 'waiting_on_tool';
 
 const STATUS_COLOR: Record<AgentStatus, string> = {
   idle: 'var(--color-success)',
@@ -97,6 +111,9 @@ const STATUS_COLOR: Record<AgentStatus, string> = {
   needs_attention: 'var(--color-warning)',
   budget_exceeded: 'var(--color-warning)',
   stalled: 'var(--color-warning)',
+  input_required: 'var(--color-accent)',
+  auth_required: 'var(--color-warning)',
+  waiting_on_tool: 'var(--color-accent)',
 };
 
 function statusColor(s: string): string {
@@ -108,6 +125,7 @@ const AGENT_ACTIVITY_EVENTS = [
   'agent_tick_start',
   'agent_tick_end',
   'agent_tick_error',
+  'agent_message_received',
 ] as const;
 
 /**
@@ -116,13 +134,17 @@ const AGENT_ACTIVITY_EVENTS = [
  * agents it joins are currently working / talking to each other. Otherwise
  * it renders as the standard static border line.
  */
-function connectorStyle(active: boolean): CSSProperties {
+function connectorStyle(active: boolean, orientation: 'vertical' | 'horizontal' = 'vertical'): CSSProperties {
   if (!active) return { background: 'var(--color-border)' };
+  const isHorizontal = orientation === 'horizontal';
   return {
     backgroundImage:
-      'linear-gradient(180deg, transparent 0%, var(--color-accent) 50%, transparent 100%)',
-    backgroundSize: '100% 200%',
-    animation: 'pulse-travel-y 1.4s linear infinite',
+      isHorizontal
+        ? 'linear-gradient(90deg, transparent 0%, var(--color-accent) 50%, transparent 100%)'
+        : 'linear-gradient(180deg, transparent 0%, var(--color-accent) 50%, transparent 100%)',
+    backgroundSize: isHorizontal ? '200% 100%' : '100% 200%',
+    animation: `${isHorizontal ? 'pulse-travel' : 'pulse-travel-y'} 1.1s linear infinite`,
+    boxShadow: '0 0 10px color-mix(in srgb, var(--color-accent) 45%, transparent)',
   };
 }
 
@@ -470,6 +492,44 @@ function getOrgRoots(agents: ManagedAgent[]): ManagedAgent[] {
   return agents
     .filter((agent) => !agent.manager_agent_id || !knownIds.has(agent.manager_agent_id))
     .sort(compareAgentsForOrg);
+}
+
+function buildAgentPathToRoot(agentId: string, agents: ManagedAgent[]): string[] {
+  const path: string[] = [];
+  const seen = new Set<string>();
+  let current = findAgentById(agents, agentId);
+  while (current && !seen.has(current.id)) {
+    path.push(current.id);
+    seen.add(current.id);
+    current = findAgentById(agents, current.manager_agent_id);
+  }
+  return path;
+}
+
+function getOrgPathEdgeKeys(
+  fromAgentId: string,
+  toAgentId: string,
+  agents: ManagedAgent[],
+): string[] {
+  if (!fromAgentId || !toAgentId || fromAgentId === toAgentId) return [];
+  const fromPath = buildAgentPathToRoot(fromAgentId, agents);
+  const toPath = buildAgentPathToRoot(toAgentId, agents);
+  if (!fromPath.length || !toPath.length) return [];
+
+  const toIndex = new Map(toPath.map((id, index) => [id, index]));
+  const lca = fromPath.find((id) => toIndex.has(id));
+  if (!lca) return [];
+
+  const edges = new Set<string>();
+  for (const id of fromPath) {
+    if (id === lca) break;
+    edges.add(id);
+  }
+  for (const id of toPath) {
+    if (id === lca) break;
+    edges.add(id);
+  }
+  return Array.from(edges);
 }
 
 const TEMPLATE_METADATA_KEYS = new Set(['id', 'name', 'description', 'source', 'editable']);
@@ -2077,6 +2137,65 @@ function AgentInstructionSection({ agent, onAgentUpdated }: { agent: ManagedAgen
   );
 }
 
+function AgentPersonalitySection({ agent, onAgentUpdated }: { agent: ManagedAgent; onAgentUpdated: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const currentPersonality = (agent.config?.personality as string) || '';
+
+  async function save() {
+    try {
+      const newConfig = { ...(agent.config || {}), personality: draft.trim() };
+      await updateManagedAgent(agent.id, { config: newConfig });
+      onAgentUpdated();
+    } catch { /* ignore */ }
+    setEditing(false);
+  }
+
+  return (
+    <div
+      className="p-3 rounded-lg"
+      style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
+    >
+      <div className="flex items-center gap-2 mb-2">
+        <h3 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>Personality</h3>
+        <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+          Voice, tone, mannerisms — shapes how the agent replies.
+        </span>
+        {!editing && (
+          <button
+            onClick={() => { setDraft(currentPersonality); setEditing(true); }}
+            className="text-xs px-2 py-0.5 rounded cursor-pointer ml-auto"
+            style={{ color: 'var(--color-accent)', border: '1px solid var(--color-accent)', opacity: 0.8 }}
+          >
+            Edit
+          </button>
+        )}
+      </div>
+      {editing ? (
+        <div className="space-y-2">
+          <textarea
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            rows={4}
+            placeholder="e.g., Dry, witty British butler. Calls the user 'sir'. Avoids slang."
+            className="w-full px-3 py-2 rounded-lg text-sm bg-transparent resize-none"
+            style={{ border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+          />
+          <div className="flex gap-2">
+            <button onClick={save} className="text-xs px-3 py-1 rounded font-medium cursor-pointer" style={{ background: 'var(--color-accent)', color: 'var(--color-on-accent)' }}>Save</button>
+            <button onClick={() => setEditing(false)} className="text-xs px-3 py-1 rounded cursor-pointer" style={{ color: 'var(--color-text-tertiary)', border: '1px solid var(--color-border)' }}>Cancel</button>
+          </div>
+        </div>
+      ) : (
+        <p className="text-sm whitespace-pre-wrap" style={{ color: currentPersonality ? 'var(--color-text)' : 'var(--color-text-tertiary)' }}>
+          {currentPersonality || '(No personality set — click Edit to give this agent a voice)'}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function AgentConfigGrid({ agent, onAgentUpdated }: { agent: ManagedAgent; onAgentUpdated: () => void }) {
   const [editingModel, setEditingModel] = useState(false);
   const [changingModel, setChangingModel] = useState(false);
@@ -2230,6 +2349,178 @@ function AgentConfigGrid({ agent, onAgentUpdated }: { agent: ManagedAgent; onAge
   );
 }
 
+function ChiefPendingCard({
+  agent,
+  onResumed,
+}: {
+  agent: ManagedAgent;
+  onResumed: () => Promise<void> | void;
+}) {
+  const [question, setQuestion] = useState<string>('');
+  const [reason, setReason] = useState<string>('');
+  const [options, setOptions] = useState<string[]>([]);
+  const [responseType, setResponseType] = useState<string>('free_text');
+  const [answer, setAnswer] = useState<string>('');
+  const [loading, setLoading] = useState<boolean>(true);
+  const [submitting, setSubmitting] = useState<boolean>(false);
+
+  const isCredential = responseType === 'credential';
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    fetchChiefPending(agent.id)
+      .then((res) => {
+        if (cancelled) return;
+        if (res.pending && res.question) {
+          setQuestion(res.question.question || '');
+          setReason(res.question.reason || '');
+          setOptions(res.question.options || []);
+          setResponseType(res.question.expected_response_type || 'free_text');
+        } else {
+          setQuestion('');
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setQuestion('');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agent.id, agent.status]);
+
+  if (loading) {
+    return (
+      <div
+        className="mb-4 p-3 rounded-lg text-sm"
+        style={{
+          background: 'var(--color-bg-secondary)',
+          border: '1px solid var(--color-border)',
+          color: 'var(--color-text-secondary)',
+        }}
+      >
+        Loading pending question...
+      </div>
+    );
+  }
+
+  if (!question) {
+    return null;
+  }
+
+  async function handleSubmit() {
+    const trimmed = answer.trim();
+    if (!trimmed) {
+      toast.error('Answer is required');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const result = await resumeChief(agent.id, trimmed);
+      toast.success('Chief resumed', {
+        description: result.response.slice(0, 240) || undefined,
+      });
+      setAnswer('');
+      await onResumed();
+    } catch (err: any) {
+      toast.error('Resume failed', {
+        description: err?.message || 'Unknown error',
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const borderColor = isCredential ? 'var(--color-warning)' : 'var(--color-accent)';
+  const accentColor = isCredential ? 'var(--color-warning)' : 'var(--color-accent)';
+  const headerLabel = isCredential
+    ? 'Chief needs credentials'
+    : 'Chief is waiting on your answer';
+
+  return (
+    <div
+      className="mb-4 p-4 rounded-lg"
+      style={{
+        background: 'var(--color-bg-secondary)',
+        border: `1px solid ${borderColor}40`,
+      }}
+    >
+      <div className="flex items-center gap-2 mb-2">
+        <MessageSquare size={15} style={{ color: accentColor }} />
+        <span className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+          {headerLabel}
+        </span>
+      </div>
+      <div className="mb-2 text-sm" style={{ color: 'var(--color-text)' }}>
+        {question}
+      </div>
+      {reason && (
+        <div className="mb-3 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+          Why: {reason}
+        </div>
+      )}
+      {options.length > 0 && (
+        <div className="mb-3 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+          Options: {options.join(', ')}
+        </div>
+      )}
+      {isCredential ? (
+        <input
+          type="password"
+          value={answer}
+          onChange={(e) => setAnswer(e.target.value)}
+          placeholder="Paste the credential..."
+          autoComplete="new-password"
+          className="w-full px-3 py-2 rounded-lg text-sm mb-3"
+          style={{
+            background: 'var(--color-bg)',
+            border: '1px solid var(--color-border)',
+            color: 'var(--color-text)',
+          }}
+          disabled={submitting}
+        />
+      ) : (
+        <textarea
+          value={answer}
+          onChange={(e) => setAnswer(e.target.value)}
+          placeholder="Type your answer..."
+          rows={3}
+          className="w-full px-3 py-2 rounded-lg text-sm mb-3"
+          style={{
+            background: 'var(--color-bg)',
+            border: '1px solid var(--color-border)',
+            color: 'var(--color-text)',
+            resize: 'vertical',
+          }}
+          disabled={submitting}
+        />
+      )}
+      {isCredential && (
+        <div className="mb-3 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+          The chief sees your raw input on the resumed turn only. The
+          trace store and the message log persist a redacted placeholder,
+          not the value itself. Treat this as a one-time secret transfer:
+          the chief can use it within its current run, but it will not
+          survive in any audit log.
+        </div>
+      )}
+      <div className="flex justify-end">
+        <button
+          onClick={handleSubmit}
+          disabled={submitting || !answer.trim()}
+          className="px-3 py-1.5 rounded-lg text-xs cursor-pointer disabled:opacity-50"
+          style={{ background: accentColor, color: 'var(--color-on-accent)' }}
+        >
+          {submitting ? 'Resuming...' : isCredential ? 'Submit credential' : 'Submit answer'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // Skills have no server-side category, so group them by name keywords for
 // the Capability Inspector. Order is intentional (most relevant first).
 const SKILL_GROUPS: { label: string; match: (n: string) => boolean }[] = [
@@ -2273,12 +2564,14 @@ const SKILL_GROUP_ORDER = [...SKILL_GROUPS.map((g) => g.label), 'Other'];
 
 function AgentPresetToolsSection({
   agent,
+  managedAgents,
   templates,
   skills,
   onAgentUpdated,
   onOpenLibrary,
 }: {
   agent: ManagedAgent;
+  managedAgents: ManagedAgent[];
   templates: AgentTemplate[];
   skills: InstalledSkill[];
   onAgentUpdated: () => void;
@@ -2308,6 +2601,9 @@ function AgentPresetToolsSection({
   const [saving, setSaving] = useState(false);
   const [presetId, setPresetId] = useState(templateId);
   const [selectedSkills, setSelectedSkills] = useState<string[]>(configuredSkills);
+  const [chiefMode, setChiefMode] = useState<boolean>(
+    (agent.config?.orchestrator_mode as string | undefined) === 'chief',
+  );
   const [skillQuery, setSkillQuery] = useState('');
   const [collapsedSkillGroups, setCollapsedSkillGroups] = useState<Set<string>>(
     new Set(),
@@ -2356,39 +2652,104 @@ function AgentPresetToolsSection({
   const templateName = templateId
     ? (templates.find((tpl) => tpl.id === templateId)?.name || templateId)
     : 'Custom';
+  const manager = findAgentById(managedAgents, agent.manager_agent_id);
+  const directReports = managedAgents.filter((candidate) => candidate.manager_agent_id === agent.id);
+  const hierarchyPath = buildManagementChain(agent, managedAgents)
+    .map((entry) => entry.name)
+    .join(' > ');
+  const dataSources = Array.from(
+    new Set(
+      [
+        ...((agent.config?.data_sources as unknown[]) || []),
+        ...((agent.config?.connectors as unknown[]) || []),
+        ...((agent.config?.sources as unknown[]) || []),
+      ]
+        .filter((item): item is string => typeof item === 'string')
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  );
+  const inheritedSkillCount = Math.max(0, effectiveSkills.length - configuredSkills.length);
+  const filteredSkillNames = new Set(groupedSkills.flatMap((group) => group.items.map((skill) => skill.name)));
 
   useEffect(() => {
     setEditing(false);
     setSaving(false);
     setPresetId(templateId);
     setSelectedSkills(configuredSkills);
+    setChiefMode(
+      (agent.config?.orchestrator_mode as string | undefined) === 'chief',
+    );
   }, [agent.id, templateId, configuredSkills.join('|')]);
 
-  const renderBadgeGroup = (label: string, items: string[]) => (
-    <div>
-      <div className="text-xs mb-1" style={{ color: 'var(--color-text-tertiary)' }}>
-        {label}
+  const panelStyle: CSSProperties = {
+    background:
+      'linear-gradient(180deg, color-mix(in srgb, var(--color-bg-secondary) 94%, var(--color-accent) 6%), var(--color-bg-secondary))',
+    border: '1px solid color-mix(in srgb, var(--color-border) 72%, var(--color-accent) 28%)',
+    boxShadow: '0 16px 50px rgba(0, 0, 0, 0.18)',
+  };
+  const insetStyle: CSSProperties = {
+    background: 'color-mix(in srgb, var(--color-bg) 82%, var(--color-accent) 18%)',
+    border: '1px solid color-mix(in srgb, var(--color-border) 72%, var(--color-accent) 28%)',
+  };
+  const metricCard = (
+    label: string,
+    value: string | number,
+    Icon: typeof PackageCheck,
+    sublabel?: string,
+  ) => (
+    <div className="flex items-center gap-3 px-4 py-3 min-w-0" style={insetStyle}>
+      <div
+        className="h-9 w-9 rounded-lg flex items-center justify-center shrink-0"
+        style={{
+          background: 'color-mix(in srgb, var(--color-accent) 16%, transparent)',
+          color: 'var(--color-accent)',
+          border: '1px solid color-mix(in srgb, var(--color-accent) 38%, transparent)',
+        }}
+      >
+        <Icon size={17} />
       </div>
-      {items.length > 0 ? (
-        <div className="flex flex-wrap gap-1.5">
-          {items.map((item) => (
-            <span
-              key={`${label}-${item}`}
-              className="px-2 py-0.5 rounded text-xs font-mono"
-              style={{
-                background: 'var(--color-bg)',
-                border: '1px solid var(--color-border)',
-                color: 'var(--color-text-secondary)',
-              }}
-            >
-              {item}
-            </span>
-          ))}
+      <div className="min-w-0">
+        <div className="text-[11px] uppercase" style={{ color: 'var(--color-text-tertiary)' }}>
+          {label}
         </div>
-      ) : (
-        <div className="text-sm" style={{ color: 'var(--color-text)' }}>None</div>
-      )}
+        <div className="text-lg font-semibold leading-tight truncate" style={{ color: 'var(--color-text)' }}>
+          {value}
+        </div>
+        {sublabel && (
+          <div className="text-xs truncate" style={{ color: 'var(--color-text-tertiary)' }}>
+            {sublabel}
+          </div>
+        )}
+      </div>
     </div>
+  );
+  const capabilityChip = (item: string, removable = false) => (
+    <span
+      key={item}
+      className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs"
+      style={{
+        background: 'color-mix(in srgb, var(--color-bg) 72%, var(--color-accent) 12%)',
+        border: '1px solid var(--color-border)',
+        color: 'var(--color-text-secondary)',
+      }}
+    >
+      {item}
+      {removable && (
+        <button
+          type="button"
+          onClick={() => toggleSkill(item)}
+          className="cursor-pointer"
+          style={{ color: 'var(--color-text-tertiary)' }}
+          aria-label={`Remove ${item}`}
+        >
+          <X size={12} />
+        </button>
+      )}
+    </span>
+  );
+  const renderBadgeGroup = (label: string, items: string[]) => (
+    <div key={label}>{items.map((item) => capabilityChip(item))}</div>
   );
 
   async function handleSave() {
@@ -2402,6 +2763,11 @@ function AgentPresetToolsSection({
       );
       if (!presetId) {
         delete applied.config.template_id;
+      }
+      if (chiefMode) {
+        applied.config.orchestrator_mode = 'chief';
+      } else {
+        delete applied.config.orchestrator_mode;
       }
       const body: Parameters<typeof updateManagedAgent>[1] = {
         config: applied.config,
@@ -2427,6 +2793,299 @@ function AgentPresetToolsSection({
         : [...current, skillName],
     );
   }
+
+  return (
+    <section className="rounded-2xl overflow-hidden" style={panelStyle}>
+      <div className="px-5 py-4 border-b" style={{ borderColor: 'color-mix(in srgb, var(--color-border) 78%, var(--color-accent) 22%)' }}>
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+          <div>
+            <div className="text-xs uppercase font-semibold" style={{ color: 'var(--color-accent)' }}>
+              Jarvis Agent Overview
+            </div>
+            <h3 className="mt-1 text-xl font-semibold" style={{ color: 'var(--color-text)' }}>
+              Capability Inspector
+            </h3>
+          </div>
+          <div className="grid gap-2 text-sm md:grid-cols-4 xl:min-w-[760px]">
+            <div className="px-3 py-2" style={insetStyle}>
+              <div className="text-[11px] uppercase" style={{ color: 'var(--color-text-tertiary)' }}>Agent Name</div>
+              <div className="truncate" style={{ color: 'var(--color-text)' }}>{agent.name}</div>
+            </div>
+            <div className="px-3 py-2" style={insetStyle}>
+              <div className="text-[11px] uppercase" style={{ color: 'var(--color-text-tertiary)' }}>Role</div>
+              <div className="truncate" style={{ color: 'var(--color-text)' }}>{roleLabel(agent)}</div>
+            </div>
+            <div className="px-3 py-2" style={insetStyle}>
+              <div className="text-[11px] uppercase" style={{ color: 'var(--color-text-tertiary)' }}>Status</div>
+              <div className="flex items-center gap-2" style={{ color: 'var(--color-text)' }}>
+                <StatusDot status={agent.status} />
+                {agent.status.replace('_', ' ')}
+              </div>
+            </div>
+            <div className="px-3 py-2" style={insetStyle}>
+              <div className="text-[11px] uppercase" style={{ color: 'var(--color-text-tertiary)' }}>Hierarchy Path</div>
+              <div className="truncate" style={{ color: 'var(--color-text)' }}>{hierarchyPath || agent.name}</div>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-5">
+          {metricCard('Preset', templateName, PackageCheck, presetId ? 'Template' : 'Custom')}
+          {metricCard('Assigned Skills', selectedSkills.length, Network)}
+          {metricCard('Effective Skills', effectiveSkills.length, ShieldCheck, `${inheritedSkillCount} inherited`)}
+          {metricCard('Data Sources', dataSources.length, Database, agent.knowledge_enabled ? 'Knowledge on' : 'Knowledge off')}
+          {metricCard('Active Tools', effectiveTools.length, Boxes)}
+        </div>
+      </div>
+
+      <div className="grid gap-4 p-4 xl:grid-cols-[320px_minmax(520px,1fr)] 2xl:grid-cols-[340px_minmax(540px,1fr)_390px]">
+        <aside className="space-y-4">
+          <div className="rounded-xl p-4" style={insetStyle}>
+            <div className="mb-4 flex items-center justify-between">
+              <h4 className="text-sm font-semibold uppercase" style={{ color: 'var(--color-text-secondary)' }}>Agent Configuration</h4>
+              <SlidersHorizontal size={16} style={{ color: 'var(--color-text-tertiary)' }} />
+            </div>
+            <label className="block text-sm">
+              <span className="mb-1 block text-xs" style={{ color: 'var(--color-text-tertiary)' }}>Preset</span>
+              <select
+                value={presetId}
+                onChange={(e) => {
+                  setPresetId(e.target.value);
+                  setEditing(true);
+                }}
+                className="w-full rounded-lg px-3 py-2 text-sm outline-none"
+                style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+              >
+                <option value="">Custom</option>
+                {templates.map((template) => (
+                  <option key={template.id} value={template.id}>{template.name}</option>
+                ))}
+              </select>
+            </label>
+            <label className="mt-4 flex items-center justify-between gap-3 text-sm" style={{ color: 'var(--color-text)' }}>
+              <span>
+                <span className="block">Knowledge Access</span>
+                <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>Organization knowledge</span>
+              </span>
+              <span className="relative inline-flex h-6 w-11 items-center rounded-full" style={{ background: agent.knowledge_enabled ? 'var(--color-accent)' : 'var(--color-bg)', border: '1px solid var(--color-border)' }}>
+                <span className="inline-block h-4 w-4 rounded-full transition-transform" style={{ background: 'var(--color-text)', transform: agent.knowledge_enabled ? 'translateX(22px)' : 'translateX(4px)' }} />
+              </span>
+            </label>
+            <label className="mt-3 flex items-center gap-2 rounded-lg p-2 text-sm cursor-pointer" style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}>
+              <input
+                type="checkbox"
+                checked={chiefMode}
+                onChange={(e) => {
+                  setChiefMode(e.target.checked);
+                  setEditing(true);
+                }}
+                className="cursor-pointer"
+              />
+              <span style={{ color: 'var(--color-text-secondary)' }}>Chief Orchestrator</span>
+            </label>
+          </div>
+
+          <div className="rounded-xl p-4" style={insetStyle}>
+            <div className="mb-3 flex items-center justify-between">
+              <h4 className="text-sm font-semibold uppercase" style={{ color: 'var(--color-text-secondary)' }}>Data Sources</h4>
+              <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{dataSources.length || 3} connected</span>
+            </div>
+            <div className="space-y-2">
+              {(dataSources.length ? dataSources : ['Knowledge index', 'Project memory', 'Agent messages']).map((source) => (
+                <div key={source} className="flex items-center justify-between rounded-lg px-3 py-2 text-sm" style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}>
+                  <span className="truncate" style={{ color: 'var(--color-text)' }}>{source}</span>
+                  <span className="h-2 w-2 rounded-full" style={{ background: 'var(--color-success)' }} />
+                </div>
+              ))}
+            </div>
+            <button type="button" onClick={onOpenLibrary} className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm cursor-pointer" style={{ border: '1px solid var(--color-accent)', color: 'var(--color-accent)' }}>
+              <Plus size={15} />
+              Add Data Source
+            </button>
+          </div>
+        </aside>
+
+        <main className="rounded-xl p-4 min-w-0" style={insetStyle}>
+          <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <h4 className="text-sm font-semibold uppercase" style={{ color: 'var(--color-text-secondary)' }}>Skills Library</h4>
+            <div className="flex gap-2">
+              <div className="relative min-w-[220px]">
+                <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: 'var(--color-text-tertiary)' }} />
+                <input
+                  value={skillQuery}
+                  onChange={(e) => setSkillQuery(e.target.value)}
+                  placeholder="Search skills..."
+                  className="w-full rounded-lg py-2 pl-9 pr-3 text-sm outline-none"
+                  style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                />
+              </div>
+              <button type="button" onClick={onOpenLibrary} className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm cursor-pointer" style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}>
+                <SlidersHorizontal size={15} />
+                Filter
+              </button>
+            </div>
+          </div>
+          <div className="mb-4 flex flex-wrap gap-2">
+            {SKILL_GROUP_ORDER.filter((label) => groupedSkills.some((group) => group.label === label)).map((label) => (
+              <button
+                type="button"
+                key={label}
+                onClick={() => toggleSkillGroup(label)}
+                className="rounded-lg px-3 py-1.5 text-xs cursor-pointer"
+                style={{ background: collapsedSkillGroups.has(label) ? 'transparent' : 'color-mix(in srgb, var(--color-accent) 14%, transparent)', border: '1px solid var(--color-border)', color: collapsedSkillGroups.has(label) ? 'var(--color-text-secondary)' : 'var(--color-accent)' }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="space-y-3 max-h-[560px] overflow-y-auto pr-1">
+            {groupedSkills.map((group) => {
+              const open = !collapsedSkillGroups.has(group.label);
+              const names = group.items.map((skill) => skill.name);
+              return (
+                <div key={group.label} className="rounded-xl" style={{ border: '1px solid var(--color-border)' }}>
+                  <div className="flex items-center justify-between px-3 py-2">
+                    <button type="button" onClick={() => toggleSkillGroup(group.label)} className="flex items-center gap-2 text-xs font-semibold uppercase cursor-pointer" style={{ color: 'var(--color-accent)' }}>
+                      <ChevronRight size={13} style={{ transform: open ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }} />
+                      {group.label}
+                      <span className="rounded px-1.5 py-0.5" style={{ background: 'var(--color-bg)', color: 'var(--color-text-tertiary)' }}>{group.items.length}</span>
+                    </button>
+                    <div className="flex items-center gap-3 text-xs">
+                      <button type="button" onClick={() => { setGroupSelected(names, true); setEditing(true); }} className="cursor-pointer" style={{ color: 'var(--color-accent)' }}>All</button>
+                      <button type="button" onClick={() => { setGroupSelected(names, false); setEditing(true); }} className="cursor-pointer" style={{ color: 'var(--color-text-secondary)' }}>None</button>
+                    </div>
+                  </div>
+                  {open && (
+                    <div className="grid gap-2 p-2 2xl:grid-cols-2">
+                      {group.items.map((skill) => {
+                        const checked = selectedSkills.includes(skill.name);
+                        return (
+                          <button
+                            key={skill.name}
+                            type="button"
+                            onClick={() => { toggleSkill(skill.name); setEditing(true); }}
+                            className="flex min-h-[76px] min-w-0 items-start gap-3 rounded-lg p-3 text-left transition-colors"
+                            style={{ background: checked ? 'color-mix(in srgb, var(--color-accent) 15%, var(--color-bg-secondary))' : 'var(--color-bg-secondary)', border: `1px solid ${checked ? 'var(--color-accent)' : 'var(--color-border)'}` }}
+                          >
+                            <div className="mt-0.5 flex h-8 w-8 items-center justify-center rounded-lg shrink-0" style={{ background: 'color-mix(in srgb, var(--color-accent) 12%, transparent)', color: 'var(--color-accent)' }}>
+                              {checked ? <Check size={16} /> : <Plus size={16} />}
+                            </div>
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-sm font-medium leading-5" style={{ color: 'var(--color-text)' }}>{skill.name}</span>
+                              <span className="mt-1 line-clamp-2 block text-xs leading-4" style={{ color: 'var(--color-text-tertiary)' }}>{skill.description || skill.source || 'Skill'}</span>
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="mt-4 rounded-xl" style={{ border: '1px solid var(--color-border)' }}>
+            <div className="flex items-center justify-between px-3 py-2">
+              <h4 className="text-xs font-semibold uppercase" style={{ color: 'var(--color-accent)' }}>
+                Tools &amp; Data Sources
+              </h4>
+              <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                {dataSources.length} sources · {effectiveTools.length} tools
+              </span>
+            </div>
+            <div className="flex flex-wrap gap-2 p-3">
+              {effectiveTools.length === 0 ? (
+                <span className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
+                  No tools attached.
+                </span>
+              ) : (
+                effectiveTools.map((tool) => capabilityChip(tool))
+              )}
+            </div>
+          </div>
+        </main>
+
+        <aside className="space-y-4">
+          <div className="rounded-xl p-4" style={insetStyle}>
+            <h4 className="mb-4 text-sm font-semibold uppercase" style={{ color: 'var(--color-text-secondary)' }}>Assigned To This Agent</h4>
+            <div className="rounded-lg p-3" style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}>
+              <div className="text-xs uppercase" style={{ color: 'var(--color-text-tertiary)' }}>Selected Preset</div>
+              <div className="mt-1 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-medium" style={{ color: 'var(--color-text)' }}>{templateName}</div>
+                  <div className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{presetId ? 'Template configuration' : 'Custom configuration'}</div>
+                </div>
+                <Pencil size={15} style={{ color: 'var(--color-accent)' }} />
+              </div>
+            </div>
+            <div className="mt-4">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-xs uppercase" style={{ color: 'var(--color-text-tertiary)' }}>Directly Assigned Skills</span>
+                <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>{selectedSkills.length}</span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {selectedSkills.length > 0 ? selectedSkills.map((skill) => capabilityChip(skill, true)) : <span className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>None</span>}
+              </div>
+            </div>
+            <div className="mt-4 rounded-lg overflow-hidden" style={{ border: '1px solid var(--color-border)' }}>
+              {[
+                ['Inherited', inheritedSkillCount, manager ? `From ${manager.name}` : 'None'],
+                ['From Preset', Math.max(0, effectiveSkills.length - inheritedSkillCount - selectedSkills.length), templateName],
+                ['Direct', selectedSkills.length, 'Assigned to this agent'],
+              ].map(([label, value, source]) => (
+                <div key={String(label)} className="flex items-center justify-between gap-3 px-3 py-2 text-sm border-b last:border-b-0" style={{ borderColor: 'var(--color-border)' }}>
+                  <span style={{ color: 'var(--color-text-secondary)' }}>{label}</span>
+                  <span className="truncate text-right" style={{ color: 'var(--color-text-tertiary)' }}>{value} - {source}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-xl p-4" style={insetStyle}>
+            <div className="mb-2 flex items-center gap-2 text-sm" style={{ color: 'var(--color-accent)' }}>
+              <ShieldCheck size={16} />
+              Runtime Scope
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-sm">
+              <div>
+                <div className="text-lg font-semibold" style={{ color: 'var(--color-text)' }}>{directReports.length}</div>
+                <div className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>Direct Reports</div>
+              </div>
+              <div>
+                <div className="text-lg font-semibold" style={{ color: 'var(--color-text)' }}>{autoTools.length}</div>
+                <div className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>Auto Tools</div>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </div>
+
+      <div className="grid gap-3 border-t p-4 md:grid-cols-[1fr_1fr_1.2fr]" style={{ borderColor: 'color-mix(in srgb, var(--color-border) 78%, var(--color-accent) 22%)' }}>
+        <button
+          type="button"
+          onClick={() => {
+            setEditing(false);
+            setPresetId(templateId);
+            setSelectedSkills(configuredSkills);
+            setChiefMode((agent.config?.orchestrator_mode as string | undefined) === 'chief');
+          }}
+          disabled={!editing || saving}
+          className="flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm cursor-pointer disabled:opacity-40"
+          style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}
+        >
+          <RefreshCw size={15} />
+          Reset Changes
+        </button>
+        <button type="button" onClick={onOpenLibrary} className="flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm cursor-pointer" style={{ background: 'var(--color-bg)', border: '1px solid var(--color-accent)', color: 'var(--color-accent)' }}>
+          <Eye size={15} />
+          Preview Runtime Capabilities
+        </button>
+        <button type="button" onClick={handleSave} disabled={!editing || saving} className="flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium cursor-pointer disabled:opacity-50" style={{ background: 'var(--color-accent)', color: 'var(--color-on-accent)' }}>
+          <Check size={16} />
+          {saving ? 'Saving...' : 'Save Changes'}
+        </button>
+      </div>
+    </section>
+  );
 
   return (
     <div
@@ -2506,6 +3165,25 @@ function AgentPresetToolsSection({
               Applying a preset updates this agent&apos;s stored config with that preset&apos;s defaults, then keeps the selected skill list agent-specific.
             </div>
           </div>
+          <label
+            className="flex items-start gap-2 p-2 rounded-lg cursor-pointer"
+            style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
+          >
+            <input
+              type="checkbox"
+              checked={chiefMode}
+              onChange={(e) => setChiefMode(e.target.checked)}
+              className="mt-0.5 cursor-pointer"
+            />
+            <span className="flex-1">
+              <span className="block text-sm" style={{ color: 'var(--color-text)' }}>
+                Run as Chief Orchestrator (action envelope)
+              </span>
+              <span className="block text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                Routes this agent through the chief mode: one JSON action per turn (complete / delegate / ask_user / fail), with delegations narrowed to direct subordinates. Best paired with a model that follows JSON instructions reliably.
+              </span>
+            </span>
+          </label>
           <div>
             <div className="flex items-center justify-between mb-2">
               <div className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
@@ -2828,17 +3506,19 @@ function OrgChartNode({
   selectedAgentId,
   onSelect,
   activeAgentIds,
+  activeEdgeKeys,
 }: {
   agent: ManagedAgent;
   managedAgents: ManagedAgent[];
   selectedAgentId: string | null;
   onSelect: (agentId: string) => void;
   activeAgentIds: Set<string>;
+  activeEdgeKeys: Set<string>;
 }) {
   const reports = getOrgChildren(managedAgents, agent.id);
   const isSelected = selectedAgentId === agent.id;
   // The trunk below a manager lights up while any direct report is active.
-  const anyReportActive = reports.some((r) => activeAgentIds.has(r.id));
+  const anyReportActive = reports.some((r) => activeAgentIds.has(r.id) || activeEdgeKeys.has(r.id));
 
   return (
     <div className="flex flex-col items-center min-w-[220px]">
@@ -2878,7 +3558,7 @@ function OrgChartNode({
               const isOnly = reports.length === 1;
               const isFirst = index === 0;
               const isLast = index === reports.length - 1;
-              const reportActive = activeAgentIds.has(report.id);
+              const reportActive = activeAgentIds.has(report.id) || activeEdgeKeys.has(report.id);
 
               return (
                 <div key={report.id} className="relative flex flex-col items-center px-3 pt-6">
@@ -2888,7 +3568,7 @@ function OrgChartNode({
                       style={{
                         left: isFirst ? '50%' : 0,
                         right: isLast ? '50%' : 0,
-                        background: 'var(--color-border)',
+                        ...connectorStyle(reportActive, 'horizontal'),
                       }}
                     />
                   )}
@@ -2899,6 +3579,7 @@ function OrgChartNode({
                     selectedAgentId={selectedAgentId}
                     onSelect={onSelect}
                     activeAgentIds={activeAgentIds}
+                    activeEdgeKeys={activeEdgeKeys}
                   />
                 </div>
               );
@@ -2927,25 +3608,49 @@ function AgentOrgChart({
   // between them can animate. `expiry` is a safety net: if a tick's
   // completion event is ever missed, the line stops pulsing on its own.
   const [activeAgentIds, setActiveAgentIds] = useState<Set<string>>(() => new Set());
+  const [activeEdgeKeys, setActiveEdgeKeys] = useState<Set<string>>(() => new Set());
   const activeExpiryRef = useRef<Map<string, number>>(new Map());
+  const edgeExpiryRef = useRef<Map<string, number>>(new Map());
 
   const handleAgentEvent = useCallback((event: AgentEvent) => {
     const raw = event.data?.agent_id;
     if (typeof raw !== 'string' || !raw) return;
+    const parentRaw = event.data?.parent_agent_id;
+    const parentAgentId = typeof parentRaw === 'string' ? parentRaw : '';
     const expiry = activeExpiryRef.current;
+    const edgeExpiry = edgeExpiryRef.current;
+    const pulseEdges = (ttlMs: number) => {
+      const edgeKeys = parentAgentId
+        ? getOrgPathEdgeKeys(parentAgentId, raw, managedAgents)
+        : [raw];
+      if (!edgeKeys.length) return;
+      const expiresAt = Date.now() + ttlMs;
+      for (const key of edgeKeys) edgeExpiry.set(key, expiresAt);
+      setActiveEdgeKeys(new Set(edgeExpiry.keys()));
+    };
     if (event.type === 'agent_tick_start') {
       expiry.set(raw, Date.now() + 120_000);
       setActiveAgentIds(new Set(expiry.keys()));
+      pulseEdges(parentAgentId ? 120_000 : 20_000);
+    } else if (event.type === 'agent_message_received') {
+      pulseEdges(18_000);
     } else if (event.type === 'agent_tick_end' || event.type === 'agent_tick_error') {
       if (expiry.delete(raw)) setActiveAgentIds(new Set(expiry.keys()));
+      if (parentAgentId) {
+        for (const key of getOrgPathEdgeKeys(parentAgentId, raw, managedAgents)) {
+          edgeExpiry.delete(key);
+        }
+        setActiveEdgeKeys(new Set(edgeExpiry.keys()));
+      }
     }
-  }, []);
+  }, [managedAgents]);
 
   useAgentEvents('*', handleAgentEvent, AGENT_ACTIVITY_EVENTS);
 
   useEffect(() => {
     const id = window.setInterval(() => {
       const expiry = activeExpiryRef.current;
+      const edgeExpiry = edgeExpiryRef.current;
       const now = Date.now();
       let changed = false;
       for (const [aid, exp] of expiry) {
@@ -2955,6 +3660,14 @@ function AgentOrgChart({
         }
       }
       if (changed) setActiveAgentIds(new Set(expiry.keys()));
+      let edgesChanged = false;
+      for (const [key, exp] of edgeExpiry) {
+        if (exp <= now) {
+          edgeExpiry.delete(key);
+          edgesChanged = true;
+        }
+      }
+      if (edgesChanged) setActiveEdgeKeys(new Set(edgeExpiry.keys()));
     }, 5000);
     return () => window.clearInterval(id);
   }, []);
@@ -2990,6 +3703,7 @@ function AgentOrgChart({
             selectedAgentId={selectedAgentId}
             onSelect={onSelect}
             activeAgentIds={activeAgentIds}
+            activeEdgeKeys={activeEdgeKeys}
           />
         ))}
       </div>
@@ -3075,6 +3789,304 @@ function AgentOrgChart({
         </div>
       )}
     </>
+  );
+}
+
+type InterAgentActivityItem = {
+  id: string;
+  agentId: string;
+  parentAgentId?: string;
+  type: 'delegation' | 'request' | 'response' | 'complete' | 'warning' | 'working';
+  title: string;
+  body: string;
+  timestamp: number;
+};
+
+function activityTypeStyle(type: InterAgentActivityItem['type']): { color: string; label: string } {
+  if (type === 'complete') return { color: 'var(--color-success)', label: 'Complete' };
+  if (type === 'warning') return { color: 'var(--color-warning)', label: 'Alert' };
+  if (type === 'delegation') return { color: 'var(--color-accent-purple)', label: 'Delegation' };
+  if (type === 'request') return { color: 'var(--color-accent)', label: 'Request' };
+  if (type === 'working') return { color: 'var(--color-accent)', label: 'Active' };
+  return { color: 'var(--color-text-secondary)', label: 'Reply' };
+}
+
+function InterAgentActivityPanel({
+  managedAgents,
+  onSelectAgent,
+}: {
+  managedAgents: ManagedAgent[];
+  onSelectAgent: (agentId: string) => void;
+}) {
+  const [filter, setFilter] = useState<'all' | 'active' | 'alerts' | 'direct'>('all');
+  const [history, setHistory] = useState<InterAgentActivityItem[]>([]);
+  const [live, setLive] = useState<InterAgentActivityItem[]>([]);
+  const agentNameById = useMemo(() => {
+    const out: Record<string, string> = {};
+    for (const agent of managedAgents) out[agent.id] = agent.name;
+    return out;
+  }, [managedAgents]);
+
+  const toAgentName = useCallback((agentId?: string) => {
+    if (!agentId) return '';
+    return agentNameById[agentId] || 'Unknown Agent';
+  }, [agentNameById]);
+
+  const loadHistory = useCallback(async () => {
+    if (managedAgents.length === 0) {
+      setHistory([]);
+      return;
+    }
+    try {
+      const batches = await Promise.all(
+        managedAgents.slice(0, 18).map(async (agent) => {
+          const messages = await fetchAgentMessages(agent.id);
+          return [...messages]
+            .sort((a, b) => b.created_at - a.created_at)
+            .slice(0, 8)
+            .map((message): InterAgentActivityItem => {
+            const isResponse = message.direction === 'agent_to_user';
+            const body = message.content.replace(/\s+/g, ' ').trim();
+            return {
+              id: `msg-${message.id}`,
+              agentId: agent.id,
+              type: isResponse ? 'response' : (message.mode === 'immediate' ? 'request' : 'delegation'),
+              title: agent.name,
+              body: body || (isResponse ? 'Response recorded.' : 'Request received.'),
+              timestamp: message.created_at,
+            };
+          });
+        }),
+      );
+      setHistory(
+        batches
+          .flat()
+          .sort((a, b) => b.timestamp - a.timestamp)
+          .slice(0, 30),
+      );
+    } catch {
+      // Non-blocking panel; the live websocket still fills this area.
+    }
+  }, [managedAgents]);
+
+  useEffect(() => {
+    loadHistory();
+    const interval = window.setInterval(loadHistory, 30000);
+    return () => window.clearInterval(interval);
+  }, [loadHistory]);
+
+  const handleAgentEvent = useCallback((event: AgentEvent) => {
+    const rawAgentId = event.data?.agent_id;
+    if (typeof rawAgentId !== 'string' || !rawAgentId) return;
+    const rawParentId = event.data?.parent_agent_id;
+    const parentAgentId = typeof rawParentId === 'string' && rawParentId ? rawParentId : '';
+    const agentName = toAgentName(rawAgentId) || String(event.data?.agent_name || 'Agent');
+    const parentName = toAgentName(parentAgentId);
+    const summary = String(event.data?.summary || event.data?.error || '').trim();
+    let item: InterAgentActivityItem | null = null;
+
+    if (event.type === 'agent_message_received') {
+      item = {
+        id: `evt-${event.timestamp}-${rawAgentId}-message`,
+        agentId: rawAgentId,
+        parentAgentId,
+        type: parentAgentId ? 'delegation' : 'request',
+        title: agentName,
+        body: parentAgentId
+          ? `${parentName || 'Parent agent'} delegated work to ${agentName}.`
+          : `${agentName} received a direct request.`,
+        timestamp: event.timestamp,
+      };
+    } else if (event.type === 'agent_tick_start') {
+      item = {
+        id: `evt-${event.timestamp}-${rawAgentId}-start`,
+        agentId: rawAgentId,
+        parentAgentId,
+        type: 'working',
+        title: agentName,
+        body: parentAgentId
+          ? `${agentName} is working on a request from ${parentName || 'another agent'}.`
+          : `${agentName} started working.`,
+        timestamp: event.timestamp,
+      };
+    } else if (event.type === 'agent_tick_end') {
+      item = {
+        id: `evt-${event.timestamp}-${rawAgentId}-end`,
+        agentId: rawAgentId,
+        parentAgentId,
+        type: 'complete',
+        title: agentName,
+        body: summary || `${agentName} completed the current task.`,
+        timestamp: event.timestamp,
+      };
+    } else if (event.type === 'agent_tick_error' || event.type === 'agent_budget_exceeded' || event.type === 'agent_stall_detected') {
+      item = {
+        id: `evt-${event.timestamp}-${rawAgentId}-alert`,
+        agentId: rawAgentId,
+        parentAgentId,
+        type: 'warning',
+        title: agentName,
+        body: summary || `${agentName} needs attention.`,
+        timestamp: event.timestamp,
+      };
+    }
+
+    if (!item) return;
+    setLive((current) => [item!, ...current].slice(0, 24));
+  }, [toAgentName]);
+
+  useAgentEvents('*', handleAgentEvent, [
+    'agent_message_received',
+    'agent_tick_start',
+    'agent_tick_end',
+    'agent_tick_error',
+    'agent_budget_exceeded',
+    'agent_stall_detected',
+  ]);
+
+  const items = useMemo(() => {
+    const merged = [...live, ...history]
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .filter((item, index, arr) => arr.findIndex((candidate) => candidate.id === item.id) === index);
+    if (filter === 'active') return merged.filter((item) => item.type === 'working' || item.type === 'delegation');
+    if (filter === 'alerts') return merged.filter((item) => item.type === 'warning');
+    if (filter === 'direct') return merged.filter((item) => !item.parentAgentId && (item.type === 'request' || item.type === 'response'));
+    return merged;
+  }, [filter, history, live]);
+
+  const liveCount = live.filter((item) => Date.now() - item.timestamp * 1000 < 120000).length;
+  const filterButton = (id: typeof filter, label: string, badge?: number) => (
+    <button
+      type="button"
+      onClick={() => setFilter(id)}
+      className="flex items-center justify-center gap-1 rounded-lg px-3 py-2 text-xs font-medium transition-colors"
+      style={{
+        background: filter === id ? 'color-mix(in srgb, var(--color-accent) 18%, transparent)' : 'var(--color-bg-secondary)',
+        border: `1px solid ${filter === id ? 'var(--color-accent)' : 'var(--color-border)'}`,
+        color: filter === id ? 'var(--color-accent)' : 'var(--color-text-secondary)',
+      }}
+    >
+      {label}
+      {!!badge && (
+        <span
+          className="rounded-full px-1.5 py-0.5 text-[10px]"
+          style={{ background: 'var(--color-error)', color: 'var(--color-on-accent)' }}
+        >
+          {badge}
+        </span>
+      )}
+    </button>
+  );
+
+  return (
+    <aside
+      className="rounded-2xl p-4 lg:sticky lg:top-6 lg:max-h-[calc(100vh-3rem)] lg:overflow-hidden"
+      style={{
+        background: 'linear-gradient(180deg, color-mix(in srgb, var(--color-bg-secondary) 92%, transparent), var(--color-bg-secondary))',
+        border: '1px solid color-mix(in srgb, var(--color-accent) 28%, var(--color-border))',
+        boxShadow: '0 0 28px color-mix(in srgb, var(--color-accent) 8%, transparent)',
+      }}
+    >
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div>
+          <h2 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-normal" style={{ color: 'var(--color-text)' }}>
+            <Activity size={16} style={{ color: 'var(--color-accent)' }} />
+            Inter-Agent Activity
+          </h2>
+          <p className="mt-1 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+            Conversation log across agents, newest first
+          </p>
+        </div>
+        <div className="flex items-center gap-1.5 text-xs" style={{ color: 'var(--color-success)' }}>
+          <span className="h-2 w-2 rounded-full" style={{ background: 'var(--color-success)' }} />
+          Live
+        </div>
+      </div>
+
+      <div className="mb-4 grid grid-cols-4 gap-1.5">
+        {filterButton('all', 'All')}
+        {filterButton('active', 'Active')}
+        {filterButton('alerts', 'Alerts', items.filter((item) => item.type === 'warning').length)}
+        {filterButton('direct', 'Direct')}
+      </div>
+
+      <div className="space-y-3 overflow-y-auto pr-1 lg:max-h-[calc(100vh-13rem)]">
+        {items.length === 0 ? (
+          <div
+            className="rounded-xl px-4 py-8 text-center text-sm"
+            style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', color: 'var(--color-text-tertiary)' }}
+          >
+            No agent conversation activity yet.
+          </div>
+        ) : (
+          items.slice(0, 18).map((item) => {
+            const style = activityTypeStyle(item.type);
+            const parentName = item.parentAgentId ? toAgentName(item.parentAgentId) : '';
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => onSelectAgent(item.agentId)}
+                className="group w-full rounded-xl p-3 text-left transition-colors"
+                style={{
+                  background: 'color-mix(in srgb, var(--color-bg) 72%, transparent)',
+                  border: `1px solid color-mix(in srgb, ${style.color} 34%, var(--color-border))`,
+                  boxShadow: `inset 3px 0 0 ${style.color}`,
+                }}
+              >
+                <div className="flex items-start gap-3">
+                  <div
+                    className="mt-0.5 grid h-9 w-9 shrink-0 place-items-center rounded-xl"
+                    style={{
+                      background: `color-mix(in srgb, ${style.color} 12%, transparent)`,
+                      border: `1px solid color-mix(in srgb, ${style.color} 36%, transparent)`,
+                      color: style.color,
+                    }}
+                  >
+                    {item.type === 'response' ? <MessageSquare size={16} /> : <Bot size={16} />}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+                          {item.title}
+                        </div>
+                        {parentName && (
+                          <div className="truncate text-[11px]" style={{ color: 'var(--color-accent)' }}>
+                            From {parentName}
+                          </div>
+                        )}
+                      </div>
+                      <span className="shrink-0 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+                        {formatRelativeTime(item.timestamp)}
+                      </span>
+                    </div>
+                    <p className="mt-1 line-clamp-3 text-xs leading-relaxed" style={{ color: 'var(--color-text-secondary)' }}>
+                      {item.body}
+                    </p>
+                    <span
+                      className="mt-2 inline-flex rounded-md px-2 py-0.5 text-[10px] font-medium"
+                      style={{ background: `color-mix(in srgb, ${style.color} 14%, transparent)`, color: style.color }}
+                    >
+                      {style.label}
+                    </span>
+                  </div>
+                </div>
+              </button>
+            );
+          })
+        )}
+      </div>
+
+      <div className="mt-3 flex items-center justify-between border-t pt-3 text-xs" style={{ borderColor: 'var(--color-border)' }}>
+        <span style={{ color: 'var(--color-text-tertiary)' }}>
+          {managedAgents.length} agents monitored
+        </span>
+        <span style={{ color: 'var(--color-accent)' }}>
+          {liveCount} live
+        </span>
+      </div>
+    </aside>
   );
 }
 
@@ -4871,10 +5883,104 @@ function LearningTab({ agentId, learningEnabled }: { agentId: string; learningEn
 // Logs tab component
 // ---------------------------------------------------------------------------
 
+function TraceTreeView({
+  node,
+  depth,
+  agentNames,
+}: {
+  node: TraceTreeNode;
+  depth: number;
+  agentNames: Record<string, string>;
+}) {
+  const friendly = agentNames[node.agent] || node.agent;
+  const outcomeColor =
+    node.outcome === 'success'
+      ? 'var(--color-success)'
+      : node.outcome === 'error'
+        ? 'var(--color-error)'
+        : 'var(--color-text-tertiary)';
+  return (
+    <div style={{ marginLeft: depth * 16 }} className="text-xs">
+      <div className="flex items-center gap-2 py-0.5">
+        <span
+          className="w-1.5 h-1.5 rounded-full inline-block"
+          style={{ background: outcomeColor }}
+        />
+        <span style={{ color: 'var(--color-text)' }}>{friendly}</span>
+        <span style={{ color: 'var(--color-text-tertiary)' }}>
+          ({(node.outcome ?? '?')}, {node.duration.toFixed(2)}s)
+        </span>
+        <span
+          className="text-[10px] font-mono"
+          style={{ color: 'var(--color-text-tertiary)' }}
+        >
+          {node.id.slice(0, 8)}
+        </span>
+      </div>
+      {node.result_preview && (
+        <div
+          className="ml-4 mb-0.5"
+          style={{ color: 'var(--color-text-tertiary)' }}
+        >
+          {node.result_preview}
+        </div>
+      )}
+      {node.children.map((child) => (
+        <TraceTreeView
+          key={child.id}
+          node={child}
+          depth={depth + 1}
+          agentNames={agentNames}
+        />
+      ))}
+    </div>
+  );
+}
+
 function LogsTab({ agentId }: { agentId: string }) {
+  const managedAgents = useAppStore((s) => s.managedAgents);
+  const agentNames = useMemo(() => {
+    const out: Record<string, string> = {};
+    for (const a of managedAgents) out[a.id] = a.name;
+    return out;
+  }, [managedAgents]);
   const [traces, setTraces] = useState<AgentTrace[]>([]);
   const [learningEntries, setLearningEntries] = useState<LearningLogEntry[]>([]);
   const [expandedTrace, setExpandedTrace] = useState<string | null>(null);
+  const [trees, setTrees] = useState<Record<string, TraceTreeNode>>({});
+  const [treeLoading, setTreeLoading] = useState<string | null>(null);
+  const [treeError, setTreeError] = useState<Record<string, string>>({});
+
+  const toggleTree = useCallback(
+    async (traceId: string) => {
+      if (trees[traceId]) {
+        setTrees((current) => {
+          const next = { ...current };
+          delete next[traceId];
+          return next;
+        });
+        return;
+      }
+      setTreeLoading(traceId);
+      try {
+        const tree = await fetchTraceTree(agentId, traceId);
+        setTrees((current) => ({ ...current, [traceId]: tree }));
+        setTreeError((current) => {
+          const next = { ...current };
+          delete next[traceId];
+          return next;
+        });
+      } catch (err: any) {
+        setTreeError((current) => ({
+          ...current,
+          [traceId]: err?.message || 'Failed to load tree',
+        }));
+      } finally {
+        setTreeLoading(null);
+      }
+    },
+    [agentId, trees],
+  );
 
   const loadData = useCallback(async () => {
     try {
@@ -5034,6 +6140,21 @@ function LogsTab({ agentId }: { agentId: string }) {
                 <div className="flex items-center gap-3 mt-1 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
                   <span>{t.duration.toFixed(1)}s</span>
                   <span>{t.steps} step{t.steps !== 1 ? 's' : ''}</span>
+                  <button
+                    type="button"
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      toggleTree(t.id);
+                    }}
+                    className="ml-auto cursor-pointer"
+                    style={{ color: 'var(--color-accent)' }}
+                  >
+                    {trees[t.id]
+                      ? 'Hide call tree'
+                      : treeLoading === t.id
+                        ? 'Loading...'
+                        : 'Show call tree'}
+                  </button>
                 </div>
                 {isExpanded && errorDetail && (
                   <div className="mt-2 pt-2 space-y-1.5 text-xs" style={{ borderTop: '1px solid var(--color-border)' }}>
@@ -5045,6 +6166,27 @@ function LogsTab({ agentId }: { agentId: string }) {
                       <span className="font-medium" style={{ color: 'var(--color-text-secondary)' }}>Action: </span>
                       <span style={{ color: 'var(--color-text)' }}>{errorDetail.suggested_action}</span>
                     </div>
+                  </div>
+                )}
+                {trees[t.id] && (
+                  <div
+                    className="mt-2 pt-2"
+                    style={{ borderTop: '1px solid var(--color-border)' }}
+                    onClick={(ev) => ev.stopPropagation()}
+                  >
+                    <TraceTreeView
+                      node={trees[t.id]}
+                      depth={0}
+                      agentNames={agentNames}
+                    />
+                  </div>
+                )}
+                {treeError[t.id] && (
+                  <div
+                    className="mt-2 text-xs"
+                    style={{ color: 'var(--color-error)' }}
+                  >
+                    {treeError[t.id]}
                   </div>
                 )}
               </div>
@@ -5252,7 +6394,7 @@ export function AgentsPage() {
 
     return (
       <div className="flex-1 overflow-y-auto px-6 py-10">
-        <div className="max-w-5xl mx-auto">
+        <div className="max-w-[1500px] mx-auto">
         {/* Back button */}
         <button
           onClick={() => setSelectedAgentId(null)}
@@ -5344,6 +6486,11 @@ export function AgentsPage() {
           </div>
         </div>
 
+        {(selectedAgent.status === 'input_required' ||
+          selectedAgent.status === 'auth_required') && (
+          <ChiefPendingCard agent={selectedAgent} onResumed={refresh} />
+        )}
+
         {/* Tabs */}
         <div className="flex gap-1 mb-6 p-1 rounded-lg overflow-x-auto" style={{ background: 'var(--color-bg-secondary)' }}>
           {DETAIL_TABS.map(({ id, label, icon: Icon }) => (
@@ -5369,6 +6516,9 @@ export function AgentsPage() {
             {/* Instruction */}
             <AgentInstructionSection agent={selectedAgent} onAgentUpdated={refresh} />
 
+            {/* Personality */}
+            <AgentPersonalitySection agent={selectedAgent} onAgentUpdated={refresh} />
+
             {/* Configuration */}
             <div
               className="p-3 rounded-lg"
@@ -5393,6 +6543,7 @@ export function AgentsPage() {
 
             <AgentPresetToolsSection
               agent={selectedAgent}
+              managedAgents={managedAgents}
               templates={templates}
               skills={skills}
               onAgentUpdated={refresh}
@@ -5658,8 +6809,8 @@ export function AgentsPage() {
   // ── List View ───────────────────────────────────────────────────────────
 
   return (
-    <div data-agents-page-pane className="relative flex-1 overflow-y-auto px-6 py-10">
-      <div className="max-w-5xl mx-auto">
+    <div data-agents-page-pane className="relative flex-1 overflow-y-auto px-6 py-8">
+      <div className="mx-auto max-w-[1480px]">
       {/* Launch wizard modal */}
       {showWizard && (
         <LaunchWizard
@@ -5673,26 +6824,29 @@ export function AgentsPage() {
         />
       )}
 
-      <header className="mb-6">
-        <div className="flex justify-between items-center">
-          <h1 className="text-lg font-semibold" style={{ color: 'var(--color-text)' }}>
-            Agents
-          </h1>
+      <header className="mb-5">
+        <div className="flex justify-between items-start gap-4">
+          <div>
+            <h1 className="text-3xl font-semibold" style={{ color: 'var(--color-text)' }}>
+              Agents
+            </h1>
+            <p className="text-sm mt-1 max-w-3xl" style={{ color: 'var(--color-text-secondary)' }}>
+              Manage your autonomous agents and their hierarchy. Monitor status, performance, and inter-agent collaboration.
+            </p>
+          </div>
           <button
             onClick={() => agentManagerAvailable && setShowWizard(true)}
             disabled={agentManagerAvailable === false}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            className="flex items-center gap-2 px-5 py-3 rounded-xl text-sm font-semibold cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             style={{
               background: agentManagerAvailable === false ? 'var(--color-bg-tertiary)' : 'var(--color-accent)',
               color: agentManagerAvailable === false ? 'var(--color-text-tertiary)' : 'var(--color-on-accent)',
+              boxShadow: agentManagerAvailable === false ? 'none' : '0 0 22px color-mix(in srgb, var(--color-accent) 34%, transparent)',
             }}
           >
             <Plus size={15} /> New Agent
           </button>
         </div>
-        <p className="text-sm mt-2 max-w-2xl" style={{ color: 'var(--color-text-secondary)' }}>
-          Long-running autonomous agents that can monitor sources, run tasks on a schedule, and message you through connected channels.
-        </p>
       </header>
 
       {agentManagerAvailable === false && (
@@ -5709,64 +6863,123 @@ export function AgentsPage() {
         </div>
       )}
 
-      {managedAgents.length > 0 && (
-        <AgentOrgChart
-          managedAgents={managedAgents}
-          selectedAgentId={selectedAgentId}
-          onSelect={(agentId) => {
-            setSelectedAgentId(agentId);
-            setDetailTab('overview');
-          }}
-        />
-      )}
+      <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_380px] 2xl:grid-cols-[minmax(0,1fr)_420px]">
+        <main className="min-w-0 space-y-5">
+          {managedAgents.length > 0 && (
+            <AgentOrgChart
+              managedAgents={managedAgents}
+              selectedAgentId={selectedAgentId}
+              onSelect={(agentId) => {
+                setSelectedAgentId(agentId);
+                setDetailTab('overview');
+              }}
+            />
+          )}
 
-      {/* Agent cards grid */}
-      <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))' }}>
-        {managedAgents.map((a) => (
-          <AgentCard
-            key={a.id}
-            agent={a}
-            onClick={() => {
-              setSelectedAgentId(a.id);
-              setDetailTab('overview');
-            }}
-            onPause={handlePause}
-            onResume={handleResume}
-            onRun={handleRun}
-            onRecover={handleRecover}
-            onDelete={handleDelete}
-            onChat={(id) => {
-              setSelectedAgentId(id);
+          {managedAgents.length > 0 && (
+            <section
+              className="rounded-2xl p-4"
+              style={{
+                background: 'var(--color-bg-secondary)',
+                border: '1px solid color-mix(in srgb, var(--color-accent) 22%, var(--color-border))',
+              }}
+            >
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-sm font-semibold uppercase tracking-normal" style={{ color: 'var(--color-text)' }}>
+                    All Agents
+                  </h2>
+                  <p className="mt-1 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                    {managedAgents.length} agent{managedAgents.length === 1 ? '' : 's'}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div
+                    className="hidden sm:flex h-9 min-w-[180px] items-center gap-2 rounded-lg px-3 text-xs"
+                    style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', color: 'var(--color-text-tertiary)' }}
+                  >
+                    <Search size={14} />
+                    <span>Search agents...</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="grid h-9 w-9 place-items-center rounded-lg"
+                    title="Grid view"
+                    style={{ background: 'color-mix(in srgb, var(--color-accent) 14%, transparent)', border: '1px solid var(--color-accent)', color: 'var(--color-accent)' }}
+                  >
+                    <Boxes size={15} />
+                  </button>
+                  <button
+                    type="button"
+                    className="grid h-9 w-9 place-items-center rounded-lg"
+                    title="List view"
+                    style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}
+                  >
+                    <ListTodo size={15} />
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))' }}>
+                {managedAgents.map((a) => (
+                  <AgentCard
+                    key={a.id}
+                    agent={a}
+                    onClick={() => {
+                      setSelectedAgentId(a.id);
+                      setDetailTab('overview');
+                    }}
+                    onPause={handlePause}
+                    onResume={handleResume}
+                    onRun={handleRun}
+                    onRecover={handleRecover}
+                    onDelete={handleDelete}
+                    onChat={(id) => {
+                      setSelectedAgentId(id);
+                      setDetailTab('interact');
+                    }}
+                    onEdit={(id) => {
+                      setSelectedAgentId(id);
+                      setDetailTab('overview');
+                    }}
+                  />
+                ))}
+              </div>
+            </section>
+          )}
+
+          {managedAgents.length === 0 && (
+            <div className="text-center py-16" style={{ color: 'var(--color-text-tertiary)' }}>
+              <Bot size={48} className="mx-auto mb-4 opacity-30" />
+              <p className="mb-2 font-medium" style={{ color: 'var(--color-text-secondary)' }}>
+                No agents yet
+              </p>
+              <p className="text-sm mb-6">Create your first agent to get started with autonomous task management.</p>
+              <button
+                onClick={() => agentManagerAvailable && setShowWizard(true)}
+                disabled={agentManagerAvailable === false}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                style={{
+                  background: agentManagerAvailable === false ? 'var(--color-bg-tertiary)' : 'var(--color-accent)',
+                  color: agentManagerAvailable === false ? 'var(--color-text-tertiary)' : 'var(--color-on-accent)',
+                }}
+              >
+                <Plus size={15} /> Launch your first agent
+              </button>
+            </div>
+          )}
+        </main>
+
+        {managedAgents.length > 0 && (
+          <InterAgentActivityPanel
+            managedAgents={managedAgents}
+            onSelectAgent={(agentId) => {
+              setSelectedAgentId(agentId);
               setDetailTab('interact');
             }}
-            onEdit={(id) => {
-              setSelectedAgentId(id);
-              setDetailTab('overview');
-            }}
           />
-        ))}
+        )}
       </div>
-
-      {managedAgents.length === 0 && (
-        <div className="text-center py-16" style={{ color: 'var(--color-text-tertiary)' }}>
-          <Bot size={48} className="mx-auto mb-4 opacity-30" />
-          <p className="mb-2 font-medium" style={{ color: 'var(--color-text-secondary)' }}>
-            No agents yet
-          </p>
-          <p className="text-sm mb-6">Create your first agent to get started with autonomous task management.</p>
-          <button
-            onClick={() => agentManagerAvailable && setShowWizard(true)}
-            disabled={agentManagerAvailable === false}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-            style={{
-              background: agentManagerAvailable === false ? 'var(--color-bg-tertiary)' : 'var(--color-accent)',
-              color: agentManagerAvailable === false ? 'var(--color-text-tertiary)' : 'var(--color-on-accent)',
-            }}
-          >
-            <Plus size={15} /> Launch your first agent
-          </button>
-        </div>
-      )}
       </div>
     </div>
   );

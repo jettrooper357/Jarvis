@@ -163,7 +163,7 @@ class AgentExecutor:
         )
         return agent.run(input_text)
 
-    def execute_tick(self, agent_id: str) -> None:
+    def execute_tick(self, agent_id: str, *, force: bool = False) -> None:
         """Run one tick for the given agent.
 
         1. Acquire concurrency guard (start_tick)
@@ -181,13 +181,17 @@ class AgentExecutor:
             if hasattr(self._manager, "has_runnable_task")
             else True
         )
-        if has_linked_open_task and not has_runnable_task:
+        if not force and has_linked_open_task and not has_runnable_task:
             logger.info(
                 "Agent %s only has future-scheduled tasks; skipping tick",
                 agent_id,
             )
             return
-        if not has_runnable_task and not self._manager.get_pending_messages(agent_id):
+        if (
+            not force
+            and not has_runnable_task
+            and not self._manager.get_pending_messages(agent_id)
+        ):
             logger.info(
                 "Agent %s has no due linked task or pending message; skipping tick",
                 agent_id,

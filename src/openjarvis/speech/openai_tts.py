@@ -78,5 +78,8 @@ class OpenAITTSBackend(TTSBackend):
     def available_voices(self) -> List[str]:
         return ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
 
+    def voice_options(self) -> list[dict[str, str]]:
+        return [{"id": v, "name": v.title()} for v in self.available_voices()]
+
     def health(self) -> bool:
         return bool(self._api_key)

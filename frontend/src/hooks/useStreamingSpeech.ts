@@ -13,6 +13,8 @@ interface UseStreamingSpeechOptions {
   onSpeechStart?: () => void;
   /** Optional language hint (e.g. 'en'). Omit for auto-detect. */
   language?: string;
+  /** When true, keep the socket open but drop mic frames and transcripts. */
+  muted?: boolean;
 }
 
 function wsUrl(): string {
@@ -33,6 +35,7 @@ function wsUrl(): string {
 }
 
 export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
+  const muted = !!opts.muted;
   const [state, setState] = useState<StreamingSpeechState>('idle');
   const [interim, setInterim] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -47,12 +50,24 @@ export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
   onFinalRef.current = opts.onFinal;
   const onSpeechStartRef = useRef(opts.onSpeechStart);
   onSpeechStartRef.current = opts.onSpeechStart;
+  const mutedRef = useRef(muted);
+  mutedRef.current = muted;
 
   useEffect(() => {
     fetchSpeechHealth()
       .then((h) => setAvailable(!!h.available))
       .catch(() => setAvailable(false));
   }, []);
+
+  useEffect(() => {
+    if (!muted) return;
+    if (transcribingTimeoutRef.current !== null) {
+      window.clearTimeout(transcribingTimeoutRef.current);
+      transcribingTimeoutRef.current = null;
+    }
+    setInterim('');
+    setState(wsRef.current?.readyState === WebSocket.OPEN ? 'listening' : 'idle');
+  }, [muted]);
 
   const cleanup = useCallback(() => {
     if (transcribingTimeoutRef.current !== null) {
@@ -132,6 +147,7 @@ export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
       try {
         const msg = JSON.parse(ev.data);
         if (msg.type === 'speech_start') {
+          if (mutedRef.current) return;
           if (transcribingTimeoutRef.current !== null) {
             window.clearTimeout(transcribingTimeoutRef.current);
             transcribingTimeoutRef.current = null;
@@ -139,6 +155,7 @@ export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
           setState('listening');
           onSpeechStartRef.current?.();
         } else if (msg.type === 'partial' && msg.text) {
+          if (mutedRef.current) return;
           setInterim(msg.text);
           setState('listening');
         } else if (msg.type === 'final' && msg.text) {
@@ -148,8 +165,10 @@ export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
           }
           setInterim('');
           setState(wsRef.current?.readyState === WebSocket.OPEN ? 'listening' : 'idle');
+          if (mutedRef.current) return;
           onFinalRef.current?.(msg.text);
         } else if (msg.type === 'speech_end') {
+          if (mutedRef.current) return;
           setState('transcribing');
           if (transcribingTimeoutRef.current !== null) {
             window.clearTimeout(transcribingTimeoutRef.current);
@@ -196,6 +215,7 @@ export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
     const node = new AudioWorkletNode(ctx, 'pcm-worklet');
     nodeRef.current = node;
     node.port.onmessage = (ev) => {
+      if (mutedRef.current) return;
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(ev.data as ArrayBuffer);
       }

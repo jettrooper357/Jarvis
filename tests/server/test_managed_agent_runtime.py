@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from openjarvis.agents.manager import AgentManager
@@ -239,6 +240,245 @@ def test_successful_project_create_completes_linked_agent_task(tmp_path, monkeyp
         updated = manager._get_task(agent_task["id"])
         assert updated["status"] == "completed"
         assert "project setup tool" in updated["progress"]["note"]
+    finally:
+        manager.close()
+        project_store.close()
+
+
+def test_project_task_acknowledgement_materializes_task(tmp_path):
+    project_store = ProjectStore(tmp_path / "projects.db")
+    manager = AgentManager(
+        db_path=str(tmp_path / "agents.db"),
+        project_store=project_store,
+    )
+    try:
+        project = project_store.create_project(name="Iron Saints Music")
+        workflow_manager = manager.create_agent(
+            name="Workflow Manager",
+            agent_type="monitor_operative",
+            org_role="Workflow Manager",
+            config={"max_turns": 4},
+        )
+        engine = FakeEngine(
+            [
+                {
+                    "content": (
+                        "I will create a task in the Iron Saints Project "
+                        "for releasing the new song titled 'Raise One for "
+                        "the Old Guard'."
+                    )
+                },
+            ]
+        )
+
+        runtime = ManagedAgentRuntime(
+            manager,
+            engine,
+            default_model="fake-model",
+        )
+        response = runtime.run(
+            workflow_manager["id"],
+            (
+                "Add a task to the Iron Saints Project for releasing the "
+                "new song titled 'Raise One for the Old Guard'."
+            ),
+        )
+
+        tasks = project_store.list_tasks(project["id"])
+        assert len(tasks) == 1
+        assert tasks[0]["title"] == "Raise One for the Old Guard"
+        assert tasks[0]["status"] == "In Progress"
+        assert tasks[0]["assigned_to"] == "Workflow Manager"
+        today = datetime.now().date()
+        assert tasks[0]["start_date"] == today.isoformat()
+        assert tasks[0]["due_date"] == (today + timedelta(days=1)).isoformat()
+        linked_work = [
+            task
+            for task in manager.list_tasks(workflow_manager["id"])
+            if task["project_task_id"] == tasks[0]["id"]
+        ]
+        assert len(linked_work) == 1
+        assert linked_work[0]["status"] == "active"
+        assert "Project task recorded" in response
+
+        replies = [
+            message
+            for message in manager.list_messages(workflow_manager["id"])
+            if message["direction"] == "agent_to_user"
+        ]
+        assert replies[0]["tool_calls"][0]["tool"] == "project_create_task"
+        assert replies[0]["tool_calls"][0]["success"] is True
+    finally:
+        manager.close()
+        project_store.close()
+
+
+def test_project_task_acknowledgement_does_not_duplicate_task(tmp_path):
+    project_store = ProjectStore(tmp_path / "projects.db")
+    manager = AgentManager(
+        db_path=str(tmp_path / "agents.db"),
+        project_store=project_store,
+    )
+    try:
+        project = project_store.create_project(name="Iron Saints Music")
+        project_store.create_task(
+            project["id"],
+            title="Raise One for the Old Guard",
+        )
+        workflow_manager = manager.create_agent(
+            name="Workflow Manager",
+            agent_type="monitor_operative",
+            org_role="Workflow Manager",
+            config={"max_turns": 4},
+        )
+        engine = FakeEngine([{"content": "Task created."}])
+
+        runtime = ManagedAgentRuntime(
+            manager,
+            engine,
+            default_model="fake-model",
+        )
+        response = runtime.run(
+            workflow_manager["id"],
+            (
+                "Create a task in Iron Saints Project for releasing the "
+                "new song titled 'Raise One for the Old Guard'."
+            ),
+        )
+
+        tasks = project_store.list_tasks(project["id"])
+        assert len(tasks) == 1
+        assert "already exists" in response
+    finally:
+        manager.close()
+        project_store.close()
+
+
+def test_project_task_fallback_strips_trailing_project_phrase(tmp_path):
+    project_store = ProjectStore(tmp_path / "projects.db")
+    manager = AgentManager(
+        db_path=str(tmp_path / "agents.db"),
+        project_store=project_store,
+    )
+    try:
+        project = project_store.create_project(name="Iron Saints Music")
+        workflow_manager = manager.create_agent(
+            name="Workflow Manager",
+            agent_type="monitor_operative",
+            org_role="Workflow Manager",
+            config={"max_turns": 4},
+        )
+        engine = FakeEngine(
+            [
+                {
+                    "content": (
+                        "Task created: Raise One for the Old Guard to the "
+                        "Iron Saints Project."
+                    )
+                },
+            ]
+        )
+
+        runtime = ManagedAgentRuntime(
+            manager,
+            engine,
+            default_model="fake-model",
+        )
+        runtime.run(
+            workflow_manager["id"],
+            (
+                "Create a task called Raise One for the Old Guard to the "
+                "Iron Saints Project."
+            ),
+        )
+
+        tasks = project_store.list_tasks(project["id"])
+        assert len(tasks) == 1
+        assert tasks[0]["title"] == "Raise One for the Old Guard"
+    finally:
+        manager.close()
+        project_store.close()
+
+
+def test_chief_project_task_tool_routes_work_to_workflow_manager(tmp_path, monkeypatch):
+    project_store = ProjectStore(tmp_path / "projects.db")
+    manager = AgentManager(
+        db_path=str(tmp_path / "agents.db"),
+        project_store=project_store,
+    )
+    monkeypatch.setattr(
+        "openjarvis.tools.project_tools._project_store",
+        lambda: project_store,
+    )
+    try:
+        project = project_store.create_project(name="Iron Saints Music")
+        chief = manager.create_agent(
+            name="Chief",
+            agent_type="monitor_operative",
+            org_role="Chief Orchestrator",
+            config={"max_turns": 4},
+        )
+        workflow_manager = manager.create_agent(
+            name="Workflow Manager",
+            agent_type="monitor_operative",
+            org_role="Workflow Manager",
+            manager_agent_id=chief["id"],
+            config={"max_turns": 4},
+        )
+        engine = FakeEngine(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "call-1",
+                            "project_create_task",
+                            (
+                                '{"project_id":"'
+                                + project["id"]
+                                + '","title":"add a task to release a new song called '
+                                'Raise One for the Old Guard","status":"In Progress"}'
+                            ),
+                        )
+                    ]
+                },
+                {"content": "Task created."},
+            ]
+        )
+
+        runtime = ManagedAgentRuntime(
+            manager,
+            engine,
+            default_model="fake-model",
+        )
+        runtime.run(
+            chief["id"],
+            (
+                "On the Iron Saints Project, add a task to release a new song "
+                "called Raise One for the Old Guard."
+            ),
+        )
+
+        tasks = project_store.list_tasks(project["id"])
+        assert len(tasks) == 1
+        assert tasks[0]["title"] == "Raise One for the Old Guard"
+        assert tasks[0]["assigned_to"] == "Workflow Manager"
+        today = datetime.now().date()
+        assert tasks[0]["start_date"] == today.isoformat()
+        assert tasks[0]["due_date"] == (today + timedelta(days=1)).isoformat()
+
+        chief_work = [
+            task
+            for task in manager.list_tasks(chief["id"])
+            if task["project_task_id"] == tasks[0]["id"]
+        ]
+        workflow_work = [
+            task
+            for task in manager.list_tasks(workflow_manager["id"])
+            if task["project_task_id"] == tasks[0]["id"]
+        ]
+        assert chief_work == []
+        assert len(workflow_work) == 1
+        assert workflow_work[0]["status"] == "active"
     finally:
         manager.close()
         project_store.close()

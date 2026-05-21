@@ -229,6 +229,48 @@ class TestChatCompletions:
                     content += delta_content
         assert content == "Hello world"
 
+    def test_streaming_regular_chat_records_chief_task(self, tmp_path):
+        from openjarvis.agents.manager import AgentManager
+        from openjarvis.engine._stubs import StreamChunk
+
+        engine = _make_engine()
+        engine._model = "test-model"
+
+        async def mock_stream_full(messages, *, model, **kwargs):
+            yield StreamChunk(content="Here are ")
+            yield StreamChunk(content="the headlines")
+            yield StreamChunk(finish_reason="stop")
+
+        engine.stream_full = mock_stream_full
+        app = create_app(engine, "test-model")
+        manager = AgentManager(db_path=str(tmp_path / "agents.db"))
+        try:
+            chief = manager.create_agent(
+                name="My Assistant",
+                agent_type="monitor_operative",
+                org_role="Chief Orchestrator",
+            )
+            app.state.agent_manager = manager
+            client = TestClient(app)
+
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "top 10 news"}],
+                    "stream": True,
+                },
+            )
+
+            assert resp.status_code == 200
+            assert "data: [DONE]" in resp.text
+            tasks = manager.list_tasks(chief["id"])
+            assert len(tasks) == 1
+            assert tasks[0]["description"] == "top 10 news"
+            assert tasks[0]["status"] == "completed"
+        finally:
+            manager.close()
+
     def test_finish_reason_default(self, client):
         resp = client.post(
             "/v1/chat/completions",

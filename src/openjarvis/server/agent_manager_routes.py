@@ -519,6 +519,67 @@ def _merge_tool_call_fragments(
             entry["function"]["arguments"] += fn["arguments"]
 
 
+def _create_chat_task(
+    manager: AgentManager,
+    agent_id: str,
+    user_content: str,
+) -> Optional[str]:
+    description = _re.sub(r"\s+", " ", user_content or "").strip()
+    if not description:
+        description = "Chat request"
+    description = description[:500]
+    try:
+        task = manager.create_task(agent_id, description, status="active")
+        return str(task.get("id") or "") or None
+    except Exception as exc:
+        logger.warning(
+            "Failed to create chat task for agent %s: %s",
+            agent_id,
+            exc,
+            exc_info=True,
+        )
+        return None
+
+
+def _finish_chat_task(
+    manager: AgentManager,
+    task_id: Optional[str],
+    final_content: str,
+    *,
+    tool_call_count: int = 0,
+) -> None:
+    if not task_id:
+        return
+    content = _re.sub(r"\s+", " ", final_content or "").strip()
+    failed = content.startswith("Error:") or content.startswith(
+        "Sorry, an error occurred"
+    )
+    try:
+        manager.update_task(
+            task_id,
+            status="failed" if failed else "completed",
+            progress={
+                "response_summary": content[:400],
+                "tool_calls": tool_call_count,
+            },
+            findings=[
+                {
+                    "source": "chat_response",
+                    "summary": content[:240],
+                }
+            ]
+            if content
+            else [],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to finish chat task %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+
+
 def _effective_agent_tool_names(agent_record: Dict[str, Any]) -> List[str]:
     return _effective_capability_tool_names(agent_record)
 
@@ -733,6 +794,7 @@ async def _stream_managed_agent(
 
     agent_id = agent_record["id"]
     config = agent_record.get("config", {})
+    chat_task_id = _create_chat_task(manager, agent_id, user_content)
     # Fall back to the server's configured default model when the agent
     # template/record doesn't pin a specific one. Without the final
     # app_state.model fallback, an unconfigured agent sends model="" to
@@ -1075,6 +1137,12 @@ async def _stream_managed_agent(
                             content,
                             tool_calls=dr_tool_calls or None,
                         )
+                        _finish_chat_task(
+                            manager,
+                            chat_task_id,
+                            content,
+                            tool_call_count=len(dr_tool_calls),
+                        )
                         break
 
             return StreamingResponse(
@@ -1147,6 +1215,12 @@ async def _stream_managed_agent(
                     store_exc,
                     exc_info=True,
                 )
+        _finish_chat_task(
+            manager,
+            chat_task_id,
+            final_content,
+            tool_call_count=len(persist_state["tool_calls"]),
+        )
         try:
             content = final_content or ""
             manager.add_learning_log(
@@ -1721,6 +1795,86 @@ def create_agent_manager_router(
         threading.Thread(target=_run_tick, daemon=True).start()
         return {"status": "running", "agent_id": agent_id}
 
+    # ── Chief pause / resume ─────────────────────────────────
+
+    _PAUSED_STATUSES = ("input_required", "auth_required")
+
+    @agents_router.get("/{agent_id}/chief-pending")
+    async def chief_pending(agent_id: str):
+        """Return the question the chief is waiting on, if any."""
+        agent = manager.get_agent(agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        if agent.get("status") not in _PAUSED_STATUSES:
+            return {"pending": False}
+        cp = manager.get_latest_checkpoint(agent_id)
+        if not cp:
+            return {"pending": False}
+        tool_state = cp.get("tool_state") or {}
+        question = tool_state.get("question") or {}
+        return {
+            "pending": True,
+            "pause_kind": agent.get("status"),
+            "question": question,
+            "checkpoint_id": cp.get("id"),
+            "run_id": tool_state.get("run_id"),
+            "turns_so_far": tool_state.get("turns", 0),
+        }
+
+    @agents_router.post("/{agent_id}/chief-resume")
+    async def chief_resume(agent_id: str, request: Request):
+        """Resume a chief that previously emitted action=ask_user."""
+        from openjarvis.core.events import get_event_bus
+        from openjarvis.server.managed_agent_runtime import (
+            ManagedAgentRuntime,
+        )
+
+        agent = manager.get_agent(agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        if agent.get("status") not in _PAUSED_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail="Agent is not awaiting user input",
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        answer = str((body or {}).get("answer", "") or "").strip()
+        if not answer:
+            raise HTTPException(
+                status_code=400, detail="answer is required"
+            )
+
+        server_engine = getattr(request.app.state, "engine", None)
+        if server_engine is None:
+            raise HTTPException(
+                status_code=500, detail="Engine not available"
+            )
+        server_model = getattr(request.app.state, "model", "") or ""
+        trace_store = getattr(request.app.state, "trace_store", None)
+
+        runtime = ManagedAgentRuntime(
+            manager,
+            server_engine,
+            bus=get_event_bus(),
+            default_model=server_model,
+            trace_store=trace_store,
+        )
+        try:
+            response = runtime.resume(agent_id, answer)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        return {
+            "agent_id": agent_id,
+            "response": response,
+            "status": (manager.get_agent(agent_id) or {}).get("status"),
+        }
+
     # ── Recover ──────────────────────────────────────────────
 
     @agents_router.post("/{agent_id}/recover")
@@ -2170,21 +2324,30 @@ def create_agent_manager_router(
 
     # ── Traces ───────────────────────────────────────────────
 
+    def _trace_store_handle(request: Request):
+        """Reuse the server's TraceStore if it's wired in; otherwise build one."""
+        store = getattr(request.app.state, "trace_store", None)
+        if store is not None:
+            return store
+        from openjarvis.core.config import load_config
+        from openjarvis.traces.store import TraceStore
+
+        config = load_config()
+        return TraceStore(config.traces.db_path or "~/.openjarvis/traces.db")
+
     @agents_router.get("/{agent_id}/traces")
-    def list_traces(agent_id: str, limit: int = 20):
+    def list_traces(agent_id: str, request: Request, limit: int = 20):
         if not manager.get_agent(agent_id):
             raise HTTPException(status_code=404, detail="Agent not found")
         try:
-            from openjarvis.core.config import load_config
-            from openjarvis.traces.store import TraceStore
-
-            config = load_config()
-            store = TraceStore(config.traces.db_path or "~/.openjarvis/traces.db")
+            store = _trace_store_handle(request)
             traces = store.list_traces(agent=agent_id, limit=limit)
             return {
                 "traces": [
                     {
                         "id": t.trace_id,
+                        "parent_trace_id": t.parent_trace_id,
+                        "run_id": t.run_id,
                         "outcome": t.outcome,
                         "duration": t.total_latency_seconds,
                         "started_at": t.started_at,
@@ -2198,18 +2361,16 @@ def create_agent_manager_router(
             raise HTTPException(status_code=500, detail=str(exc))
 
     @agents_router.get("/{agent_id}/traces/{trace_id}")
-    def get_trace(agent_id: str, trace_id: str):
+    def get_trace(agent_id: str, trace_id: str, request: Request):
         try:
-            from openjarvis.core.config import load_config
-            from openjarvis.traces.store import TraceStore
-
-            config = load_config()
-            store = TraceStore(config.traces.db_path or "~/.openjarvis/traces.db")
+            store = _trace_store_handle(request)
             trace = store.get(trace_id)
             if trace is None:
                 raise HTTPException(status_code=404, detail="Trace not found")
             return {
                 "id": trace.trace_id,
+                "parent_trace_id": trace.parent_trace_id,
+                "run_id": trace.run_id,
                 "agent": trace.agent,
                 "outcome": trace.outcome,
                 "duration": trace.total_latency_seconds,
@@ -2225,6 +2386,42 @@ def create_agent_manager_router(
                     for s in trace.steps
                 ],
             }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @agents_router.get("/{agent_id}/traces/{trace_id}/tree")
+    def get_trace_tree(agent_id: str, trace_id: str, request: Request):
+        """Return a recursive tree of *trace_id* and its descendants.
+
+        Depth-first walk via TraceStore.list_children. Each node carries
+        identity + headline metrics so the UI can render an indented
+        call tree without making N+1 calls.
+        """
+        try:
+            store = _trace_store_handle(request)
+            root = store.get(trace_id)
+            if root is None:
+                raise HTTPException(status_code=404, detail="Trace not found")
+
+            def _serialize(trace: Any) -> Dict[str, Any]:
+                children = store.list_children(trace.trace_id)
+                return {
+                    "id": trace.trace_id,
+                    "parent_trace_id": trace.parent_trace_id,
+                    "run_id": trace.run_id,
+                    "agent": trace.agent,
+                    "outcome": trace.outcome,
+                    "duration": trace.total_latency_seconds,
+                    "started_at": trace.started_at,
+                    "model": trace.model,
+                    "result_preview": (trace.result or "")[:240],
+                    "metadata": trace.metadata,
+                    "children": [_serialize(c) for c in children],
+                }
+
+            return {"root": _serialize(root)}
         except HTTPException:
             raise
         except Exception as exc:

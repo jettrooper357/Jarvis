@@ -16,6 +16,7 @@ def test_activity_tracking_updates_last_activity_at(tmp_path):
     executor = AgentExecutor(mgr, bus)
 
     agent = mgr.create_agent("stall-test")
+    mgr.send_message(agent["id"], "run stall test", mode="queued")
 
     def fake_invoke(agent_dict):
         bus.publish(
@@ -44,6 +45,7 @@ def test_activity_tracking_filters_by_agent_id(tmp_path):
 
     agent_a = mgr.create_agent("agent-a")
     agent_b = mgr.create_agent("agent-b")
+    mgr.send_message(agent_a["id"], "run filter test", mode="queued")
 
     def fake_invoke(agent_dict):
         # Emit event for agent_b while agent_a is executing

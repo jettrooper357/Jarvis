@@ -79,9 +79,16 @@ function CodeBlockPre({ children, ...props }: any) {
 }
 
 function SpeakMessageButton({ content }: { content: string }) {
-  const ttsVoice = useAppStore((s) => s.settings.ttsVoice);
+  const ttsProvider = useAppStore((s) => s.settings.ttsProvider);
+  const ttsVoice = useAppStore((s) => {
+    const provider = s.settings.ttsProvider || 'auto';
+    const byProvider = s.settings.ttsVoicesByProvider || {};
+    return Object.prototype.hasOwnProperty.call(byProvider, provider)
+      ? byProvider[provider]
+      : s.settings.ttsVoice;
+  });
   const ttsSpeed = useAppStore((s) => s.settings.ttsSpeed);
-  const tts = useTTSPlayer({ voiceId: ttsVoice, speed: ttsSpeed });
+  const tts = useTTSPlayer({ provider: ttsProvider, voiceId: ttsVoice, speed: ttsSpeed });
   const handleClick = () => {
     if (tts.isSpeaking) {
       tts.stop();

@@ -104,3 +104,19 @@ def test_openai_tts_synthesize():
 
     assert result.audio == b"fake-openai-audio"
     assert result.voice_id == "nova"
+
+
+def test_elevenlabs_tts_synthesize():
+    from openjarvis.speech.elevenlabs_tts import ElevenLabsTTSBackend
+
+    backend = ElevenLabsTTSBackend(api_key="fake-key")
+
+    with patch(
+        "openjarvis.speech.elevenlabs_tts._elevenlabs_synthesize",
+        return_value=b"fake-elevenlabs-audio",
+    ):
+        result = backend.synthesize("Hello", voice_id="voice-1", output_format="wav")
+
+    assert result.audio == b"fake-elevenlabs-audio"
+    assert result.format == "mp3"
+    assert result.voice_id == "voice-1"

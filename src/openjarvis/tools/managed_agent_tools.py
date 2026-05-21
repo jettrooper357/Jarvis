@@ -289,6 +289,16 @@ class ManagedAgentDelegateTool(BaseTool):
                         "type": "string",
                         "description": "The exact subtask or question to send.",
                     },
+                    "tools_allowed": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional least-privilege override: the child "
+                            "may only call tools whose names appear here. "
+                            "Omit to let the child use its full configured "
+                            "toolset; pass an empty list to deny all tools."
+                        ),
+                    },
                 },
                 "required": ["agent_name_or_id", "message"],
             },
@@ -334,11 +344,29 @@ class ManagedAgentDelegateTool(BaseTool):
                 content="Delegation depth limit reached.",
             )
 
+        raw_tools = params.get("tools_allowed")
+        tools_allowed: Optional[List[str]]
+        if raw_tools is None:
+            tools_allowed = None
+        elif isinstance(raw_tools, list):
+            tools_allowed = [str(t).strip() for t in raw_tools if str(t).strip()]
+            if not tools_allowed:
+                # Preserve empty-list semantics: "no tools at all".
+                tools_allowed = []
+        else:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content="tools_allowed must be a list of tool names or null.",
+            )
         reply = ctx.runtime.run(
             target_id,
             str(params.get("message", "")),
             parent_agent_id=ctx.current_agent_id,
             visited_agent_ids=visited,
+            parent_trace_id=ctx.current_trace_id,
+            run_id=ctx.run_id,
+            tools_allowed=tools_allowed,
         )
         target_name = str(target.get("name", target_id))
         return ToolResult(

@@ -1091,11 +1091,36 @@ async def speech_stream(websocket: WebSocket):
 class TTSSynthesizeRequest(BaseModel):
     text: str
     voice_id: str = ""
+    provider: str = "auto"
     speed: float = 1.0
     output_format: str = "wav"
 
 
-def _resolve_voice(request: Request, voice_id: str):
+def _get_tts_for_provider(request: Request, provider: str = "auto"):
+    provider = (provider or "auto").strip()
+    if provider in ("", "auto"):
+        return getattr(request.app.state, "tts_backend", None)
+
+    cache = getattr(request.app.state, "tts_backends", None)
+    if cache is None:
+        cache = {}
+        request.app.state.tts_backends = cache
+    if provider in cache:
+        return cache[provider]
+
+    try:
+        from openjarvis.core.config import load_config
+        from openjarvis.speech._tts_discovery import create_tts_backend
+
+        config = getattr(request.app.state, "config", None) or load_config()
+        backend = create_tts_backend(provider, config)
+    except Exception:
+        backend = None
+    cache[provider] = backend
+    return backend
+
+
+def _resolve_voice(request: Request, voice_id: str, provider: str = "auto"):
     """Map a voice_id to (backend, kwargs) for synthesize/stream.
 
     Custom voices live in :mod:`openjarvis.speech.custom_voices` — a mix
@@ -1105,7 +1130,7 @@ def _resolve_voice(request: Request, voice_id: str):
     """
     from openjarvis.speech import custom_voices
 
-    default_tts = getattr(request.app.state, "tts_backend", None)
+    default_tts = _get_tts_for_provider(request, provider)
     clone_tts = getattr(request.app.state, "tts_clone_backend", None)
 
     if voice_id.startswith(("mix_", "clone_")):
@@ -1113,7 +1138,8 @@ def _resolve_voice(request: Request, voice_id: str):
         if voice is None:
             raise HTTPException(status_code=404, detail=f"Unknown voice: {voice_id}")
         if voice.kind == "mix":
-            return default_tts, {"voice_id": voice.kokoro_voice}
+            kokoro_tts = _get_tts_for_provider(request, "kokoro")
+            return kokoro_tts, {"voice_id": voice.kokoro_voice}
         # clone
         if clone_tts is None:
             raise HTTPException(
@@ -1136,7 +1162,7 @@ async def synthesize_speech(req: TTSSynthesizeRequest, request: Request):
     """Synthesize text to a single audio blob (non-streaming)."""
     from fastapi.responses import Response
 
-    backend, voice_kwargs = _resolve_voice(request, req.voice_id)
+    backend, voice_kwargs = _resolve_voice(request, req.voice_id, req.provider)
     if backend is None:
         raise HTTPException(status_code=501, detail="TTS backend not configured")
     kwargs: Dict[str, Any] = {
@@ -1166,7 +1192,7 @@ async def synthesize_speech_stream(req: TTSSynthesizeRequest, request: Request):
 
     from fastapi.responses import StreamingResponse
 
-    backend, voice_kwargs = _resolve_voice(request, req.voice_id)
+    backend, voice_kwargs = _resolve_voice(request, req.voice_id, req.provider)
     if backend is None:
         raise HTTPException(status_code=501, detail="TTS backend not configured")
 
@@ -1205,7 +1231,7 @@ async def synthesize_speech_stream(req: TTSSynthesizeRequest, request: Request):
 
 
 @speech_router.get("/voices")
-async def list_voices(request: Request):
+async def list_voices(request: Request, provider: str = "auto"):
     """Return available TTS voices, grouped by source.
 
     Response shape::
@@ -1213,18 +1239,33 @@ async def list_voices(request: Request):
         {
           "backend": "kokoro",
           "clone_backend": "f5-tts" | null,
-          "builtin": [{"id": "af_heart", "lang": "a", "gender": "f", "name": "heart"}, ...],
-          "custom": [{"id": "mix_xxx", "name": "...", "kind": "mix", "kokoro_voice": "..."}, ...]
+          "builtin": [{"id": "af_heart", "lang": "a", "name": "heart"}, ...],
+          "custom": [{"id": "mix_xxx", "name": "...", "kind": "mix"}, ...]
         }
     """
     from openjarvis.speech import custom_voices
 
-    tts = getattr(request.app.state, "tts_backend", None)
+    tts = _get_tts_for_provider(request, provider)
     clone_tts = getattr(request.app.state, "tts_clone_backend", None)
+    providers = []
+    try:
+        from openjarvis.core.config import load_config
+        from openjarvis.speech._tts_discovery import list_tts_providers
+
+        config = getattr(request.app.state, "config", None) or load_config()
+        providers = list_tts_providers(config)
+    except Exception:
+        providers = []
     builtin = []
     if tts is not None:
-        for v in tts.available_voices():
-            entry: Dict[str, Any] = {"id": v}
+        voice_options = (
+            tts.voice_options()
+            if hasattr(tts, "voice_options")
+            else [{"id": v} for v in tts.available_voices()]
+        )
+        for option in voice_options:
+            entry: Dict[str, Any] = dict(option)
+            v = str(entry.get("id", ""))
             if len(v) >= 3 and v[2] == "_":
                 entry["lang"] = v[0]
                 entry["gender"] = v[1]
@@ -1233,6 +1274,8 @@ async def list_voices(request: Request):
     custom = [custom_voices.to_public_dict(v) for v in custom_voices.list_voices()]
     return {
         "backend": tts.backend_id if tts is not None else None,
+        "provider": provider or "auto",
+        "providers": providers,
         "clone_backend": clone_tts.backend_id if clone_tts is not None else None,
         "builtin": builtin,
         "custom": custom,
@@ -1289,14 +1332,25 @@ async def create_voice_clone(request: Request):
     ref_text = (form.get("ref_text") or "").strip()
     audio_file = form.get("file")
     if audio_file is None or not hasattr(audio_file, "read"):
-        raise HTTPException(status_code=400, detail="Missing audio file in 'file' field")
+        raise HTTPException(
+            status_code=400,
+            detail="Missing audio file in 'file' field",
+        )
     audio_bytes = await audio_file.read()
     if len(audio_bytes) < 1024:
-        raise HTTPException(status_code=400, detail="Audio file is too small (need ~6-10s of speech)")
+        raise HTTPException(
+            status_code=400,
+            detail="Audio file is too small (need ~6-10s of speech)",
+        )
     filename = getattr(audio_file, "filename", "ref.wav") or "ref.wav"
     suffix = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ".wav"
     try:
-        voice = custom_voices.add_clone(name, audio_bytes, ref_text=ref_text, suffix=suffix)
+        voice = custom_voices.add_clone(
+            name,
+            audio_bytes,
+            ref_text=ref_text,
+            suffix=suffix,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return custom_voices.to_public_dict(voice)

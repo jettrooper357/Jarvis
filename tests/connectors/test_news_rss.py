@@ -186,3 +186,41 @@ def test_sync_updates_status_counters(connector):
     assert status.items_total == 3
     assert status.items_synced == 3
     assert status.last_sync is not None
+
+
+def test_sync_skips_bad_feed_and_keeps_good_items(tmp_path):
+    """One broken feed should not abort the whole News/RSS sync."""
+    import json
+
+    from openjarvis.connectors.news_rss import NewsRSSConnector
+
+    config_path = tmp_path / "news_rss.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "feeds": [
+                    {"name": "Bad Feed", "url": "https://example.com/bad.xml"},
+                    {"name": "Good Feed", "url": "https://example.com/good.xml"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    c = NewsRSSConnector(config_path=str(config_path))
+
+    def fake_fetch(url: str) -> str:
+        if "bad" in url:
+            return "<html>not rss"
+        return _SAMPLE_RSS
+
+    with patch("openjarvis.connectors.news_rss._fetch_feed", side_effect=fake_fetch):
+        docs = list(c.sync())
+
+    status = c.sync_status()
+    assert len(docs) == 3
+    assert status.state == "idle"
+    assert status.items_total == 3
+    assert status.items_synced == 3
+    assert status.last_sync is not None
+    assert status.error is not None
+    assert "Bad Feed" in status.error

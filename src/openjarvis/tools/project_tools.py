@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+import re
 from typing import Any, Dict, List
 
 from openjarvis.core.registry import ToolRegistry
@@ -20,6 +22,67 @@ def _truncate(value: str, limit: int = 220) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
+
+
+def _default_task_dates() -> Dict[str, str]:
+    start = datetime.now().date()
+    return {
+        "start_date": start.isoformat(),
+        "due_date": (start + timedelta(days=1)).isoformat(),
+    }
+
+
+def _clean_task_title(title: str) -> str:
+    text = str(title or "").strip()
+    # Strip delegation-prompt artifacts. The chief's delegation message has
+    # the shape "...GOAL: <goal>\nACCEPTANCE CRITERIA: ...\nBUDGET: ...".
+    # If a subordinate pastes any of that block into the title field, we
+    # extract just the goal phrase by (1) jumping past GOAL: if present,
+    # then (2) truncating at the next section header.
+    goal_match = re.search(r"\bgoal\s*:\s*", text, flags=re.IGNORECASE)
+    if goal_match:
+        text = text[goal_match.end():].strip(" .,:;-\"'") or text
+    section_split = re.split(
+        r"\s*(?:acceptance\s+criteria|budget|deliverables?|depends_on|"
+        r"task_id|tools_allowed|budget_max_turns|when\s+you\s+finish)\s*:",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )
+    if len(section_split) > 1:
+        text = section_split[0].strip(" .,:;-\"'") or text
+    # If the title is still a long multi-sentence blob, keep only the
+    # first sentence.
+    if len(text) > 120:
+        first_sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0]
+        if first_sentence and len(first_sentence) < len(text):
+            text = first_sentence.strip(" .,:;-\"'") or text
+    text = re.sub(
+        r"\s+(?:to|in|on|under)\s+(?:the\s+)?"
+        r"[A-Za-z0-9 &'._-]+?\s+project\.?$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip(" .,:;-\"'")
+    song_match = re.search(
+        r"\b(?:called|named|titled)\s+['\"]?(?P<title>[^'\"]+?)['\"]?$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if song_match and re.search(
+        r"\b(?:song|single|track)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return song_match.group("title").strip(" .,:;-\"'") or text
+    task_match = re.search(
+        r"\btask\s+(?:to|for)\s+(?P<title>.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if task_match:
+        return task_match.group("title").strip(" .,:;-\"'") or text
+    return text
 
 
 def _format_project(project: Dict[str, Any]) -> str:
@@ -189,6 +252,10 @@ class ProjectCreateTaskTool(BaseTool):
                         ),
                     },
                     "status": {"type": "string", "description": "Task status."},
+                    "start_date": {
+                        "type": "string",
+                        "description": "Optional ISO start date.",
+                    },
                     "assigned_to": {
                         "type": "string",
                         "description": "Optional assignee name.",
@@ -207,7 +274,7 @@ class ProjectCreateTaskTool(BaseTool):
 
     def execute(self, **params: Any) -> ToolResult:
         project_id = str(params.get("project_id", "") or "").strip()
-        title = str(params.get("title", "") or "").strip()
+        title = _clean_task_title(str(params.get("title", "") or "").strip())
         if not project_id or not title:
             return ToolResult(
                 tool_name=self.spec.name,
@@ -226,10 +293,15 @@ class ProjectCreateTaskTool(BaseTool):
                 "assigned_to",
                 "owner",
                 "priority",
+                "start_date",
                 "due_date",
             )
             if params.get(key) is not None
         }
+        fields["title"] = title
+        defaults = _default_task_dates()
+        fields.setdefault("start_date", defaults["start_date"])
+        fields.setdefault("due_date", defaults["due_date"])
         try:
             task = _project_store().create_task(project_id, **fields)
         except KeyError:

@@ -4,8 +4,8 @@ setlocal EnableExtensions EnableDelayedExpansion
 REM ============================================================
 REM Object:         Start_Claude_AI.bat
 REM Author:         Jim Thomas
-REM Revision:       1.0
-REM Revision Date:  05/18/2026
+REM Revision:       1.2
+REM Revision Date:  05/20/2026
 REM Created:        05/18/2026
 REM
 REM History:
@@ -16,6 +16,14 @@ REM                                   online web-login mode or local Ollama mode
 REM                                   Includes WSL/Ollama checks, model validation,
 REM                                   Anthropic-compatible endpoint checks, and
 REM                                   step/error logging.
+REM 05/20/2026    Jim Thomas    1.1   Added explicit Claude Code local model pinning
+REM                                   with ANTHROPIC_MODEL and Claude default model
+REM                                   variables.
+REM 05/20/2026    Jim Thomas    1.2   Changed local/Ollama launch to use Ollama's
+REM                                   Claude integration:
+REM                                   ollama launch claude --model <model>.
+REM                                   This prevents Claude Code from launching directly
+REM                                   into the normal online Claude model picker.
 REM ============================================================
 
 TITLE Start Claude AI
@@ -33,13 +41,8 @@ SET "OLLAMA_HOST_URL=http://localhost:11434"
 SET "OLLAMA_WSL_HOST=0.0.0.0:11434"
 
 REM Keep this small for your hardware.
-REM Ollama's Claude Code documentation recommends models like qwen3.5,
-REM but this value is intentionally editable.
+REM Change this one line when you want to test a different Ollama model.
 SET "LOCAL_CLAUDE_MODEL=qwen2.5-coder:7b"
-
-REM If you later pull a better small Claude-Code-compatible model,
-REM change LOCAL_CLAUDE_MODEL above. Do not rewrite the whole script.
-REM That would be work, and we are pretending to avoid that now.
 
 REM Log settings.
 SET "LOG_FOLDER=%PROJECT_FOLDER%\Logs"
@@ -52,18 +55,18 @@ SET "RESET_WSL_FIRST=0"
 
 REM Claude launch settings.
 SET "CLAUDE_ONLINE_ARGS="
+
+REM CHANGE 05/20/2026:
+REM Kept for logging/reference, but local launch now uses:
+REM ollama launch claude --model "%LOCAL_CLAUDE_MODEL%"
 SET "CLAUDE_LOCAL_ARGS=--model ""%LOCAL_CLAUDE_MODEL%"""
 
 REM OpenJarvis web stack settings.
 REM The backend MUST be running or the Vite dev server gets ECONNREFUSED
-REM on every /v1 and /health proxy call. Edit the values; do not rewrite
-REM the script.
+REM on every /v1 and /health proxy call.
 SET "START_OPENJARVIS_STACK=1"
-REM Default model for the OpenJarvis backend (reliable tool-calling + code).
-REM mmap is disabled in the Ollama engine (use_mmap=false) so weights load
-REM fully into RAM once instead of paging per-token over the slow /mnt/f
-REM mount. Phase 2 (setup-ollama-store.ps1) moves the store to a fast ext4
-REM VHD; the engine option is harmless there.
+
+REM Default model for the OpenJarvis backend.
 SET "OJ_BACKEND_CMD=uv run jarvis serve --model qwen2.5-coder:7b"
 SET "OJ_BACKEND_HEALTH_URL=http://localhost:8000/health"
 SET "OJ_FRONTEND_FOLDER=%PROJECT_FOLDER%\frontend"
@@ -159,9 +162,11 @@ SET "ANTHROPIC_API_KEY="
 SET "ANTHROPIC_AUTH_TOKEN="
 SET "ANTHROPIC_CUSTOM_HEADERS="
 SET "ANTHROPIC_CUSTOM_MODEL_OPTION="
+SET "ANTHROPIC_MODEL="
 SET "ANTHROPIC_DEFAULT_OPUS_MODEL="
 SET "ANTHROPIC_DEFAULT_SONNET_MODEL="
 SET "ANTHROPIC_DEFAULT_HAIKU_MODEL="
+SET "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="
 
 call :OpenVSCode
 
@@ -183,30 +188,54 @@ call :Log INFO "Preparing Claude local/Ollama mode."
 call :CheckCommand "wsl"
 if errorlevel 1 goto FAIL
 
+REM CHANGE 05/20/2026:
+REM Local mode now uses Ollama's Claude launcher.
+REM This requires the Windows-side ollama command to be available in PATH.
+call :CheckCommand "ollama"
+if errorlevel 1 goto FAIL
+
 call :PrepareOllama
 if errorlevel 1 goto FAIL
 
-REM Phase 2: move the Ollama model store onto a native ext4 VHD (fast).
-REM Best-effort and runs AFTER :PrepareOllama so it wins the OLLAMA_MODELS
-REM override. Needs admin; if skipped, the -nommap model still runs on
-REM /mnt/f. See scripts\setup-ollama-store.ps1 / .sh.
-call :Log INFO "Configuring fast Ollama model store (setup-ollama-store.ps1)."
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\setup-ollama-store.ps1"
+REM Phase 2: move the Ollama model store onto a native ext4 VHD if available.
+REM Best-effort and runs AFTER :PrepareOllama so it wins the OLLAMA_MODELS override.
+call :Log INFO "Configuring fast Ollama model store if setup script exists."
+
+if exist "%~dp0scripts\setup-ollama-store.ps1" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\setup-ollama-store.ps1" >> "%LOG_FILE%" 2>&1
+    if errorlevel 1 (
+        call :Log WARN "setup-ollama-store.ps1 returned an error. Continuing to validate Ollama model."
+    )
+) else (
+    call :Log WARN "setup-ollama-store.ps1 not found. Skipping fast Ollama model store setup."
+)
 
 call :ValidateClaudeLocalModel
 if errorlevel 1 goto FAIL
 
 call :OpenVSCode
 
-call :Log INFO "Launching Claude local mode."
-call :Log INFO "Command: claude %CLAUDE_LOCAL_ARGS%"
-call :Log INFO "ANTHROPIC_BASE_URL=%OLLAMA_HOST_URL%"
+call :Log INFO "Launching Claude local mode through Ollama Claude integration."
+call :Log INFO "Command: ollama launch claude --model %LOCAL_CLAUDE_MODEL%"
+call :Log INFO "Ollama base URL expected at: %OLLAMA_HOST_URL%"
+call :Log INFO "Local model: %LOCAL_CLAUDE_MODEL%"
 
-REM These variables are required for Claude Code to use Ollama's Anthropic-compatible API.
-REM They are set only inside the launched cmd window.
-start "Claude - Local Ollama" cmd /k "cd /d ""%PROJECT_FOLDER%"" && set ANTHROPIC_AUTH_TOKEN=ollama&& set ANTHROPIC_API_KEY=&& set ANTHROPIC_BASE_URL=%OLLAMA_HOST_URL%&& claude %CLAUDE_LOCAL_ARGS%"
+REM ============================================================
+REM CHANGE 05/20/2026:
+REM Do NOT launch Claude directly here.
+REM Direct launch:
+REM     claude --model "%LOCAL_CLAUDE_MODEL%"
+REM still opens Claude Code's normal online model system on some installs.
+REM
+REM Correct local launch:
+REM     ollama launch claude --model "%LOCAL_CLAUDE_MODEL%"
+REM
+REM This lets Ollama set the Anthropic-compatible routing for Claude Code.
+REM ============================================================
 
-call :Log INFO "Claude local window launched."
+start "Claude - Local Ollama" cmd /k "cd /d ""%PROJECT_FOLDER%"" && echo Claude Local Ollama Mode && echo Model: %LOCAL_CLAUDE_MODEL% && echo Base URL: %OLLAMA_HOST_URL% && echo. && echo Launching Claude Code through Ollama... && echo. && ollama launch claude --model ""%LOCAL_CLAUDE_MODEL%"""
+
+call :Log INFO "Claude local/Ollama window launched."
 goto SUCCESS
 
 REM ============================================================
@@ -281,6 +310,7 @@ if not exist "%OLLAMA_WINDOWS_MODEL_FOLDER%" (
 )
 
 call :Log INFO "Configuring WSL ollama.service."
+
 wsl -u root bash -lc "mkdir -p '%OLLAMA_WSL_MODEL_FOLDER%' /etc/systemd/system/ollama.service.d; chmod -R a+rwX '%OLLAMA_WSL_MODEL_FOLDER%' 2>/dev/null; printf '[Service]\nEnvironment=OLLAMA_MODELS=%OLLAMA_WSL_MODEL_FOLDER%\nEnvironment=OLLAMA_HOST=%OLLAMA_WSL_HOST%\nEnvironment=OLLAMA_KEEP_ALIVE=30m\nEnvironment=OLLAMA_NUM_PARALLEL=1\n' > /etc/systemd/system/ollama.service.d/override.conf; systemctl daemon-reload; systemctl enable --now ollama; systemctl restart ollama" >> "%LOG_FILE%" 2>&1
 
 if errorlevel 1 (
@@ -315,6 +345,11 @@ call :Log INFO "Checking/pulling local model."
 wsl bash -lc "ollama list | grep -qF '%LOCAL_CLAUDE_MODEL%' || ollama pull '%LOCAL_CLAUDE_MODEL%'" >> "%LOG_FILE%" 2>&1
 if errorlevel 1 (
     call :Log ERROR "Could not verify or pull model: %LOCAL_CLAUDE_MODEL%"
+    echo ERROR: Could not verify or pull model:
+    echo %LOCAL_CLAUDE_MODEL%
+    echo.
+    echo Check log:
+    echo %LOG_FILE%
     exit /b 1
 )
 
@@ -333,6 +368,13 @@ if not "%MESSAGES_RC%"=="0" (
     call :Log ERROR "Claude local model failed /v1/messages. curl exit code: %MESSAGES_RC%"
     echo ERROR: Claude local model failed Anthropic-compatible /v1/messages.
     echo Model: %LOCAL_CLAUDE_MODEL%
+    echo.
+    echo This usually means one of these is true:
+    echo   1. Ollama is too old.
+    echo   2. The model does not support the Anthropic-compatible route.
+    echo   3. The model name is not exactly correct.
+    echo   4. Ollama is running, but not the service instance this script configured.
+    echo.
     echo Check log:
     echo %LOG_FILE%
     exit /b 1
@@ -421,6 +463,7 @@ call :StartOpenJarvisStack
 if errorlevel 1 (
     call :Log WARN "OpenJarvis web stack did not start cleanly. The Claude window is still up; see messages above and the log."
 )
+
 call :Log INFO "Start_Claude_AI.bat completed successfully."
 echo.
 echo Claude launcher completed.

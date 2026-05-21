@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import contextvars
+import json
 import logging
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from openjarvis.agents.capabilities import (
@@ -32,6 +35,11 @@ class ManagedAgentExecutionContext:
     current_agent_id: str
     parent_agent_id: str = ""
     visited_agent_ids: tuple[str, ...] = ()
+    # Trace lineage so delegation builds a single tree:
+    #   current_trace_id is THIS run's own id (the parent's perspective);
+    #   run_id groups every trace from one user request together.
+    current_trace_id: Optional[str] = None
+    run_id: Optional[str] = None
 
 
 _execution_context: contextvars.ContextVar[ManagedAgentExecutionContext | None] = (
@@ -126,6 +134,12 @@ def _role_guidance(agent_record: Dict[str, Any]) -> str:
             "delegated task — call project_create first.\n"
             "- Use project_create_task to create trackable project "
             "tasks/subtasks before assigning agent work.\n"
+            "- If no dates are supplied, create the task anyway; the "
+            "system defaults start_date to today and due_date to tomorrow.\n"
+            "- For project/task setup and tracking work, assign execution "
+            "to the Workflow Manager or Project Manager after the project "
+            "task exists; do not keep that work on Chief unless no manager "
+            "agent exists.\n"
             "- Use managed_agent_directory to discover available agents by "
             "role, then assign execution tasks to the best matching "
             "subordinate with managed_agent_assign_task and the relevant "
@@ -154,8 +168,27 @@ def _role_guidance(agent_record: Dict[str, Any]) -> str:
             "  - Use project_create for new projects.\n"
             "  - Use project_create_task for trackable tasks and "
             "subtasks.\n"
+            "  - If no dates are supplied, create the task anyway; the "
+            "system defaults start_date to today and due_date to tomorrow.\n"
             "  - Assign agent work only after a project task exists, "
-            "passing its project_task_id into managed_agent_assign_task."
+            "passing its project_task_id into managed_agent_assign_task.\n"
+            "\n"
+            "CRITICAL — task creation discipline:\n"
+            "- Create EXACTLY ONE project_create_task per delegated "
+            "request. Do NOT call project_create_task a second time in the "
+            "same turn to 'clean up' a prior attempt — the first call "
+            "succeeded or the result tells you why it didn't. If a delegate "
+            "message contains one goal, that is one task.\n"
+            "- The task TITLE is the concise SUBJECT of the request "
+            "(e.g. \"Raise One for the Old Guard\"), NOT the full "
+            "instruction. Never paste a delegation goal, an "
+            "\"ACCEPTANCE CRITERIA:\" block, or the entire user message "
+            "into the title field. If the request is "
+            "\"release a new song called X\", the title is \"Release new "
+            "song: X\" or simply \"X\" — not the full sentence.\n"
+            "- Only create multiple tasks in one turn when the user "
+            "explicitly lists multiple items (e.g. \"create three tasks: "
+            "A, B, and C\")."
         )
     is_information_officer = (
         "information officer" in role_key
@@ -215,15 +248,42 @@ def _role_guidance(agent_record: Dict[str, Any]) -> str:
     )
 
 
+def _today_anchor() -> str:
+    """One-line "today is X" anchor for every managed-agent system prompt.
+
+    Models without a current-date prior (e.g. gpt-4o-mini, whose training
+    cuts off in 2024) will invent dates when asked to default to "today".
+    Anchoring this in the system prompt is the cheapest reliable fix.
+    """
+    today = datetime.now().date()
+    tomorrow = today + timedelta(days=1)
+    return (
+        f"Today is {today.isoformat()} (use this for any 'today / now / "
+        f"soon' reasoning). If a project task or milestone needs a "
+        f"start_date and none was supplied, use {today.isoformat()}; for "
+        f"due_date / end_date use {tomorrow.isoformat()}. Never invent a "
+        "year from your training data -- always use the value above."
+    )
+
+
 def _build_managed_system_prompt(agent_record: Dict[str, Any]) -> str:
     config = agent_record.get("config", {}) or {}
     parts: List[str] = []
+    # The today-anchor goes FIRST so the date is the first thing the
+    # model sees and stays salient through long prompts.
+    parts.append(_today_anchor())
     system_prompt = str(config.get("system_prompt", "") or "").strip()
     instruction = str(config.get("instruction", "") or "").strip()
+    personality = str(config.get("personality", "") or "").strip()
     if system_prompt:
         parts.append(system_prompt)
     if instruction and instruction != system_prompt:
         parts.append(f"Agent instruction:\n{instruction}")
+    if personality:
+        parts.append(
+            "Personality (voice / tone / mannerisms — shape how you reply, "
+            "without altering the task or any rules above):\n" + personality
+        )
     role_guidance = _role_guidance(agent_record)
     if role_guidance:
         parts.append(role_guidance)
@@ -248,6 +308,73 @@ def _tool_calls_completed_agent_task(
     )
 
 
+_PROJECT_TASK_VERBS = ("add", "create", "make", "open", "log", "record")
+_PROJECT_MATCH_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "for",
+    "project",
+    "projects",
+    "the",
+    "to",
+}
+
+
+def _text_tokens(value: str) -> List[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", str(value or "").casefold())
+        if token and token not in _PROJECT_MATCH_STOPWORDS
+    ]
+
+
+def _text_key(value: str) -> str:
+    return " ".join(_text_tokens(value))
+
+
+def _default_chat_project_task_dates() -> Dict[str, str]:
+    start = datetime.now().date()
+    return {
+        "start_date": start.isoformat(),
+        "due_date": (start + timedelta(days=1)).isoformat(),
+    }
+
+
+_MULTI_TASK_RE = re.compile(
+    r"\b("
+    r"(?:create|add|make|open)\s+(?:two|three|four|five|\d+)\s+tasks?"
+    r"|tasks?\s*:\s*[A-Za-z0-9]"
+    r"|multiple\s+tasks?"
+    r"|several\s+tasks?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _user_asked_for_multiple_tasks(text: str) -> bool:
+    """Detect an explicit signal that the user wants more than one task.
+
+    Used to gate the "one project_create_task per turn" cap. The default
+    is single-task: the cap only lifts when the message has an obvious
+    multi-item phrasing.
+    """
+    if not text:
+        return False
+    return bool(_MULTI_TASK_RE.search(str(text)))
+
+
+def _clean_project_task_title(title: str) -> str:
+    text = str(title or "").strip()
+    return re.sub(
+        r"\s+(?:to|in|on|under)\s+(?:the\s+)?"
+        r"[A-Za-z0-9 &'._-]+?\s+project\.?$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip(" .,:;-\"'") or text
+
+
 class ManagedAgentRuntime:
     """Run managed agents synchronously with tool-calling and delegation."""
 
@@ -258,11 +385,41 @@ class ManagedAgentRuntime:
         *,
         bus: Any = None,
         default_model: str = "",
+        trace_store: Any = None,
+        credential_scrubber: Any = None,
+        credential_vault: Any = None,
     ) -> None:
+        from openjarvis.security.credential_scrubber import CredentialScrubber
+        from openjarvis.security.credential_vault import CredentialVault
+
         self._manager = manager
         self._engine = engine
         self._bus = bus
         self._default_model = default_model
+        self._trace_store = trace_store
+        self._scrubber = credential_scrubber or CredentialScrubber()
+        self._vault = credential_vault or CredentialVault()
+
+    def _scrub_tool_calls(
+        self,
+        tool_calls: Optional[List[Dict[str, Any]]],
+        run_id: Optional[str],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Apply the credential scrubber to ``arguments``/``result`` fields."""
+        if not tool_calls or not run_id:
+            return tool_calls
+        scrub = self._scrubber.scrub
+        out: List[Dict[str, Any]] = []
+        for call in tool_calls:
+            new_call = dict(call)
+            if "arguments" in new_call:
+                new_call["arguments"] = scrub(
+                    new_call.get("arguments", ""), run_id
+                )
+            if "result" in new_call:
+                new_call["result"] = scrub(new_call.get("result", ""), run_id)
+            out.append(new_call)
+        return out
 
     def run(
         self,
@@ -271,12 +428,23 @@ class ManagedAgentRuntime:
         *,
         parent_agent_id: str = "",
         visited_agent_ids: Optional[Sequence[str]] = None,
+        parent_trace_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        tools_allowed: Optional[Sequence[str]] = None,
     ) -> str:
         agent_record = self._manager.get_agent(agent_id)
         if agent_record is None:
             raise KeyError(f"Agent {agent_id!r} not found")
+        # The "all open tasks are future-scheduled" gate is for scheduler
+        # ticks and channel messages -- contexts where the runtime is
+        # opportunistically firing the agent. When a chief explicitly
+        # delegates (parent_agent_id set), the subordinate is being told
+        # to do work *now*, regardless of its existing task backlog.
+        # Gating delegations here silently swallows the chief's request
+        # and produces the "Cannot complete" message users have seen.
         if (
-            hasattr(self._manager, "has_open_linked_task")
+            not parent_agent_id
+            and hasattr(self._manager, "has_open_linked_task")
             and self._manager.has_open_linked_task(agent_id)
             and hasattr(self._manager, "has_runnable_task")
             and not self._manager.has_runnable_task(agent_id)
@@ -289,6 +457,19 @@ class ManagedAgentRuntime:
         mode = "delegated" if parent_agent_id else "channel"
         started_at = time.time()
         agent_name = str(agent_record.get("name", agent_id))
+        # Trace lineage: every run gets a fresh trace_id; the root run
+        # uses its own trace_id as the run_id so children share it.
+        from openjarvis.core.types import _trace_id as _new_trace_id
+
+        effective_trace_id = _new_trace_id()
+        effective_run_id = run_id or effective_trace_id
+
+        # Apply the credential scrubber to *inbound* user content. A
+        # delegated subordinate sees whatever message the chief sent;
+        # if the chief embedded a credential the parent ran registered
+        # against this run_id, replace it before it lands in the
+        # persistent agent_messages log.
+        user_content = self._scrubber.scrub(user_content, effective_run_id)
         if self._bus is not None:
             try:
                 self._bus.publish(
@@ -296,6 +477,7 @@ class ManagedAgentRuntime:
                     {
                         "agent_id": agent_id,
                         "agent_name": agent_name,
+                        "parent_agent_id": parent_agent_id or "",
                         "mode": mode,
                     },
                 )
@@ -310,6 +492,7 @@ class ManagedAgentRuntime:
                     {
                         "agent_id": agent_id,
                         "agent_name": agent_name,
+                        "parent_agent_id": parent_agent_id or "",
                         "message_id": message_id,
                         "mode": mode,
                     },
@@ -322,6 +505,7 @@ class ManagedAgentRuntime:
         self._project_writeback(agent_record, phase="start", summary=user_content)
         response_text = ""
         tool_calls: Optional[List[Dict[str, Any]]] = None
+        project_task_ids_to_enqueue: List[str] = []
         had_error = False
         try:
             response_text, tool_calls = self._run_turn(
@@ -330,6 +514,10 @@ class ManagedAgentRuntime:
                 message_id=message_id,
                 parent_agent_id=parent_agent_id,
                 visited_agent_ids=visited_agent_ids or (),
+                trace_id=effective_trace_id,
+                run_id=effective_run_id,
+                parent_trace_id=parent_trace_id,
+                tools_allowed=tools_allowed,
             )
         except Exception as exc:
             logger.exception("Managed agent turn failed for %s", agent_id)
@@ -340,10 +528,36 @@ class ManagedAgentRuntime:
                 self._manager.mark_message_delivered(message_id)
             except Exception:
                 logger.exception("Failed to mark message delivered for %s", agent_id)
+        if not had_error:
+            materialized = self._maybe_materialize_project_task_request(
+                agent_record=agent_record,
+                user_content=user_content,
+                response_text=response_text,
+                tool_calls=tool_calls,
+            )
+            if materialized is not None:
+                tool_calls = list(tool_calls or [])
+                tool_calls.append(materialized)
+                metadata = materialized.get("metadata")
+                if isinstance(metadata, dict):
+                    project_task_id = str(
+                        metadata.get("project_task_id") or ""
+                    )
+                    if project_task_id:
+                        project_task_ids_to_enqueue.append(project_task_id)
+                result_text = str(materialized.get("result", "") or "")
+                if result_text and result_text not in response_text:
+                    response_text = (
+                        f"{response_text}\n\n{result_text}"
+                        if response_text
+                        else result_text
+                    )
+        safe_response = self._scrubber.scrub(response_text, effective_run_id)
+        safe_tool_calls = self._scrub_tool_calls(tool_calls, effective_run_id)
         self._manager.store_agent_response(
             agent_id,
-            response_text,
-            tool_calls=tool_calls or None,
+            safe_response,
+            tool_calls=safe_tool_calls or None,
         )
         if (
             not had_error
@@ -353,12 +567,22 @@ class ManagedAgentRuntime:
                 agent_id,
                 note="Completed by successful project setup tool execution.",
             )
+            project_task_ids_to_enqueue.extend(
+                self._project_task_ids_from_tool_calls(tool_calls)
+            )
         self._project_writeback(
             agent_record,
             phase="finish",
             summary=response_text,
             error=had_error,
         )
+        if not had_error:
+            for project_task_id in dict.fromkeys(project_task_ids_to_enqueue):
+                self._enqueue_project_task_for_agent(
+                    agent_record=agent_record,
+                    project_task_id=project_task_id,
+                    description=user_content,
+                )
         if self._bus is not None:
             try:
                 event_type = (
@@ -369,6 +593,7 @@ class ManagedAgentRuntime:
                 payload = {
                     "agent_id": agent_id,
                     "agent_name": agent_name,
+                    "parent_agent_id": parent_agent_id or "",
                     "duration": time.time() - started_at,
                     "status": "error" if had_error else "ok",
                     "summary": response_text[:240],
@@ -378,6 +603,38 @@ class ManagedAgentRuntime:
                 self._bus.publish(event_type, payload)
             except Exception:
                 logger.exception("Failed to publish completion event for %s", agent_id)
+        if self._trace_store is not None:
+            try:
+                from openjarvis.core.types import Trace
+
+                trace = Trace(
+                    trace_id=effective_trace_id,
+                    parent_trace_id=parent_trace_id,
+                    run_id=effective_run_id,
+                    query=user_content,
+                    agent=agent_id,
+                    model=str(
+                        (agent_record.get("config") or {}).get("model", "")
+                        or self._default_model
+                    ),
+                    engine=getattr(self._engine, "engine_id", ""),
+                    result=response_text[:4000],
+                    outcome="error" if had_error else "success",
+                    started_at=started_at,
+                    ended_at=time.time(),
+                    total_latency_seconds=time.time() - started_at,
+                    metadata={
+                        "agent_name": agent_name,
+                        "mode": mode,
+                        "parent_agent_id": parent_agent_id,
+                        "tool_calls": tool_calls or [],
+                    },
+                )
+                self._trace_store.save(trace)
+            except Exception:
+                logger.exception(
+                    "Failed to save trace for managed-agent run %s", agent_id
+                )
         return response_text
 
     # ── Project-task writeback (Mission Control) ──────────────────
@@ -503,6 +760,348 @@ class ManagedAgentRuntime:
                 agent_record.get("id"),
             )
 
+    def _maybe_materialize_project_task_request(
+        self,
+        *,
+        agent_record: Dict[str, Any],
+        user_content: str,
+        response_text: str,
+        tool_calls: Optional[List[Dict[str, Any]]],
+    ) -> Optional[Dict[str, Any]]:
+        """Create the project task when the model acknowledged but skipped it.
+
+        This is intentionally narrow: it only handles explicit user requests
+        to add/create a task in a named project, and only for agents that are
+        already allowed to use ``project_create_task``.
+        """
+        if "project_create_task" not in _effective_tool_names(agent_record):
+            return None
+        if any(
+            call.get("tool") == "project_create_task"
+            and call.get("success", False)
+            for call in tool_calls or []
+        ):
+            return None
+        # If this agent successfully delegated the work, the subordinate
+        # already handled it (created the task in its own run). The
+        # chief's tool_calls only contain managed_agent_delegate, not the
+        # inner project_create_task -- so without this check we would
+        # materialize a *second* task at the chief level for the same
+        # user request. This is the root of the "two tasks not one" bug.
+        if any(
+            call.get("tool")
+            in (
+                "managed_agent_delegate",
+                "managed_agent_assign_task",
+                "managed_agent_message",
+            )
+            and call.get("success", False)
+            for call in tool_calls or []
+        ):
+            return None
+
+        parsed = self._parse_project_task_request(user_content)
+        if parsed is None:
+            return None
+
+        try:
+            store = self._manager._project_store()
+            project = self._match_project(store.list_projects(), parsed["project"])
+            if project is None:
+                return {
+                    "tool": "project_create_task",
+                    "arguments": json.dumps(parsed),
+                    "result": (
+                        "Project task not recorded: no matching project was "
+                        f"found for '{parsed['project']}'."
+                    ),
+                    "success": False,
+                    "latency": 0.0,
+                }
+
+            title = _clean_project_task_title(parsed["title"])
+            existing = self._find_existing_project_task(
+                store.list_tasks(project["id"]),
+                title,
+            )
+            if existing is not None:
+                return {
+                    "tool": "project_create_task",
+                    "arguments": json.dumps(parsed),
+                    "result": (
+                        "Project task already exists: "
+                        f"{existing.get('title', title)}."
+                    ),
+                    "success": True,
+                    "latency": 0.0,
+                }
+
+            target_agent = self._preferred_worker_for_project_task(agent_record, None)
+            agent_name = str(
+                (target_agent or agent_record).get("name")
+                or agent_record.get("name")
+                or agent_record["id"]
+            )
+            default_dates = _default_chat_project_task_dates()
+            task = store.create_task(
+                project["id"],
+                title=title,
+                description=user_content,
+                status="In Progress",
+                assigned_to=agent_name,
+                owner=agent_name,
+                priority="Medium",
+                start_date=default_dates["start_date"],
+                due_date=default_dates["due_date"],
+            )
+            return {
+                "tool": "project_create_task",
+                "arguments": json.dumps(
+                    {
+                        "project_id": project["id"],
+                        "title": title,
+                        "status": "In Progress",
+                        "start_date": default_dates["start_date"],
+                        "due_date": default_dates["due_date"],
+                    }
+                ),
+                "result": (
+                    "Project task recorded: "
+                    f"{task['title']} in {project.get('name', 'project')}."
+                ),
+                "success": True,
+                "latency": 0.0,
+                "metadata": {
+                    "project_id": task["project_id"],
+                    "project_task_id": task["id"],
+                },
+            }
+        except Exception:
+            logger.exception(
+                "Failed to materialize project task request for agent %s",
+                agent_record.get("id"),
+            )
+            return None
+
+    def _parse_project_task_request(
+        self,
+        user_content: str,
+    ) -> Optional[Dict[str, str]]:
+        text = str(user_content or "").strip()
+        lowered = text.casefold()
+        if "task" not in lowered or "project" not in lowered:
+            return None
+        if not any(re.search(rf"\b{verb}\b", lowered) for verb in _PROJECT_TASK_VERBS):
+            return None
+
+        project_match = re.search(
+            r"\b(?:to|in|on|under|for)\s+(?:the\s+)?"
+            r"(?P<project>[A-Za-z0-9 &'._-]+?)\s+project\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if project_match is None:
+            project_match = re.search(
+                r"\bproject\s+(?:called|named)?\s*"
+                r"(?P<project>[A-Za-z0-9 &'._-]+)",
+                text,
+                flags=re.IGNORECASE,
+            )
+        if project_match is None:
+            return None
+
+        project_name = project_match.group("project").strip(" .,:;-\"'")
+        title = self._project_task_title_from_request(text, project_match.end())
+        if not project_name or not title:
+            return None
+        return {"project": project_name, "title": title}
+
+    def _project_task_title_from_request(
+        self,
+        text: str,
+        project_end: int,
+    ) -> str:
+        song_match = re.search(
+            r"\b(?:called|named|titled)\s+['\"]?(?P<title>[^'\"]+?)['\"]?\.?$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if song_match and re.search(
+            r"\breleas(?:e|ing)\b.*\bsong\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            return _clean_project_task_title(song_match.group("title"))
+
+        tail = text[project_end:].strip(" .,:;-")
+        tail = re.sub(
+            r"^(?:for|to|called|named|titled)\s+",
+            "",
+            tail,
+            flags=re.IGNORECASE,
+        ).strip(" .,:;-\"'")
+        if tail:
+            return _clean_project_task_title(tail[:120])
+
+        generic = re.sub(
+            r"\b(?:add|create|make|open|log|record)\b\s+(?:a\s+)?task\b",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip(" .,:;-")
+        generic = re.sub(
+            r"^(?:called|named|titled)\s+",
+            "",
+            generic,
+            flags=re.IGNORECASE,
+        ).strip(" .,:;-\"'")
+        return _clean_project_task_title(generic[:120]) or "New Project Task"
+
+    def _match_project(
+        self,
+        projects: Sequence[Dict[str, Any]],
+        requested_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        requested_key = _text_key(requested_name)
+        requested_tokens = set(requested_key.split())
+        if not requested_key or not requested_tokens:
+            return None
+
+        best_project: Optional[Dict[str, Any]] = None
+        best_score = 0
+        for project in projects:
+            project_key = _text_key(str(project.get("name", "")))
+            project_tokens = set(project_key.split())
+            if not project_tokens:
+                continue
+            overlap = requested_tokens & project_tokens
+            score = len(overlap) * 10
+            if requested_key in project_key or project_key in requested_key:
+                score += 100
+            if score > best_score:
+                best_project = project
+                best_score = score
+
+        required_overlap = 1 if len(requested_tokens) == 1 else 2
+        if best_project is None:
+            return None
+        best_tokens = set(_text_key(str(best_project.get("name", ""))).split())
+        if len(requested_tokens & best_tokens) < required_overlap:
+            return None
+        return best_project
+
+    def _find_existing_project_task(
+        self,
+        tasks: Sequence[Dict[str, Any]],
+        title: str,
+    ) -> Optional[Dict[str, Any]]:
+        title_key = _text_key(title)
+        for task in tasks:
+            if _text_key(str(task.get("title", ""))) == title_key:
+                return task
+        return None
+
+    def _project_task_ids_from_tool_calls(
+        self,
+        tool_calls: Optional[List[Dict[str, Any]]],
+    ) -> List[str]:
+        ids: List[str] = []
+        for call in tool_calls or []:
+            if call.get("tool") != "project_create_task" or not call.get("success"):
+                continue
+            result = str(call.get("result") or "")
+            match = re.search(r"\bid=([A-Za-z0-9_-]+)", result)
+            if match:
+                ids.append(match.group(1))
+        return ids
+
+    def _preferred_worker_for_project_task(
+        self,
+        agent_record: Dict[str, Any],
+        project_task: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        assigned_to = str((project_task or {}).get("assigned_to") or "").strip()
+        if assigned_to:
+            exact = next(
+                (
+                    agent
+                    for agent in self._manager.list_agents()
+                    if str(agent.get("name", "")).strip().casefold()
+                    == assigned_to.casefold()
+                ),
+                None,
+            )
+            if exact is not None:
+                return exact
+
+        role = str(agent_record.get("org_role", "") or "").casefold()
+        name = str(agent_record.get("name", "") or "").casefold()
+        is_chief = "chief" in role or "chief" in name
+        if not is_chief:
+            return agent_record
+
+        workflow = next(
+            (
+                agent
+                for agent in self._manager.list_agents()
+                if agent.get("id") != agent_record.get("id")
+                and (
+                    "workflow manager"
+                    in str(agent.get("org_role", "") or agent.get("name", "")).casefold()
+                    or "project manager"
+                    in str(agent.get("org_role", "") or agent.get("name", "")).casefold()
+                )
+            ),
+            None,
+        )
+        return workflow or agent_record
+
+    def _enqueue_project_task_for_agent(
+        self,
+        *,
+        agent_record: Dict[str, Any],
+        project_task_id: str,
+        description: str,
+    ) -> None:
+        """Create runnable agent work for a chat-created project task."""
+        try:
+            ptask = self._manager._project_store().get_task(project_task_id)
+            target_agent = self._preferred_worker_for_project_task(
+                agent_record,
+                ptask,
+            )
+            if target_agent is None:
+                return
+            agent_id = str(target_agent["id"])
+            target_name = str(target_agent.get("name") or agent_id)
+            existing = [
+                task
+                for task in self._manager.list_tasks(agent_id)
+                if str(task.get("project_task_id") or "") == project_task_id
+                and str(task.get("status") or "") not in ("completed", "failed")
+            ]
+            if existing:
+                return
+            project_id = str((ptask or {}).get("project_id") or "") or None
+            if ptask is not None and str(ptask.get("assigned_to") or "") != target_name:
+                self._manager._project_store().update_task(
+                    project_task_id,
+                    assigned_to=target_name,
+                    owner=target_name,
+                )
+            self._manager.create_task(
+                agent_id,
+                description=str((ptask or {}).get("title") or description),
+                status="active",
+                project_task_id=project_task_id,
+                project_id=project_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to enqueue materialized project task for agent %s",
+                agent_record.get("id"),
+            )
+
     def _run_turn(
         self,
         *,
@@ -511,6 +1110,10 @@ class ManagedAgentRuntime:
         message_id: str,
         parent_agent_id: str,
         visited_agent_ids: Sequence[str],
+        trace_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        parent_trace_id: Optional[str] = None,
+        tools_allowed: Optional[Sequence[str]] = None,
     ) -> tuple[str, List[Dict[str, Any]]]:
         agent_id = agent_record["id"]
         config = agent_record.get("config", {}) or {}
@@ -529,7 +1132,13 @@ class ManagedAgentRuntime:
             current_agent_id=agent_id,
             parent_agent_id=parent_agent_id,
             visited_agent_ids=tuple(visited_agent_ids),
+            current_trace_id=trace_id,
+            run_id=run_id,
         )
+
+        orchestrator_mode = str(
+            config.get("orchestrator_mode", "") or ""
+        ).strip().lower()
 
         with use_managed_agent_context(execution_context):
             if agent_record.get("agent_type", "") == "deep_research":
@@ -538,6 +1147,15 @@ class ManagedAgentRuntime:
                     user_content=user_content,
                     model=model,
                     execution_context=execution_context,
+                    tools_allowed=tools_allowed,
+                )
+            if orchestrator_mode == "chief":
+                return self._run_chief_turn(
+                    agent_record=agent_record,
+                    user_content=user_content,
+                    model=model,
+                    execution_context=execution_context,
+                    tools_allowed=tools_allowed,
                 )
             return self._run_standard_turn(
                 agent_record=agent_record,
@@ -545,6 +1163,7 @@ class ManagedAgentRuntime:
                 message_id=message_id,
                 model=model,
                 execution_context=execution_context,
+                tools_allowed=tools_allowed,
             )
 
     def _run_deep_research_turn(
@@ -554,6 +1173,7 @@ class ManagedAgentRuntime:
         user_content: str,
         model: str,
         execution_context: ManagedAgentExecutionContext,
+        tools_allowed: Optional[Sequence[str]] = None,
     ) -> tuple[str, List[Dict[str, Any]]]:
         from openjarvis.agents.deep_research import DeepResearchAgent
 
@@ -566,6 +1186,7 @@ class ManagedAgentRuntime:
             execution_context=execution_context,
             interactive=True,
             confirm_callback=lambda _prompt: True,
+            restrict_to_tool_names=tools_allowed,
         )
         collected_tool_calls: List[Dict[str, Any]] = []
 
@@ -601,6 +1222,472 @@ class ManagedAgentRuntime:
         result = dr_agent.run(user_content)
         return result.content or "No results found.", collected_tool_calls
 
+    def _run_chief_turn(
+        self,
+        *,
+        agent_record: Dict[str, Any],
+        user_content: str,
+        model: str,
+        execution_context: ManagedAgentExecutionContext,
+        tools_allowed: Optional[Sequence[str]] = None,
+    ) -> tuple[str, List[Dict[str, Any]]]:
+        from openjarvis.agents.orchestrator import OrchestratorAgent
+
+        config = agent_record.get("config", {}) or {}
+        tool_instances = build_agent_tool_instances(
+            agent_record,
+            engine=self._engine,
+            model=model,
+            bus=self._bus,
+            execution_context=execution_context,
+            interactive=True,
+            confirm_callback=lambda _prompt: True,
+            restrict_to_tool_names=tools_allowed,
+        )
+
+        registry = self._build_chief_registry(str(agent_record["id"]))
+
+        collected_tool_calls: List[Dict[str, Any]] = []
+
+        chief = OrchestratorAgent(
+            engine=self._engine,
+            model=model,
+            tools=tool_instances,
+            bus=self._bus,
+            max_turns=int(config.get("max_turns", 6)),
+            temperature=float(config.get("temperature", 0.2)),
+            max_tokens=int(config.get("max_tokens", 1024)),
+            mode="chief",
+            chief_registry=registry,
+            interactive=True,
+            confirm_callback=lambda _prompt: True,
+        )
+
+        original_execute = chief._executor.execute
+        chief_agent_id = str(agent_record["id"])
+
+        def _tracked_execute(tool_call: ToolCall) -> ToolResult:
+            # Signal to the UI / Mission Control that the chief is
+            # parked on a tool call. Best-effort: a failure to update
+            # status must not abort the tool execution.
+            try:
+                self._manager.update_agent(
+                    chief_agent_id,
+                    status="waiting_on_tool",
+                    current_activity=f"tool: {tool_call.name}",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to set waiting_on_tool status for %s",
+                    chief_agent_id,
+                )
+            try:
+                result = original_execute(tool_call)
+            finally:
+                try:
+                    self._manager.update_agent(
+                        chief_agent_id,
+                        status="running",
+                        current_activity="",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to clear waiting_on_tool status for %s",
+                        chief_agent_id,
+                    )
+            collected_tool_calls.append(
+                {
+                    "tool": tool_call.name,
+                    "arguments": tool_call.arguments or "",
+                    "result": result.content or "",
+                    "success": bool(result.success),
+                    "latency": float(result.latency_seconds or 0.0),
+                }
+            )
+            return result
+
+        chief._executor.execute = _tracked_execute
+        result = chief.run(user_content)
+        self._maybe_checkpoint_chief(
+            agent_record=agent_record,
+            execution_context=execution_context,
+            result=result,
+        )
+        return result.content or "No results.", collected_tool_calls
+
+    def _build_chief_registry(self, chief_id: str) -> Dict[str, Dict[str, object]]:
+        """Direct subordinates first; fall back to all-other-agents."""
+        direct: Dict[str, Dict[str, object]] = {}
+        others: Dict[str, Dict[str, object]] = {}
+        try:
+            for other in self._manager.list_agents():
+                other_id = str(other.get("id", "") or "")
+                if not other_id or other_id == chief_id:
+                    continue
+                entry: Dict[str, object] = {
+                    "name": other.get("name", other_id),
+                    "role": str(other.get("org_role", "") or ""),
+                    "hint": str(other.get("summary_memory", "") or "")[:120],
+                }
+                if str(other.get("manager_agent_id", "") or "") == chief_id:
+                    direct[other_id] = entry
+                else:
+                    others[other_id] = entry
+        except Exception:
+            logger.exception("Failed to build chief registry for %s", chief_id)
+        return direct or others
+
+    def _maybe_checkpoint_chief(
+        self,
+        *,
+        agent_record: Dict[str, Any],
+        execution_context: ManagedAgentExecutionContext,
+        result: Any,
+    ) -> None:
+        """If the chief paused for user input, persist a resumable checkpoint.
+
+        Status routing depends on what the chief is waiting on:
+        ``expected_response_type == "credential"`` -> ``auth_required``
+        (UI surfaces a password input and the resume answer is redacted
+        in the trace); anything else -> ``input_required``.
+        """
+        chief_meta = (getattr(result, "metadata", None) or {}).get("chief") or {}
+        if chief_meta.get("action") != "ask_user":
+            return
+        checkpoint = chief_meta.get("checkpoint")
+        if not isinstance(checkpoint, dict):
+            return
+        agent_id = str(agent_record["id"])
+        tick_id = (
+            str(execution_context.run_id or "")
+            or str(execution_context.current_trace_id or "")
+            or "chief_pause"
+        )
+        conversation_state = {"messages": checkpoint.get("messages", [])}
+        tool_state = {
+            k: v for k, v in checkpoint.items() if k != "messages"
+        }
+        tool_state["trace_id"] = execution_context.current_trace_id
+        tool_state["run_id"] = execution_context.run_id
+        question = checkpoint.get("question") or {}
+        is_credential = (
+            str(question.get("expected_response_type", "") or "").lower()
+            == "credential"
+        )
+        status = "auth_required" if is_credential else "input_required"
+        try:
+            self._manager.save_checkpoint(
+                agent_id,
+                tick_id=tick_id,
+                conversation_state=conversation_state,
+                tool_state=tool_state,
+            )
+            self._manager.update_agent(agent_id, status=status)
+        except Exception:
+            logger.exception(
+                "Failed to persist chief checkpoint for %s",
+                agent_id,
+            )
+
+    def resume(self, agent_id: str, user_answer: str) -> str:
+        """Resume a chief that previously emitted action=ask_user.
+
+        Loads the latest checkpoint, appends ``user_answer`` to the
+        restored conversation, runs the chief's resume entry, and
+        persists results. Trace lineage stays in the same ``run_id``.
+        """
+        from openjarvis.agents.orchestrator import OrchestratorAgent
+        from openjarvis.core.types import (
+            Message,
+            Role,
+            ToolCall,
+            ToolResult,
+            Trace,
+            _trace_id,
+        )
+
+        agent_record = self._manager.get_agent(agent_id)
+        if agent_record is None:
+            raise KeyError(f"Agent {agent_id!r} not found")
+        checkpoint = self._manager.get_latest_checkpoint(agent_id)
+        if checkpoint is None:
+            raise ValueError(f"No checkpoint to resume for {agent_id}")
+
+        conv = checkpoint.get("conversation_state") or {}
+        tool_state = checkpoint.get("tool_state") or {}
+
+        messages: List[Message] = []
+        for raw in conv.get("messages", []):
+            try:
+                role = Role(raw["role"])
+            except Exception:
+                role = Role.USER
+            msg = Message(
+                role=role,
+                content=raw.get("content", "") or "",
+                name=raw.get("name"),
+                tool_call_id=raw.get("tool_call_id"),
+            )
+            if raw.get("tool_calls"):
+                msg.tool_calls = [
+                    ToolCall(
+                        id=tc["id"],
+                        name=tc["name"],
+                        arguments=tc["arguments"],
+                    )
+                    for tc in raw["tool_calls"]
+                ]
+            messages.append(msg)
+
+        tool_results = [
+            ToolResult(
+                tool_name=tr.get("tool_name", ""),
+                content=tr.get("content", "") or "",
+                success=bool(tr.get("success", True)),
+            )
+            for tr in tool_state.get("tool_results", [])
+        ]
+        already_delegated = bool(tool_state.get("already_delegated", False))
+        turns_so_far = int(tool_state.get("turns", 0) or 0)
+        saved_run_id = tool_state.get("run_id")
+        saved_trace_id = tool_state.get("trace_id")
+        saved_question = tool_state.get("question") or {}
+        was_credential = (
+            str(saved_question.get("expected_response_type", "") or "").lower()
+            == "credential"
+        )
+
+        config = agent_record.get("config", {}) or {}
+        model = (
+            config.get("model")
+            or getattr(self._engine, "_model", "")
+            or self._default_model
+        )
+        if not model:
+            raise RuntimeError("No model configured for resume")
+
+        started_at = time.time()
+        new_trace_id = _trace_id()
+        effective_run_id = saved_run_id or new_trace_id
+
+        # Two-pronged credential handling on resume:
+        #
+        # 1. The vault stores the raw value and hands back an opaque
+        #    token. The chief is given the TOKEN as its user_answer, so
+        #    its in-memory messages, any checkpoint it produces, any
+        #    delegation message it builds, and the inference engine call
+        #    itself only ever see the token. Tokens are dereferenced
+        #    inside the executor wrapper just before each tool runs.
+        # 2. The scrubber is registered with the raw value as defence in
+        #    depth: if a tool *result* echoes the credential back
+        #    (e.g., an API response that includes the token), it gets
+        #    redacted before we persist it.
+        #
+        # Both are purged in the finally block.
+        scrubber_registered = False
+        chief_user_answer = user_answer
+        if was_credential:
+            scrubber_registered = self._scrubber.register(
+                effective_run_id, user_answer
+            )
+            token = self._vault.store(effective_run_id, user_answer)
+            if token:
+                chief_user_answer = token
+
+        try:
+            execution_context = ManagedAgentExecutionContext(
+                runtime=self,
+                manager=self._manager,
+                engine=self._engine,
+                current_agent_id=agent_id,
+                current_trace_id=new_trace_id,
+                run_id=effective_run_id,
+            )
+
+            # Persist the user's answer as a channel message so transcripts
+            # and Mission Control reflect that an answer arrived. For
+            # credential answers, never write the raw value -- agent_messages
+            # is a long-lived audit log and would expose the secret to any
+            # tool that lists messages. The chief still receives the raw
+            # value in-memory below; only the persisted copy is redacted.
+            if was_credential:
+                message_to_persist = (
+                    f"[credential supplied: {len(user_answer)} chars]"
+                )
+            else:
+                message_to_persist = user_answer
+            user_msg = self._manager.send_message(
+                agent_id, message_to_persist, mode="channel"
+            )
+            message_id = user_msg["id"]
+
+            registry = self._build_chief_registry(agent_id)
+            tool_instances = build_agent_tool_instances(
+                agent_record,
+                engine=self._engine,
+                model=model,
+                bus=self._bus,
+                execution_context=execution_context,
+                interactive=True,
+                confirm_callback=lambda _prompt: True,
+            )
+
+            with use_managed_agent_context(execution_context):
+                chief = OrchestratorAgent(
+                    engine=self._engine,
+                    model=model,
+                    tools=tool_instances,
+                    bus=self._bus,
+                    max_turns=int(config.get("max_turns", 6)),
+                    temperature=float(config.get("temperature", 0.2)),
+                    max_tokens=int(config.get("max_tokens", 1024)),
+                    mode="chief",
+                    chief_registry=registry,
+                    interactive=True,
+                    confirm_callback=lambda _prompt: True,
+                )
+
+                # Wrap the chief's executor: dereference vault tokens
+                # against this run_id just before the actual tool runs,
+                # so the chief itself never holds the raw secret.
+                original_execute = chief._executor.execute
+
+                def _dereferencing_execute(tc: ToolCall) -> ToolResult:
+                    resolved_args = self._vault.resolve(
+                        tc.arguments or "", effective_run_id
+                    )
+                    if resolved_args != (tc.arguments or ""):
+                        substituted = ToolCall(
+                            id=tc.id,
+                            name=tc.name,
+                            arguments=resolved_args,
+                        )
+                    else:
+                        substituted = tc
+                    try:
+                        self._manager.update_agent(
+                            agent_id,
+                            status="waiting_on_tool",
+                            current_activity=f"tool: {tc.name}",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to set waiting_on_tool on resume for %s",
+                            agent_id,
+                        )
+                    try:
+                        out = original_execute(substituted)
+                    finally:
+                        try:
+                            self._manager.update_agent(
+                                agent_id,
+                                status="running",
+                                current_activity="",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to clear waiting_on_tool on resume for %s",
+                                agent_id,
+                            )
+                    if out.content:
+                        scrubbed = self._scrubber.scrub(
+                            out.content, effective_run_id
+                        )
+                        if scrubbed != out.content:
+                            out.content = scrubbed
+                    return out
+
+                chief._executor.execute = _dereferencing_execute
+
+                result = chief.resume_chief(
+                    messages=messages,
+                    tool_results=tool_results,
+                    already_delegated=already_delegated,
+                    turns_so_far=turns_so_far,
+                    user_answer=chief_user_answer,
+                )
+
+            response_text = result.content or ""
+            # Scrub before persistence: the chief may have summarized
+            # the credential into its response, e.g. echoing what it
+            # used. The trace and the agent-response log both get the
+            # placeholder version.
+            safe_response_text = self._scrubber.scrub(
+                response_text, effective_run_id
+            )
+            self._manager.store_agent_response(agent_id, safe_response_text)
+            try:
+                self._manager.mark_message_delivered(message_id)
+            except Exception:
+                logger.exception(
+                    "Failed to mark resume message delivered for %s", agent_id
+                )
+
+            # Trace continuity: parent is the original ask_user trace, run_id
+            # stays the same so the whole call tree groups together.
+            # For credential answers, never persist the raw value in the
+            # trace -- it would leak through TraceStore queries and FTS.
+            if self._trace_store is not None:
+                try:
+                    trace_query = (
+                        "[credential redacted]"
+                        if was_credential
+                        else user_answer
+                    )
+                    trace = Trace(
+                        trace_id=new_trace_id,
+                        parent_trace_id=saved_trace_id,
+                        run_id=effective_run_id,
+                        query=trace_query,
+                        agent=agent_id,
+                        model=str(model),
+                        engine=getattr(self._engine, "engine_id", ""),
+                        result=safe_response_text[:4000],
+                        outcome="success",
+                        started_at=started_at,
+                        ended_at=time.time(),
+                        total_latency_seconds=time.time() - started_at,
+                        metadata={
+                            "resume_of": saved_trace_id,
+                            "agent_name": agent_record.get("name", ""),
+                            "credential_response": was_credential,
+                        },
+                    )
+                    self._trace_store.save(trace)
+                except Exception:
+                    logger.exception(
+                        "Failed to save resume trace for %s", agent_id
+                    )
+
+            # If the chief paused again, record the new checkpoint and keep
+            # input_required; otherwise return to idle.
+            new_meta = (result.metadata or {}).get("chief") or {}
+            if (
+                new_meta.get("action") == "ask_user"
+                and isinstance(new_meta.get("checkpoint"), dict)
+            ):
+                self._maybe_checkpoint_chief(
+                    agent_record=agent_record,
+                    execution_context=execution_context,
+                    result=result,
+                )
+            else:
+                try:
+                    self._manager.update_agent(agent_id, status="idle")
+                except Exception:
+                    logger.exception(
+                        "Failed to clear input_required status for %s",
+                        agent_id,
+                    )
+
+            return safe_response_text
+        finally:
+            if scrubber_registered:
+                self._scrubber.purge(effective_run_id)
+            # Always purge the vault for this run; safe to call even if
+            # nothing was stored.
+            self._vault.purge(effective_run_id)
+
     def _run_standard_turn(
         self,
         *,
@@ -609,6 +1696,7 @@ class ManagedAgentRuntime:
         message_id: str,
         model: str,
         execution_context: ManagedAgentExecutionContext,
+        tools_allowed: Optional[Sequence[str]] = None,
     ) -> tuple[str, List[Dict[str, Any]]]:
         config = agent_record.get("config", {}) or {}
         tool_instances = build_agent_tool_instances(
@@ -619,6 +1707,7 @@ class ManagedAgentRuntime:
             execution_context=execution_context,
             interactive=True,
             confirm_callback=lambda _prompt: True,
+            restrict_to_tool_names=tools_allowed,
         )
         tool_specs = [tool.to_openai_function() for tool in tool_instances]
         tool_map = {tool.spec.name: tool for tool in tool_instances}
@@ -643,6 +1732,26 @@ class ManagedAgentRuntime:
         max_turns = int(config.get("max_turns", 10))
         collected_prefix = ""
         collected_tool_calls: List[Dict[str, Any]] = []
+        # Identical-call dedupe: when a model loops and calls the same
+        # tool with the same arguments twice in one run, the second
+        # call returns the cached result instead of re-executing. This
+        # is the safety net behind the "two tasks from one request"
+        # bug -- subordinates that re-issue project_create_task get
+        # the original result back and move on.
+        seen_calls: Dict[tuple, Dict[str, Any]] = {}
+        # Semantic cap for project_create_task: one delegated request =
+        # one task unless the message explicitly lists multiple items.
+        # Models otherwise tend to create two tasks per request -- one
+        # with the raw goal pasted as the title, then a clean retry.
+        project_task_created = False
+        multi_task_allowed = _user_asked_for_multiple_tasks(user_content)
+
+        def _normalize_args(args_str: str) -> str:
+            """Canonicalize JSON-ish args so trivially-different forms dedupe."""
+            try:
+                return json.dumps(json.loads(args_str), sort_keys=True)
+            except Exception:
+                return (args_str or "").strip()
 
         for _turn in range(max_turns):
             kwargs: Dict[str, Any] = {
@@ -681,31 +1790,83 @@ class ManagedAgentRuntime:
                 tool_args = _tool_call_args(raw)
                 tool_result_content = f"Tool '{tool_name}' not available"
                 tool_success = False
-                try:
-                    tool = tool_map.get(tool_name)
-                    if tool is None:
-                        raise KeyError(tool_name)
-                    executor = ToolExecutor(
-                        tools=[tool],
-                        bus=self._bus,
-                        interactive=True,
-                        confirm_callback=lambda _prompt: True,
-                    )
-                    result_obj = executor.execute(
-                        ToolCall(
-                            id=str(raw.get("id", "")),
-                            name=tool_name,
-                            arguments=tool_args,
-                        )
-                    )
-                    tool_result_content = result_obj.content or ""
-                    tool_success = bool(result_obj.success)
-                except Exception as exc:
-                    logger.exception(
-                        "Managed agent tool execution failed for %s",
+                call_key = (tool_name, _normalize_args(tool_args))
+                cached = seen_calls.get(call_key)
+                if cached is not None:
+                    logger.info(
+                        "Managed agent %s tried duplicate tool call "
+                        "%s(%s); returning cached result",
+                        agent_record.get("id", "?"),
                         tool_name,
+                        tool_args[:120],
                     )
-                    tool_result_content = f"Error executing {tool_name}: {exc}"
+                    tool_result_content = (
+                        "(duplicate call -- this tool was already run with "
+                        "these exact arguments earlier in this turn. "
+                        "Original result:)\n" + str(cached.get("content", ""))
+                    )
+                    tool_success = bool(cached.get("success", True))
+                elif (
+                    tool_name == "project_create_task"
+                    and project_task_created
+                    and not multi_task_allowed
+                ):
+                    logger.info(
+                        "Managed agent %s tried a second project_create_task "
+                        "in one turn without an explicit multi-task signal; "
+                        "suppressing to avoid duplicate task creation.",
+                        agent_record.get("id", "?"),
+                    )
+                    tool_result_content = (
+                        "(suppressed -- a project_create_task already "
+                        "succeeded in this turn. The user asked for one "
+                        "task. If you genuinely need a second task, the "
+                        "user must list it explicitly (e.g. \"create two "
+                        "tasks: A and B\"). Report success using the task "
+                        "already created above.)"
+                    )
+                    tool_success = False
+                    seen_calls[call_key] = {
+                        "content": tool_result_content,
+                        "success": tool_success,
+                    }
+                else:
+                    try:
+                        tool = tool_map.get(tool_name)
+                        if tool is None:
+                            raise KeyError(tool_name)
+                        executor = ToolExecutor(
+                            tools=[tool],
+                            bus=self._bus,
+                            interactive=True,
+                            confirm_callback=lambda _prompt: True,
+                        )
+                        result_obj = executor.execute(
+                            ToolCall(
+                                id=str(raw.get("id", "")),
+                                name=tool_name,
+                                arguments=tool_args,
+                            )
+                        )
+                        tool_result_content = result_obj.content or ""
+                        tool_success = bool(result_obj.success)
+                    except Exception as exc:
+                        logger.exception(
+                            "Managed agent tool execution failed for %s",
+                            tool_name,
+                        )
+                        tool_result_content = (
+                            f"Error executing {tool_name}: {exc}"
+                        )
+                    seen_calls[call_key] = {
+                        "content": tool_result_content,
+                        "success": tool_success,
+                    }
+                    if (
+                        tool_name == "project_create_task"
+                        and tool_success
+                    ):
+                        project_task_created = True
 
                 collected_tool_calls.append(
                     {

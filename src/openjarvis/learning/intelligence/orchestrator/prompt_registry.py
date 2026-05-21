@@ -48,6 +48,58 @@ FINAL_ANSWER: <your final answer>
 NOW SOLVE THE TASK. You MUST use at least one tool - choose the best one for the task.
 """
 
+# Doc-aligned variant. The "tools-required" rule in SYSTEM_PROMPT_TEMPLATE
+# above is intentional for the SFT/GRPO training pipelines (every trace
+# carries a tool call, which the training pipelines depend on). This
+# variant matches the Chief Orchestrator design doc instead:
+# "Prefer the simplest valid action. If a direct answer works, use it."
+# Use it for interactive sessions where the model should be free to
+# answer from its own knowledge. Pass the rendered string into
+# OrchestratorAgent via the ``system_prompt`` kwarg.
+DOC_ALIGNED_SYSTEM_PROMPT_TEMPLATE = """\
+You are an intelligent orchestrator that solves tasks by picking the
+simplest valid action.
+
+=== AVAILABLE TOOLS ===
+{tools_description}
+
+=== TOOL SELECTION GUIDE ===
+{tool_selection_guide}
+
+=== RESPONSE FORMAT ===
+You MUST respond in this EXACT format. When you have an answer:
+
+THOUGHT: <brief reasoning about what the task needs>
+FINAL_ANSWER: <your final answer>
+
+When you need a tool first:
+
+THOUGHT: <reasoning about which tool to use and why>
+TOOL: <exact tool name from the list>
+INPUT: <input for the tool>
+
+After getting tool results, use another tool or give the final answer:
+
+THOUGHT: <analyze the result>
+FINAL_ANSWER: <your final answer>
+
+=== CRITICAL RULES ===
+1. Prefer the simplest valid action. If you can answer the question from
+   your own knowledge, do so -- emit THOUGHT followed by FINAL_ANSWER
+   without calling any tool.
+2. Use a tool when the task genuinely needs one: math precision,
+   external data, code execution, file access, or search.
+3. Match the tool to the task type (see guide above).
+4. For LLM tools, write clear prompts that will get good responses.
+5. Prefer specialized tools when available (calculator for math,
+   code_interpreter for code).
+6. Never invent tool results. If a tool fails, decide whether to retry,
+   try a different tool, or give a partial FINAL_ANSWER that explains
+   what is missing.
+
+NOW SOLVE THE TASK.
+"""
+
 # ---------------------------------------------------------------------------
 # Tool descriptions for OpenJarvis built-in tools
 # ---------------------------------------------------------------------------
@@ -339,7 +391,49 @@ def build_system_prompt(
     )
 
 
+def build_doc_aligned_system_prompt(
+    tool_names: Optional[List[str]] = None,
+    *,
+    tools: Optional[List["BaseTool"]] = None,
+) -> str:
+    """Doc-aligned variant of :func:`build_system_prompt`.
+
+    Identical inputs and structure, but uses
+    :data:`DOC_ALIGNED_SYSTEM_PROMPT_TEMPLATE` so the model is allowed
+    to answer directly when no tool is needed. The default builder is
+    preserved unchanged because the SFT/GRPO pipelines depend on every
+    rendered trace containing at least one tool call.
+    """
+    rendered_default = build_system_prompt(tool_names=tool_names, tools=tools)
+    # Swap the template: re-render with the doc-aligned one by reusing
+    # the tool description + selection guide blocks the default builder
+    # already produced. The block delimiters are stable across both
+    # templates so a simple split is reliable.
+    tools_block = ""
+    guide_block = ""
+    try:
+        tools_block = (
+            rendered_default.split("=== AVAILABLE TOOLS ===\n", 1)[1]
+            .split("=== TOOL SELECTION GUIDE ===\n", 1)[0]
+            .rstrip("\n")
+        )
+        guide_block = (
+            rendered_default.split("=== TOOL SELECTION GUIDE ===\n", 1)[1]
+            .split("=== RESPONSE FORMAT ===\n", 1)[0]
+            .rstrip("\n")
+        )
+    except IndexError:
+        # Default template shape changed -- fall back to the default.
+        return rendered_default
+    return DOC_ALIGNED_SYSTEM_PROMPT_TEMPLATE.format(
+        tools_description=tools_block,
+        tool_selection_guide=guide_block,
+    )
+
+
 __all__ = [
+    "DOC_ALIGNED_SYSTEM_PROMPT_TEMPLATE",
     "TOOL_DESCRIPTIONS",
+    "build_doc_aligned_system_prompt",
     "build_system_prompt",
 ]

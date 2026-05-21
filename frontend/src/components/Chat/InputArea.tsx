@@ -42,21 +42,31 @@ function buildContextMessages(messages: ChatMessage[], limit: number): ApiMessag
 export function InputArea() {
   const [input, setInput] = useState('');
   const [wakeAwaitingCommand, setWakeAwaitingCommand] = useState(false);
+  const [ttsMicMuted, setTtsMicMuted] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const wakeAwaitingCommandRef = useRef(false);
   const wakeTimeoutRef = useRef<number | null>(null);
+  const ttsUnmuteTimeoutRef = useRef<number | null>(null);
 
   const activeId = useAppStore((s) => s.activeId);
   const selectedModel = useAppStore((s) => s.selectedModel);
   const models = useAppStore((s) => s.models);
   const isStreaming = useAppStore((s) => s.streamState.isStreaming);
   const defaultModel = useAppStore((s) => s.settings.defaultModel);
+  const defaultAgent = useAppStore((s) => s.settings.defaultAgent);
   const speechEnabled = useAppStore((s) => s.settings.speechEnabled);
   const speechStreaming = useAppStore((s) => s.settings.speechStreaming);
   const ttsAutoplay = useAppStore((s) => s.settings.ttsAutoplay);
-  const ttsVoice = useAppStore((s) => s.settings.ttsVoice);
+  const ttsProvider = useAppStore((s) => s.settings.ttsProvider);
+  const ttsVoice = useAppStore((s) => {
+    const provider = s.settings.ttsProvider || 'auto';
+    const byProvider = s.settings.ttsVoicesByProvider || {};
+    return Object.prototype.hasOwnProperty.call(byProvider, provider)
+      ? byProvider[provider]
+      : s.settings.ttsVoice;
+  });
   const ttsSpeed = useAppStore((s) => s.settings.ttsSpeed);
   const wakeWords = useAppStore((s) => s.settings.wakeWords);
   const maxTokens = useAppStore((s) => s.settings.maxTokens);
@@ -91,8 +101,38 @@ export function InputArea() {
       setWakeAwaitingCommand(false);
     }, 8000);
   }, []);
+  const muteMicForTts = useCallback(() => {
+    if (ttsUnmuteTimeoutRef.current !== null) {
+      window.clearTimeout(ttsUnmuteTimeoutRef.current);
+      ttsUnmuteTimeoutRef.current = null;
+    }
+    setTtsMicMuted(true);
+  }, []);
+  const scheduleUnmuteMicAfterTts = useCallback(() => {
+    if (ttsUnmuteTimeoutRef.current !== null) {
+      window.clearTimeout(ttsUnmuteTimeoutRef.current);
+    }
+    ttsUnmuteTimeoutRef.current = window.setTimeout(() => {
+      ttsUnmuteTimeoutRef.current = null;
+      setTtsMicMuted(false);
+    }, 450);
+  }, []);
+  useEffect(
+    () => () => {
+      if (ttsUnmuteTimeoutRef.current !== null) {
+        window.clearTimeout(ttsUnmuteTimeoutRef.current);
+      }
+    },
+    [],
+  );
   // tts is declared before `streaming` so the barge-in callback can reference it.
-  const tts = useTTSPlayer({ voiceId: ttsVoice, speed: ttsSpeed });
+  const tts = useTTSPlayer({
+    provider: ttsProvider,
+    voiceId: ttsVoice,
+    speed: ttsSpeed,
+    onStart: muteMicForTts,
+    onIdle: scheduleUnmuteMicAfterTts,
+  });
   // Only auto-speak responses when voice streaming is on — a text-only chat
   // session should stay silent even if TTS autoplay is enabled.
   const autoSpeak = ttsAutoplay && speechStreaming;
@@ -116,7 +156,10 @@ export function InputArea() {
       armWakeAwaitingCommand();
     },
     // Barge-in: the moment VAD hears the user, cut the assistant off.
-    onSpeechStart: () => tts.stop(),
+    onSpeechStart: () => {
+      if (!ttsMicMuted) tts.stop();
+    },
+    muted: ttsMicMuted,
   });
 
   // Wake-word mode: when any wake phrase is configured, keep the mic open
@@ -150,11 +193,11 @@ export function InputArea() {
   }, [selectedModel, isStreaming, resetStream]);
 
   const effectiveMicAvailable = speechStreaming ? streaming.available : speechAvailable;
-  const micDisabled = !speechEnabled || !effectiveMicAvailable || isStreaming;
+  const micDisabled = !speechEnabled || !effectiveMicAvailable || isStreaming || ttsMicMuted;
   const micReason: 'not-enabled' | 'no-backend' | 'streaming' | undefined =
     !speechEnabled ? 'not-enabled'
     : !effectiveMicAvailable ? 'no-backend'
-    : isStreaming ? 'streaming'
+    : isStreaming || ttsMicMuted ? 'streaming'
     : undefined;
 
   const micState: 'idle' | 'recording' | 'transcribing' = speechStreaming
@@ -163,6 +206,7 @@ export function InputArea() {
     : speechState;
 
   const handleMicClick = useCallback(async () => {
+    if (ttsMicMuted) return;
     if (speechStreaming) {
       if (streaming.state === 'idle') {
         await streaming.start();
@@ -183,7 +227,7 @@ export function InputArea() {
     } else {
       await startRecording();
     }
-  }, [speechStreaming, streaming, speechState, startRecording, stopRecording]);
+  }, [ttsMicMuted, speechStreaming, streaming, speechState, startRecording, stopRecording]);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -285,7 +329,14 @@ export function InputArea() {
 
     try {
       for await (const sseEvent of streamChat(
-        { model: effectiveModel, messages: apiMessages, stream: true, temperature, max_tokens: maxTokens },
+        {
+          model: effectiveModel,
+          messages: apiMessages,
+          agent_id: defaultAgent || undefined,
+          stream: true,
+          temperature,
+          max_tokens: maxTokens,
+        },
         controller.signal,
       )) {
         const eventName = sseEvent.event;
@@ -492,7 +543,9 @@ export function InputArea() {
         >
           {streaming.interim ||
             (streaming.state === 'listening'
-              ? hasWakeWords
+              ? ttsMicMuted
+                ? 'Speaking...'
+                : hasWakeWords
                 ? `Listening for "${effectiveWakeWords[0]}"...`
                 : 'Listening…'
               : 'Transcribing…')}

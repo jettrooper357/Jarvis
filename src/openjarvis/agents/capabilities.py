@@ -6,7 +6,7 @@ import importlib
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from openjarvis.agents.library import (
     builtin_skills_dir,
@@ -220,8 +220,15 @@ def build_agent_tool_instances(
     interactive: bool = False,
     confirm_callback: Optional[Callable[[str], bool]] = None,
     inject_tool: Optional[Callable[[BaseTool], None]] = None,
+    restrict_to_tool_names: Optional[Iterable[str]] = None,
 ) -> List[BaseTool]:
-    """Build the exact callable tool set for a managed agent."""
+    """Build the exact callable tool set for a managed agent.
+
+    When ``restrict_to_tool_names`` is provided, the returned list is
+    filtered to only tools whose ``spec.name`` appears in that set --
+    used by the chief's per-delegation ``tools_allowed`` for least
+    privilege. An empty set produces an empty toolset.
+    """
     _ensure_tool_registries_populated()
 
     visible_tool_names = effective_agent_tool_names(agent_record)
@@ -333,4 +340,7 @@ def build_agent_tool_instances(
             continue
         seen_names.add(name)
         deduped.append(tool)
+    if restrict_to_tool_names is not None:
+        allowed = {str(n).strip() for n in restrict_to_tool_names if str(n).strip()}
+        deduped = [t for t in deduped if t.spec.name in allowed]
     return deduped

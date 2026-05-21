@@ -4,6 +4,7 @@ import { getBase } from './api';
 export interface ChatRequest {
   model: string;
   messages: Array<{ role: string; content: string }>;
+  agent_id?: string;
   stream: true;
   temperature?: number;
   max_tokens?: number;

@@ -40,6 +40,7 @@ import {
   createProject,
   createTask,
   deleteProject,
+  deleteTask,
   getDashboard,
   getProjectBundle,
   updateProject,
@@ -54,7 +55,7 @@ import type {
   TaskStatus,
 } from '../lib/projects-api';
 import { PROJECT_STATUSES } from '../components/Project/projectUtils';
-import { fetchManagedAgents, type ManagedAgent } from '../lib/api';
+import { checkHealth, fetchManagedAgents, type ManagedAgent } from '../lib/api';
 
 type Status = 'In Progress' | 'Done' | 'At Risk' | 'Blocked' | 'Pending';
 type Accent = 'cyan' | 'green' | 'amber' | 'red' | 'purple';
@@ -916,7 +917,12 @@ function GanttContextMenu({
   const actions: { key: string; label: string; danger?: boolean }[] =
     target.kind === 'category'
       ? [
-          { key: 'rename-cat', label: 'Edit name' },
+          ...(target.category
+            ? [
+                { key: 'rename-cat', label: 'Edit name' },
+                { key: 'delete-category', label: `Delete Category…`, danger: true },
+              ]
+            : []),
           { key: 'add-task-cat', label: `Add Task in “${target.label}”` },
         ]
       : target.item.type === 'project'
@@ -931,6 +937,7 @@ function GanttContextMenu({
             { key: 'add-subtask', label: 'Add Subtask' },
             { key: 'add-milestone', label: 'Add Milestone' },
             { key: 'edit', label: 'Edit…' },
+            { key: 'delete-task', label: 'Delete Task…', danger: true },
           ];
   return (
     <div
@@ -963,7 +970,7 @@ function GanttContextMenu({
             }
             onClick={() => onAction(action.key)}
           >
-            {action.key === 'delete-project' ? (
+            {action.key === 'delete-project' || action.key === 'delete-task' || action.key === 'delete-category' ? (
               <Trash2 size={12} className="text-red-300" />
             ) : action.key === 'edit' || action.key === 'rename-cat' ? (
               <Info size={12} className="text-cyan-300" />
@@ -992,6 +999,8 @@ function GanttChart({
   onRequestAddCategory,
   onRenameCategory,
   onAssignCategory,
+  onDeleteItem,
+  onDeleteCategory,
   onDeleteProject,
   extraCategoriesByProject,
 }: {
@@ -1018,6 +1027,8 @@ function GanttChart({
     project: GanttItem,
     category: string,
   ) => void;
+  onDeleteItem: (item: GanttItem) => void;
+  onDeleteCategory: (project: GanttItem, category: string, label: string) => void;
   onDeleteProject: (project: GanttItem) => void;
   extraCategoriesByProject: Record<string, string[]>;
 }) {
@@ -1137,9 +1148,11 @@ function GanttChart({
         setEditingCatId(
           `cat:${target.project.id}:${target.category || '__uncat__'}`,
         );
-      } else {
+      } else if (action === 'add-task-cat') {
         openRow(target.project.id);
         onRequestAdd(target.project, 'task', target.category || undefined);
+      } else if (action === 'delete-category') {
+        onDeleteCategory(target.project, target.category, target.label);
       }
     } else if (action === 'edit') {
       onEdit(target.item);
@@ -1154,6 +1167,8 @@ function GanttChart({
     } else if (action === 'add-subtask') {
       openRow(target.item.id);
       onRequestAdd(target.item, 'subtask');
+    } else if (action === 'delete-task') {
+      onDeleteItem(target.item);
     } else if (action === 'delete-project') {
       onDeleteProject(target.item);
     }
@@ -2163,6 +2178,7 @@ export function ProjectsPage() {
   const [error, setError] = useState<string | null>(null);
   const [dash, setDash] = useState<ProjectDashboard | null>(null);
   const [axis, setAxis] = useState<Axis>(DEFAULT_AXIS);
+  const [apiReachable, setApiReachable] = useState<boolean | null>(null);
   // Pending "quick add" request from the Gantt right-click menu.
   const [addReq, setAddReq] = useState<{
     mode: 'task' | 'subtask' | 'milestone' | 'category';
@@ -2220,6 +2236,23 @@ export function ProjectsPage() {
       )
       .catch(() => setAgents([]));
   }, [reload]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const check = async () => {
+      const reachable = await checkHealth();
+      if (!cancelled) setApiReachable(reachable);
+    };
+    check();
+    const interval = window.setInterval(check, 30000);
+    const onFocus = () => check();
+    window.addEventListener('focus', onFocus);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, []);
 
   // Run a write, surface any error, then re-sync from the DB so the page
   // always matches the store (and Mission Control).
@@ -2401,6 +2434,59 @@ export function ProjectsPage() {
     );
   };
 
+  const deleteSelectedItem = (item: GanttItem) => {
+    if (item.type === 'project') {
+      deleteSelectedProject(item);
+      return;
+    }
+    const descendantIds = new Set<string>();
+    const collectDescendants = (parentId: string) => {
+      for (const candidate of items) {
+        if (candidate.type === 'task' && candidate.parentId === parentId) {
+          descendantIds.add(candidate.id);
+          collectDescendants(candidate.id);
+        }
+      }
+    };
+    collectDescendants(item.id);
+    const childText = descendantIds.size
+      ? ` This will also delete ${descendantIds.size} subtask${descendantIds.size === 1 ? '' : 's'}.`
+      : '';
+    const kind = item.level > 1 ? 'subtask' : 'task';
+    const ok = window.confirm(`Delete ${kind} "${item.name}"?${childText}`);
+    if (!ok) return;
+    selectedIdRef.current = null;
+    setSelected(null);
+    mutate(() => deleteTask(item.id));
+  };
+
+  const deleteProjectCategory = (
+    project: GanttItem,
+    category: string,
+    label: string,
+  ) => {
+    const tasksInCategory = items.filter(
+      (item) =>
+        item.type === 'task' &&
+        item.projectId === project.projectId &&
+        (item.category?.trim() ?? '') === category,
+    );
+    const taskText = tasksInCategory.length
+      ? ` ${tasksInCategory.length} task${tasksInCategory.length === 1 ? '' : 's'} will move to Uncategorized.`
+      : '';
+    const ok = window.confirm(`Delete category "${label}"?${taskText}`);
+    if (!ok) return;
+    const remaining = (extraCategoriesByProject[project.projectId] ?? []).filter(
+      (name) => name.trim() !== category,
+    );
+    mutate(async () => {
+      await updateProject(project.projectId, { categories: remaining });
+      await Promise.all(
+        tasksInCategory.map((task) => updateTask(task.id, { category: '' })),
+      );
+    }, project.id);
+  };
+
   const saveEditedItem = (next: GanttItem) => {
     if (next.type === 'project') {
       mutate(
@@ -2489,6 +2575,9 @@ export function ProjectsPage() {
     ];
   }, [dash, rawProjects.length, agents.length]);
 
+  const jarvisOnline = apiReachable === true;
+  const jarvisUnknown = apiReachable === null;
+
   return (
     <AxisContext.Provider value={axis}>
     <div
@@ -2517,16 +2606,35 @@ export function ProjectsPage() {
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <div className="flex items-center gap-3 rounded-lg px-3 py-2" style={panelStyle}>
-                <span className="grid h-10 w-10 place-items-center rounded-full" style={{ border: '2px solid #24d9ff', boxShadow: '0 0 24px rgba(36,217,255,.75)' }}>
-                  <Gauge size={20} style={{ color: '#24d9ff' }} />
+                <span
+                  className="grid h-10 w-10 place-items-center rounded-full"
+                  style={{
+                    border: `2px solid ${jarvisOnline ? '#24d9ff' : jarvisUnknown ? '#94a3b8' : '#ff4e61'}`,
+                    boxShadow: jarvisOnline
+                      ? '0 0 24px rgba(36,217,255,.75)'
+                      : jarvisUnknown
+                        ? '0 0 18px rgba(148,163,184,.24)'
+                        : '0 0 24px rgba(255,78,97,.48)',
+                  }}
+                >
+                  <Gauge
+                    size={20}
+                    style={{ color: jarvisOnline ? '#24d9ff' : jarvisUnknown ? '#94a3b8' : '#ff4e61' }}
+                  />
                 </span>
                 <div>
-                  <div className="text-xs font-semibold text-cyan-300">
-                    J.A.R.V.I.S. ONLINE
+                  <div
+                    className="text-xs font-semibold"
+                    style={{ color: jarvisOnline ? '#67e8f9' : jarvisUnknown ? '#cbd5e1' : '#fda4af' }}
+                  >
+                    {jarvisOnline ? 'J.A.R.V.I.S. ONLINE' : jarvisUnknown ? 'J.A.R.V.I.S. CHECKING' : 'J.A.R.V.I.S. OFFLINE'}
                   </div>
                   <div className="flex items-center gap-1 text-[11px] text-slate-400">
-                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                    Systems nominal
+                    <span
+                      className="h-1.5 w-1.5 rounded-full"
+                      style={{ background: jarvisOnline ? '#34d399' : jarvisUnknown ? '#94a3b8' : '#fb7185' }}
+                    />
+                    {jarvisOnline ? 'Systems nominal' : jarvisUnknown ? 'Checking backend' : 'Backend unreachable'}
                   </div>
                 </div>
               </div>
@@ -2605,6 +2713,8 @@ export function ProjectsPage() {
               onRequestAddCategory={requestAddCategory}
               onRenameCategory={renameProjectCategory}
               onAssignCategory={assignItemCategory}
+              onDeleteItem={deleteSelectedItem}
+              onDeleteCategory={deleteProjectCategory}
               onDeleteProject={deleteSelectedProject}
               extraCategoriesByProject={extraCategoriesByProject}
             />

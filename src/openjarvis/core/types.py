@@ -223,6 +223,11 @@ class Trace:
     """
 
     trace_id: str = field(default_factory=_trace_id)
+    # parent_trace_id links a delegated child run to its parent so a
+    # chief + N subordinates reconstructs as one tree. run_id groups
+    # every trace from one user request together regardless of depth.
+    parent_trace_id: Optional[str] = None
+    run_id: Optional[str] = None
     query: str = ""
     agent: str = ""
     model: str = ""

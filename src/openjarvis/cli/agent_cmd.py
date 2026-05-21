@@ -440,7 +440,7 @@ def run_agent(agent_id):
         click.echo("Executor not available", err=True)
         raise SystemExit(1)
     try:
-        executor.execute_tick(agent_id)
+        executor.execute_tick(agent_id, force=True)
     except Exception as exc:
         click.echo(f"Tick failed: {exc}", err=True)
         raise SystemExit(1)

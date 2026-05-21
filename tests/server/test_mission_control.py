@@ -8,6 +8,7 @@ from __future__ import annotations
 import sqlite3
 import time
 import uuid
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -102,6 +103,9 @@ def test_new_unassigned_agent_work_creates_child_project_task(stores):
     assert child["parent_task_id"] == catchall["id"]
     assert child["title"] == "Start a new project called test project"
     assert child["status"] == "In Progress"
+    today = datetime.now().date()
+    assert child["start_date"] == today.isoformat()
+    assert child["due_date"] == (today + timedelta(days=1)).isoformat()
 
 
 # --- 3-tier authorization ----------------------------------------------
@@ -287,3 +291,33 @@ def test_mission_control_stale_running_agent_not_working(client):
     assert z["stale"] is True
     # Stale activity must not be surfaced as if it were live.
     assert z["current_activity"] == ""
+
+
+def test_project_task_date_update_reactivates_linked_agent_work(client):
+    tc, ps, m = client
+    tomorrow = (datetime.now().date() + timedelta(days=1)).isoformat()
+    today = datetime.now().date().isoformat()
+    proj = ps.create_project(name="P", status="Active")
+    pt = ps.create_task(
+        proj["id"],
+        title="Release song",
+        status="In Progress",
+        start_date=tomorrow,
+    )
+    ag = m.create_agent(name="Chief", org_role="Chief Orchestrator")
+    agent_task = m.create_task(
+        ag["id"],
+        description="Release song",
+        project_task_id=pt["id"],
+        status="completed",
+    )
+
+    response = tc.put(
+        f"/v1/projects/tasks/{pt['id']}",
+        json={"start_date": today, "due_date": tomorrow, "status": "In Progress"},
+    )
+
+    assert response.status_code == 200
+    updated = m._get_task(agent_task["id"])
+    assert updated["status"] == "active"
+    assert m.has_runnable_task(ag["id"]) is True

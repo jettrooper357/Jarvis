@@ -79,7 +79,9 @@ interface Settings {
   speechEnabled: boolean;
   speechStreaming: boolean;
   ttsAutoplay: boolean;
+  ttsProvider: string;
   ttsVoice: string;
+  ttsVoicesByProvider: Record<string, string>;
   ttsSpeed: number;
   wakeWords: string[];
   /** Max recent messages sent verbatim; older turns are condensed. */
@@ -100,7 +102,9 @@ function loadSettings(): Settings {
     speechEnabled: false,
     speechStreaming: true,
     ttsAutoplay: false,
+    ttsProvider: 'auto',
     ttsVoice: '',
+    ttsVoicesByProvider: {},
     ttsSpeed: 1.0,
     wakeWords: [],
     contextMaxMessages: 12,

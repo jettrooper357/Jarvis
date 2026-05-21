@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from openjarvis.agents._stubs import (
     AgentContext,
     AgentResult,
@@ -13,6 +15,27 @@ from openjarvis.agents._stubs import (
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import Conversation, Message, Role, ToolCall, ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
+
+
+@pytest.fixture
+def _isolate_from_user_config(monkeypatch):
+    """Force default-resolution to fall through to class defaults.
+
+    BaseAgent / ToolUsingAgent resolve their default temperature and
+    max_tokens via ``load_config()`` when no explicit kwargs are given.
+    If a developer's local config.toml sets values different from the
+    code's hardcoded fallbacks (0.7 / 1024 / 10), tests that assert the
+    fallbacks would fail. Tests that need the class-default branch
+    consume this fixture; tests that exercise the config-fallback path
+    (default_system_prompt injection) do not.
+    """
+    import openjarvis.agents._stubs as _stubs
+
+    monkeypatch.setattr(
+        _stubs,
+        "load_config",
+        lambda: (_ for _ in ()).throw(RuntimeError("isolated for tests")),
+    )
 
 # ---------------------------------------------------------------------------
 # Concrete subclass for testing
@@ -76,7 +99,7 @@ class TestBaseAgentInit:
         assert agent._engine is engine
         assert agent._model == "test-model"
 
-    def test_default_params(self):
+    def test_default_params(self, _isolate_from_user_config):
         engine = MagicMock()
         agent = _ConcreteAgent(engine, "m")
         assert agent._temperature == 0.7
@@ -285,7 +308,7 @@ class TestToolUsingAgent:
         assert agent._executor is not None
         assert len(agent._tools) == 1
 
-    def test_default_max_turns(self):
+    def test_default_max_turns(self, _isolate_from_user_config):
         engine = MagicMock()
         agent = _ConcreteToolAgent(engine, "m")
         assert agent._max_turns == 10

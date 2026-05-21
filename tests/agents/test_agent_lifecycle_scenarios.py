@@ -14,6 +14,23 @@ from openjarvis.agents.errors import RetryableError
 from openjarvis.core.events import EventType
 from tests.agents.scenario_harness import ScenarioHarness
 
+
+def _queue_work(
+    h: ScenarioHarness,
+    agent_id: str,
+    content: str = "Run this tick.",
+) -> None:
+    h.manager.send_message(agent_id, content, mode="queued")
+
+
+def _create_runnable_work(
+    h: ScenarioHarness,
+    agent_id: str,
+    description: str = "Scheduled work.",
+) -> None:
+    h.manager.create_task(agent_id, description=description, status="active")
+
+
 # ---------------------------------------------------------------------------
 # Scenario 1: Manual agent full lifecycle
 # ---------------------------------------------------------------------------
@@ -30,6 +47,7 @@ def test_manual_agent_full_lifecycle(scenario_harness: ScenarioHarness) -> None:
         config={"schedule_type": "manual", "instruction": "Do something."},
     )
     aid = agent["id"]
+    _queue_work(h, aid)
 
     h.executor.execute_tick(aid)
 
@@ -62,6 +80,7 @@ def test_interval_scheduled_agent(scenario_harness: ScenarioHarness) -> None:
         },
     )
     aid = agent["id"]
+    _create_runnable_work(h, aid, "Check status on schedule.")
 
     # Register at base_time — next_fire = base_time + 60
     with patch("openjarvis.agents.scheduler.time") as mock_time:
@@ -217,6 +236,7 @@ def test_budget_enforcement(scenario_harness: ScenarioHarness) -> None:
         },
     )
     aid = agent["id"]
+    _queue_work(h, aid, "Run the budget check.")
 
     h.executor.execute_tick(aid)
 
@@ -247,6 +267,7 @@ def test_error_retry_success(scenario_harness: ScenarioHarness) -> None:
         config={"schedule_type": "manual", "instruction": "Retry test."},
     )
     aid = agent["id"]
+    _queue_work(h, aid, "Run the retry test.")
 
     # Patch retry_delay to avoid real sleeps
     with patch("openjarvis.agents.executor.time.sleep"):
@@ -279,6 +300,7 @@ def test_error_exhaustion(scenario_harness: ScenarioHarness) -> None:
         config={"schedule_type": "manual", "instruction": "Always fail."},
     )
     aid = agent["id"]
+    _queue_work(h, aid, "Run the failure test.")
 
     with patch("openjarvis.agents.executor.time.sleep"):
         h.executor.execute_tick(aid)
@@ -361,6 +383,7 @@ def test_pause_resume(scenario_harness: ScenarioHarness) -> None:
         },
     )
     aid = agent["id"]
+    _create_runnable_work(h, aid, "Run after resume.")
 
     # Register at base_time
     with patch("openjarvis.agents.scheduler.time") as mock_time:
@@ -416,6 +439,7 @@ def test_multi_agent_scheduling(scenario_harness: ScenarioHarness) -> None:
             },
         )
         agents.append(a)
+        _create_runnable_work(h, a["id"], f"Scheduled task {i}.")
         with patch("openjarvis.agents.scheduler.time") as mock_time:
             mock_time.time.return_value = base_time
             h.scheduler.register_agent(a["id"])
@@ -511,6 +535,7 @@ def test_memory_persistence_across_ticks(scenario_harness: ScenarioHarness) -> N
         },
     )
     aid = agent["id"]
+    _create_runnable_work(h, aid, "Investigate topic X.")
 
     # --- Tick 1 ---
     h.executor.execute_tick(aid)

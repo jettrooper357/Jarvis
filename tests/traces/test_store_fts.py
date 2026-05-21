@@ -16,7 +16,12 @@ def store():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         s = TraceStore(Path(tmpdir) / "traces.db")
-        yield s
+        try:
+            yield s
+        finally:
+            # Close the SQLite connection so Windows can unlink the
+            # WAL-mode files when the tempdir context exits.
+            s.close()
 
 
 def _make_trace(trace_id: str, query: str, result: str, agent: str = "test") -> Trace:

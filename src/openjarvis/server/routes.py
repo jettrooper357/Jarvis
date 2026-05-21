@@ -247,6 +247,243 @@ def _inject_connector_knowledge_context(
     return [context_message] + list(messages)
 
 
+def _is_chief_mode_agent(agent_record: Any) -> bool:
+    """True when the managed agent is opted into chief-mode dispatch."""
+    if not agent_record:
+        return False
+    config = agent_record.get("config") or {}
+    mode = str(config.get("orchestrator_mode", "") or "").strip().lower()
+    return mode == "chief"
+
+
+async def _stream_chief_response(
+    *,
+    manager: Any,
+    agent_record: dict,
+    user_content: str,
+    engine: Any,
+    bus: Any,
+    app_state: Any,
+    model: str,
+) -> StreamingResponse:
+    """Run a chief-mode managed agent and stream the final answer as SSE.
+
+    Chief mode emits one JSON action per turn rather than token-streamed
+    text, so we run the full chief loop in a thread and then word-split
+    the user-facing content into OpenAI-compatible chunks. The chief
+    handles delegation, tool calls, and aggregation internally; the
+    response shown to the chat box is the chief's `final_report.summary`
+    (or its `ask_user` question, or `fail` reason).
+    """
+    import asyncio
+    import json as _json
+    import threading
+
+    from openjarvis.server.agent_manager_routes import (
+        _create_chat_task,
+        _finish_chat_task,
+    )
+    from openjarvis.server.managed_agent_runtime import ManagedAgentRuntime
+
+    agent_id = agent_record["id"]
+    chat_task_id = _create_chat_task(manager, agent_id, user_content)
+    # The chief's _run_chief_turn resolves model as:
+    #   config.get("model") -> engine._model -> default_model
+    # Pass the chat-selected model as default so an unconfigured chief
+    # still has something to call without writing back to the DB.
+    trace_store = getattr(app_state, "trace_store", None)
+    server_model = model or getattr(app_state, "model", "") or ""
+
+    runtime = ManagedAgentRuntime(
+        manager,
+        engine,
+        bus=bus,
+        default_model=server_model,
+        trace_store=trace_store,
+    )
+
+    result_holder: dict[str, Any] = {"content": "", "error": None, "status": None}
+
+    def _execute() -> None:
+        try:
+            result_holder["content"] = runtime.run(agent_id, user_content)
+        except Exception as exc:
+            result_holder["error"] = str(exc)
+        # Capture the resulting status so we can surface input_required
+        # and auth_required correctly to the caller.
+        try:
+            cur = manager.get_agent(agent_id) or {}
+            result_holder["status"] = cur.get("status")
+        except Exception:
+            result_holder["status"] = None
+
+    worker = threading.Thread(target=_execute, daemon=True)
+    worker.start()
+
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created_at = 0
+
+    async def _generate():
+        nonlocal created_at
+        # Open the SSE stream with an empty role chunk so clients know
+        # to render an assistant message.
+        opener = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [
+                {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
+            ],
+        }
+        yield f"data: {_json.dumps(opener)}\n\n"
+
+        loop = asyncio.get_running_loop()
+        # Wait for the chief to finish. The chief's run is potentially
+        # long (delegations + worker turns), so don't block the event
+        # loop -- await a thread-poll wrapper.
+        while worker.is_alive():
+            await asyncio.sleep(0.1)
+        await loop.run_in_executor(None, worker.join)
+
+        if result_holder["error"]:
+            content = (
+                "Chief run failed: " + str(result_holder["error"])[:240]
+            )
+        else:
+            content = result_holder["content"] or "(no response)"
+
+        # Word-split for incremental rendering -- chief mode produces
+        # full final text, not tokens, so this is best-effort UX.
+        words = content.split(" ")
+        for i, word in enumerate(words):
+            piece = word if i == 0 else f" {word}"
+            chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": piece},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {_json.dumps(chunk)}\n\n"
+            # Small yield so the event loop can flush.
+            await asyncio.sleep(0)
+
+        finish_reason = "stop"
+        # Surface the chief's pause states so the client can render the
+        # follow-up UI without polling.
+        if result_holder.get("status") in ("input_required", "auth_required"):
+            finish_reason = "input_required"
+
+        terminal = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [
+                {"index": 0, "delta": {}, "finish_reason": finish_reason}
+            ],
+        }
+        yield f"data: {_json.dumps(terminal)}\n\n"
+        yield "data: [DONE]\n\n"
+
+        try:
+            _finish_chat_task(manager, chat_task_id, content)
+        except Exception:
+            logging.getLogger("openjarvis.server").debug(
+                "Failed to finalize chief chat task", exc_info=True,
+            )
+
+    return StreamingResponse(
+        _generate(), media_type="text/event-stream"
+    )
+
+
+def _resolve_managed_chat_agent(app_state: Any, requested_agent_id: str | None) -> Any:
+    manager = getattr(app_state, "agent_manager", None)
+    if manager is None:
+        return None
+    requested = (requested_agent_id or "").strip()
+    if requested:
+        try:
+            return manager.get_agent(requested)
+        except Exception:
+            logging.getLogger("openjarvis.server").debug(
+                "Requested chat agent lookup failed",
+                exc_info=True,
+            )
+            return None
+    try:
+        agents = manager.list_agents()
+    except Exception:
+        logging.getLogger("openjarvis.server").debug(
+            "Managed chat agent lookup failed",
+            exc_info=True,
+        )
+        return None
+    if not agents:
+        return None
+
+    def _rank(agent: Any) -> tuple[int, int]:
+        name = str(agent.get("name") or "").casefold()
+        role = str(agent.get("org_role") or "").casefold()
+        parent = str(agent.get("manager_agent_id") or "").strip()
+        text = f"{name} {role}"
+        if name == "my assistant":
+            return (0, 0)
+        if "chief orchestrator" in text and not parent:
+            return (1, 0)
+        if "chief orchestrator" in text:
+            return (2, 0)
+        if not parent:
+            return (3, 0)
+        return (9, 0)
+
+    ranked = sorted(agents, key=_rank)
+    return ranked[0] if _rank(ranked[0])[0] < 9 else None
+
+
+def _create_direct_chat_task(manager: Any, agent_id: str, query_text: str) -> str | None:
+    try:
+        from openjarvis.server.agent_manager_routes import _create_chat_task
+
+        return _create_chat_task(manager, agent_id, query_text)
+    except Exception:
+        logging.getLogger("openjarvis.server").debug(
+            "Direct chat task creation failed",
+            exc_info=True,
+        )
+        return None
+
+
+def _finish_direct_chat_task(
+    manager: Any,
+    task_id: str | None,
+    content: str,
+    *,
+    tool_call_count: int = 0,
+) -> None:
+    if not task_id:
+        return
+    try:
+        from openjarvis.server.agent_manager_routes import _finish_chat_task
+
+        _finish_chat_task(
+            manager,
+            task_id,
+            content,
+            tool_call_count=tool_call_count,
+        )
+    except Exception:
+        logging.getLogger("openjarvis.server").debug(
+            "Direct chat task completion failed",
+            exc_info=True,
+        )
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(request_body: ChatCompletionRequest, request: Request):
     """Handle chat completion requests (streaming and non-streaming)."""
@@ -373,8 +610,63 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         from openjarvis.server.cloud_router import is_cloud_model
 
         bus = getattr(request.app.state, "bus", None)
+        managed_agent = _resolve_managed_chat_agent(
+            request.app.state,
+            request_body.agent_id,
+        )
+        manager = getattr(request.app.state, "agent_manager", None)
+        # Chief-mode short-circuit: when the resolved agent is opted into
+        # chief mode, always route through the chief's runtime so it can
+        # delegate. Otherwise the chat would bypass delegation entirely
+        # (especially on cloud models, which used to skip
+        # _stream_managed_agent and just stream raw completions).
+        if (
+            _is_chief_mode_agent(managed_agent)
+            and manager is not None
+            and query_text
+        ):
+            return await _stream_chief_response(
+                manager=manager,
+                agent_record=managed_agent,
+                user_content=query_text,
+                engine=engine,
+                bus=bus,
+                app_state=request.app.state,
+                model=model,
+            )
         if is_cloud_model(model):
-            return await _handle_stream(engine, model, request_body, complexity_info)
+            task_id = None
+            if managed_agent and manager is not None:
+                task_id = _create_direct_chat_task(
+                    manager,
+                    managed_agent["id"],
+                    query_text,
+                )
+            return await _handle_stream(
+                engine,
+                model,
+                request_body,
+                complexity_info,
+                task_manager=manager,
+                task_id=task_id,
+            )
+        if managed_agent is not None and manager is not None and query_text:
+            from openjarvis.server.agent_manager_routes import _stream_managed_agent
+
+            msg = manager.send_message(managed_agent["id"], query_text, mode="immediate")
+            agent_for_chat = dict(managed_agent)
+            agent_config = dict(agent_for_chat.get("config") or {})
+            agent_config["model"] = model
+            agent_for_chat["config"] = agent_config
+            return await _stream_managed_agent(
+                manager=manager,
+                agent_record=agent_for_chat,
+                user_content=query_text,
+                message_id=msg["id"],
+                engine=engine,
+                bus=bus,
+                app_state=request.app.state,
+            )
         # Route streaming chat through the agent whenever one is available so
         # the chat box can use the agent's tools (web_search, etc.) and answer
         # with live data. Tradeoff: the bridge runs agent.run() synchronously
@@ -541,6 +833,9 @@ async def _handle_stream(
     model: str,
     req: ChatCompletionRequest,
     complexity_info=None,
+    *,
+    task_manager: Any = None,
+    task_id: str | None = None,
 ):
     """Stream response using SSE format."""
     from openjarvis.server.cloud_router import (
@@ -555,6 +850,7 @@ async def _handle_stream(
     # Route directly to the right backend — bypasses engine routing entirely
     # so broken MultiEngine state can never misdirect requests.
     use_cloud = is_cloud_model(model)
+    stream_state: dict[str, Any] = {"content": "", "completed": False}
 
     async def generate():
         # Send role chunk first
@@ -609,6 +905,7 @@ async def _handle_stream(
                         max_tokens=req.max_tokens,
                     )
             async for token in token_iter:
+                stream_state["content"] += token
                 chunk = ChatCompletionChunk(
                     id=chunk_id,
                     model=model,
@@ -641,6 +938,7 @@ async def _handle_stream(
                     )
                 ],
             )
+            stream_state["content"] += f"\n\nError during generation: {exc}"
             yield f"data: {error_chunk.model_dump_json()}\n\n"
             yield "data: [DONE]\n\n"
             return
@@ -671,11 +969,24 @@ async def _handle_stream(
 
         yield f"data: {_json.dumps(finish_dict)}\n\n"
         yield "data: [DONE]\n\n"
+        stream_state["completed"] = True
 
+    background = None
+    if task_manager is not None and task_id:
+        from starlette.background import BackgroundTask
+
+        background = BackgroundTask(
+            lambda: _finish_direct_chat_task(
+                task_manager,
+                task_id,
+                stream_state["content"],
+            )
+        )
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        background=background,
     )
 
 
@@ -801,6 +1112,8 @@ async def save_cloud_key(request: Request):
         "GOOGLE_API_KEY",
         "OPENROUTER_API_KEY",
         "MINIMAX_API_KEY",
+        "CARTESIA_API_KEY",
+        "ELEVENLABS_API_KEY",
     }
     body = await request.json()
     key_name = str(body.get("keyName", "")).strip()
@@ -850,6 +1163,8 @@ async def reload_cloud_engine(request: Request):
         "OPENROUTER_API_KEY",
         "MINIMAX_API_KEY",
         "OPENAI_CODEX_API_KEY",
+        "CARTESIA_API_KEY",
+        "ELEVENLABS_API_KEY",
     )
 
     # Re-read ~/.openjarvis/cloud-keys.env and make the running process env
@@ -868,6 +1183,8 @@ async def reload_cloud_engine(request: Request):
     for key in key_names:
         if key not in found_keys:
             os.environ.pop(key, None)
+    if hasattr(request.app.state, "tts_backends"):
+        request.app.state.tts_backends = {}
 
     def _set_agent_engine() -> None:
         agent = getattr(request.app.state, "agent", None)

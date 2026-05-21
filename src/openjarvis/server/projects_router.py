@@ -262,9 +262,23 @@ def create_projects_router():
     async def update_task(task_id: str, request: Request):
         body = await request.json()
         try:
-            return _get_store().update_task(task_id, **(body or {}))
+            task = _get_store().update_task(task_id, **(body or {}))
         except KeyError:
             raise HTTPException(404, f"Task '{task_id}' not found")
+        manager = getattr(request.app.state, "agent_manager", None)
+        if manager is not None and isinstance(body, dict):
+            changed_schedule = any(
+                key in body for key in ("start_date", "due_date", "status")
+            )
+            if changed_schedule and hasattr(manager, "reactivate_project_task_work"):
+                try:
+                    manager.reactivate_project_task_work(task_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to reactivate linked agent work for task %s",
+                        task_id,
+                    )
+        return task
 
     @router.delete("/tasks/{task_id}")
     async def delete_task(task_id: str):

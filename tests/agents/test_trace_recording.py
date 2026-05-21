@@ -19,6 +19,7 @@ def test_executor_records_trace(tmp_path):
     executor = AgentExecutor(mgr, bus, trace_store=trace_store)
 
     agent = mgr.create_agent("trace-test")
+    mgr.send_message(agent["id"], "run trace test", mode="queued")
 
     def fake_invoke(agent_dict):
         bus.publish(
@@ -66,6 +67,7 @@ def test_executor_records_error_trace(tmp_path):
     executor = AgentExecutor(mgr, bus, trace_store=trace_store)
 
     agent = mgr.create_agent("error-trace")
+    mgr.send_message(agent["id"], "run error trace test", mode="queued")
 
     with patch.object(
         executor,
@@ -89,6 +91,7 @@ def test_executor_no_trace_without_store(tmp_path):
     executor = AgentExecutor(mgr, bus)  # No trace_store
 
     agent = mgr.create_agent("no-trace")
+    mgr.send_message(agent["id"], "run no-trace test", mode="queued")
 
     def fake_invoke(agent_dict):
         return AgentResult(content="done", metadata={})

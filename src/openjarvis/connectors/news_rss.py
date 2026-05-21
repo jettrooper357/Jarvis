@@ -25,7 +25,21 @@ _DEFAULT_CONFIG_PATH = str(DEFAULT_CONFIG_DIR / "connectors" / "news_rss.json")
 
 def _fetch_feed(url: str) -> str:
     """Download raw XML from a feed URL."""
-    resp = httpx.get(url, timeout=30.0, follow_redirects=True)
+    resp = httpx.get(
+        url,
+        timeout=30.0,
+        follow_redirects=True,
+        headers={
+            "Accept": (
+                "application/rss+xml, application/atom+xml, application/xml, "
+                "text/xml;q=0.9, */*;q=0.8"
+            ),
+            "User-Agent": (
+                "OpenJarvis/1.0 "
+                "(+https://open-jarvis.github.io/OpenJarvis/)"
+            ),
+        },
+    )
     resp.raise_for_status()
     return resp.text
 
@@ -129,23 +143,42 @@ class NewsRSSConnector(BaseConnector):
     ) -> Iterator[Document]:
         """Yield Documents for recent items across all configured feeds."""
         feeds = self._load_config()
+        default_max_items = 20
+        try:
+            raw_config = json.loads(self._config_path.read_text(encoding="utf-8"))
+            default_max_items = int(
+                raw_config.get("max_items_per_feed", default_max_items)
+            )
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            pass
         self._status.state = "syncing"
         self._status.error = None
         self._status.items_synced = 0
         self._status.items_total = 0
+        errors: list[str] = []
 
         for feed in feeds:
             feed_name = feed.get("name", "Unknown Feed")
             feed_url = feed.get("url", "")
             if not feed_url:
                 continue
+            max_items = default_max_items
+            try:
+                max_items = int(feed.get("max_items", default_max_items))
+            except (TypeError, ValueError):
+                max_items = default_max_items
 
             try:
                 xml_text = _fetch_feed(feed_url)
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
+                errors.append(f"{feed_name}: fetch failed ({exc})")
                 continue
 
-            items = _parse_rss_items(xml_text)
+            try:
+                items = _parse_rss_items(xml_text, max_items=max_items)
+            except ET.ParseError as exc:
+                errors.append(f"{feed_name}: invalid RSS/Atom XML ({exc})")
+                continue
             self._status.items_total += len(items)
             for item in items:
                 pub_dt = _parse_pub_date(item["pubDate"])
@@ -169,7 +202,8 @@ class NewsRSSConnector(BaseConnector):
                         continue
 
                 title = item["title"] or "Untitled"
-                doc_id = f"rss-{feed_name}-{title[:40]}"
+                identity = item["link"] or title
+                doc_id = f"rss-{feed_name}-{identity[:160]}"
 
                 yield Document(
                     doc_id=doc_id,
@@ -185,6 +219,7 @@ class NewsRSSConnector(BaseConnector):
 
         self._status.state = "idle"
         self._status.last_sync = datetime.now()
+        self._status.error = "; ".join(errors) if errors else None
 
     def sync_status(self) -> SyncStatus:
         return self._status

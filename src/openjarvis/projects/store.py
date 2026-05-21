@@ -14,6 +14,7 @@ Progress rolls up: a project's ``progress`` is derived from the average
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 import uuid
@@ -95,6 +96,52 @@ def _now() -> float:
 
 def _gen_id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+def _clean_task_title(title: Any) -> str:
+    text = str(title or "Untitled Task").strip() or "Untitled Task"
+    # Strip delegation-prompt artifacts. The chief's delegation message
+    # has the shape "...GOAL: <goal>\nACCEPTANCE CRITERIA:\n- ...\nBUDGET:
+    # ...". If a subordinate pastes any of that block into the title field,
+    # extract just the goal phrase: jump past GOAL: if present, then
+    # truncate at the next section header.
+    goal_match = re.search(r"\bgoal\s*:\s*", text, flags=re.IGNORECASE)
+    if goal_match:
+        text = text[goal_match.end():].strip(" .,:;-\"'") or text
+    section_split = re.split(
+        r"\s*(?:acceptance\s+criteria|budget|deliverables?|depends_on|"
+        r"task_id|tools_allowed|budget_max_turns|when\s+you\s+finish)\s*:",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )
+    if len(section_split) > 1:
+        text = section_split[0].strip(" .,:;-\"'") or text
+    # Keep only the first sentence when the title is still a long blob.
+    if len(text) > 120:
+        first_sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0]
+        if first_sentence and len(first_sentence) < len(text):
+            text = first_sentence.strip(" .,:;-\"'") or text
+    text = re.sub(
+        r"\s+(?:to|in|on|under)\s+(?:the\s+)?"
+        r"[A-Za-z0-9 &'._-]+?\s+project\.?$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip(" .,:;-\"'")
+    # If the cleaned title still contains the song-title cue, extract it.
+    song_match = re.search(
+        r"\b(?:called|named|titled)\s+['\"]?(?P<title>[^'\"]+?)['\"]?$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if song_match and re.search(
+        r"\b(?:song|single|track|album|ep)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return song_match.group("title").strip(" .,:;-\"'") or text
+    return text or "Untitled Task"
 
 
 def default_db_path() -> Path:
@@ -283,7 +330,7 @@ class ProjectStore:
                 tid,
                 project_id,
                 fields.get("parent_task_id"),
-                str(fields.get("title") or "Untitled Task"),
+                _clean_task_title(fields.get("title")),
                 str(fields.get("description") or ""),
                 str(fields.get("type") or "Feature"),
                 str(fields.get("category") or ""),
@@ -329,7 +376,7 @@ class ProjectStore:
                 "sort_order",
             ):
                 cols.append(f"{key} = ?")
-                params.append(val)
+                params.append(_clean_task_title(val) if key == "title" else val)
         if cols:
             cols.append("updated_at = ?")
             params.append(_now())
@@ -339,6 +386,24 @@ class ProjectStore:
             )
             self._conn.commit()
         return self.get_task(task_id)  # type: ignore[return-value]
+
+    def normalize_task_titles(self) -> int:
+        """Clean persisted task titles and return the number changed."""
+        rows = self._conn.execute("SELECT id, title FROM tasks").fetchall()
+        changed = 0
+        now = _now()
+        for row in rows:
+            cleaned = _clean_task_title(row["title"])
+            if cleaned == row["title"]:
+                continue
+            self._conn.execute(
+                "UPDATE tasks SET title = ?, updated_at = ? WHERE id = ?",
+                (cleaned, now, row["id"]),
+            )
+            changed += 1
+        if changed:
+            self._conn.commit()
+        return changed
 
     def delete_task(self, task_id: str) -> None:
         self._conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))

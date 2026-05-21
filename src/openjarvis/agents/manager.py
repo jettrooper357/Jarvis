@@ -10,7 +10,7 @@ import json
 import sqlite3
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -93,6 +93,14 @@ _SUMMARY_MAX = 2000
 # Created on demand by the migration backfill; surfaced in Mission Control
 # as "needs reconciliation".
 _UNASSIGNED_PROJECT_NAME = "Unassigned Work"
+
+
+def _default_agent_project_task_dates() -> Dict[str, str]:
+    start = datetime.now().date()
+    return {
+        "start_date": start.isoformat(),
+        "due_date": (start + timedelta(days=1)).isoformat(),
+    }
 
 
 class AgentManager:
@@ -226,6 +234,7 @@ class AgentManager:
 
         agent = self.get_agent(agent_id)
         title = str(description or "Agent work").strip() or "Agent work"
+        default_dates = _default_agent_project_task_dates()
         child = ps.create_task(
             proj_task["project_id"],
             parent_task_id=proj_task["id"],
@@ -234,6 +243,8 @@ class AgentManager:
             type="Chore",
             status=self._agent_status_to_project_status(status),
             assigned_to=(agent or {}).get("name", "") or "",
+            start_date=default_dates["start_date"],
+            due_date=default_dates["due_date"],
         )
         return child
 
@@ -691,6 +702,78 @@ class AgentManager:
             and str(task.get("status") or "") not in ("completed", "failed")
             for task in self.list_tasks(agent_id)
         )
+
+    def reactivate_project_task_work(
+        self,
+        project_task_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Ensure due project work has an open linked agent task.
+
+        Used when a human moves a project task's start date to today. The
+        scheduler only sees ``agent_tasks``; this bridges manual project edits
+        back into runnable agent work.
+        """
+        ptid = str(project_task_id or "").strip()
+        if not ptid:
+            return []
+        project_task = self._project_store().get_task(ptid)
+        if project_task is None:
+            return []
+        if str(project_task.get("status") or "") in ("Done", "Cancelled"):
+            return []
+        start_ts = self._parse_task_start(project_task.get("start_date"))
+        if start_ts is not None and start_ts > time.time():
+            return []
+
+        rows = self._conn.execute(
+            "SELECT * FROM agent_tasks WHERE project_task_id = ?",
+            (ptid,),
+        ).fetchall()
+        reactivated: List[Dict[str, Any]] = []
+        for row in rows:
+            task = self._row_to_task(row)
+            if str(task.get("status") or "") in ("completed", "failed"):
+                progress = dict(task.get("progress") or {})
+                progress["reactivated"] = (
+                    "Project task start date is due; reopened for agent processing."
+                )
+                reactivated.append(
+                    self.update_task(
+                        task["id"],
+                        status="active",
+                        progress=progress,
+                    )
+                )
+            else:
+                reactivated.append(task)
+
+        if reactivated:
+            return reactivated
+
+        assignee = str(
+            project_task.get("assigned_to") or project_task.get("owner") or ""
+        ).strip()
+        if not assignee:
+            return []
+        match = next(
+            (
+                agent
+                for agent in self.list_agents()
+                if str(agent.get("name", "")).strip().casefold()
+                == assignee.casefold()
+            ),
+            None,
+        )
+        if match is None:
+            return []
+        created = self.create_task(
+            match["id"],
+            description=str(project_task.get("title") or "Project task"),
+            status="active",
+            project_task_id=ptid,
+            project_id=str(project_task.get("project_id") or "") or None,
+        )
+        return [created]
 
     def list_tasks_assigned_by(
         self, assigned_by_agent_id: str, status: Optional[str] = None

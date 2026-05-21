@@ -20,6 +20,7 @@ import {
 import { useAppStore, type ThemeMode } from '../lib/store';
 import {
   checkHealth,
+  saveCloudKey,
   fetchSpeechHealth,
   fetchSpeechVoices,
   getMemoryStats,
@@ -55,14 +56,17 @@ function OllamaModelList() {
   );
 }
 
-function ApiKeyInput({ storageKey, placeholder }: { storageKey: string; placeholder: string }) {
+function ApiKeyInput({ storageKey, keyName, placeholder }: { storageKey: string; keyName?: string; placeholder: string }) {
   const [value, setValue] = useState(() => {
     try { return localStorage.getItem(storageKey) || ''; } catch { return ''; }
   });
   const [saved, setSaved] = useState(false);
-  const save = (v: string) => {
+  const save = async (v: string) => {
     setValue(v);
     try { if (v) localStorage.setItem(storageKey, v); else localStorage.removeItem(storageKey); } catch {}
+    if (keyName) {
+      try { await saveCloudKey(keyName, v); } catch {}
+    }
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
@@ -142,8 +146,8 @@ export function SettingsPage() {
   const [voices, setVoices] = useState<VoicesResponse>({ backend: null, clone_backend: null, builtin: [], custom: [] });
   const [voiceCreatorOpen, setVoiceCreatorOpen] = useState(false);
 
-  const refreshVoices = () => {
-    fetchSpeechVoices().then(setVoices).catch(() => {});
+  const refreshVoices = (provider = settings.ttsProvider) => {
+    fetchSpeechVoices(provider).then(setVoices).catch(() => {});
   };
 
   const [memoryStats, setMemoryStats] = useState<{ entries: number; backend: string } | null>(null);
@@ -180,6 +184,11 @@ export function SettingsPage() {
       .catch(() => setMemoryStats(null));
     refreshVoices();
   }, []);
+
+  useEffect(() => {
+    refreshVoices(settings.ttsProvider);
+    setTtsProbe(null);
+  }, [settings.ttsProvider]);
 
   const showSaved = () => {
     setSaved(true);
@@ -232,6 +241,16 @@ export function SettingsPage() {
     setConfirmClear(false);
     showSaved();
   };
+  const selectedTtsBackend = voices.backend || ttsBackendName;
+  const selectedTtsProvider = settings.ttsProvider || 'auto';
+  const rememberedTtsVoices = settings.ttsVoicesByProvider || {};
+  const currentTtsVoice = Object.prototype.hasOwnProperty.call(
+    rememberedTtsVoices,
+    selectedTtsProvider,
+  )
+    ? rememberedTtsVoices[selectedTtsProvider]
+    : settings.ttsVoice;
+  const ttsBlocked = !selectedTtsBackend || !!(ttsProbe && !ttsProbe.ok);
 
   return (
     <div className="flex-1 overflow-y-auto px-6 py-10">
@@ -341,6 +360,8 @@ export function SettingsPage() {
                 <CloudProviderStatus label="Anthropic" storageKey="openjarvis-anthropic-key" />
                 <CloudProviderStatus label="Google" storageKey="openjarvis-gemini-key" />
                 <CloudProviderStatus label="OpenRouter" storageKey="openjarvis-openrouter-key" />
+                <CloudProviderStatus label="Cartesia" storageKey="openjarvis-cartesia-key" />
+                <CloudProviderStatus label="ElevenLabs" storageKey="openjarvis-elevenlabs-key" />
               </div>
             </SettingRow>
           </Section>
@@ -348,16 +369,22 @@ export function SettingsPage() {
           {/* API Keys */}
           <Section title="API Keys">
             <SettingRow label="OpenAI" description="GPT-4, GPT-3.5, etc.">
-              <ApiKeyInput storageKey="openjarvis-openai-key" placeholder="sk-..." />
+              <ApiKeyInput storageKey="openjarvis-openai-key" keyName="OPENAI_API_KEY" placeholder="sk-..." />
             </SettingRow>
             <SettingRow label="Anthropic" description="Claude models">
-              <ApiKeyInput storageKey="openjarvis-anthropic-key" placeholder="sk-ant-..." />
+              <ApiKeyInput storageKey="openjarvis-anthropic-key" keyName="ANTHROPIC_API_KEY" placeholder="sk-ant-..." />
             </SettingRow>
             <SettingRow label="Google" description="Gemini models">
-              <ApiKeyInput storageKey="openjarvis-gemini-key" placeholder="AI..." />
+              <ApiKeyInput storageKey="openjarvis-gemini-key" keyName="GEMINI_API_KEY" placeholder="AI..." />
             </SettingRow>
             <SettingRow label="OpenRouter" description="Multi-provider routing">
-              <ApiKeyInput storageKey="openjarvis-openrouter-key" placeholder="sk-or-..." />
+              <ApiKeyInput storageKey="openjarvis-openrouter-key" keyName="OPENROUTER_API_KEY" placeholder="sk-or-..." />
+            </SettingRow>
+            <SettingRow label="Cartesia" description="Cloud text-to-speech voices">
+              <ApiKeyInput storageKey="openjarvis-cartesia-key" keyName="CARTESIA_API_KEY" placeholder="cartesia key..." />
+            </SettingRow>
+            <SettingRow label="ElevenLabs" description="Cloud text-to-speech voices">
+              <ApiKeyInput storageKey="openjarvis-elevenlabs-key" keyName="ELEVENLABS_API_KEY" placeholder="elevenlabs key..." />
             </SettingRow>
           </Section>
 
@@ -600,14 +627,40 @@ export function SettingsPage() {
                 }}
               />
             </SettingRow>
-            <SettingRow label="Text-to-Speech backend" description={ttsBackendName ? `Using ${ttsBackendName}` : 'No TTS backend configured'}>
+            <SettingRow label="Voice service" description="Choose where voice replies are generated">
+              <select
+                value={selectedTtsProvider}
+                onChange={(e) => {
+                  const nextProvider = e.target.value;
+                  updateSettings({
+                    ttsProvider: nextProvider,
+                    ttsVoice: rememberedTtsVoices[nextProvider] || '',
+                  });
+                  showSaved();
+                }}
+                className="text-sm px-2 py-1 rounded-lg outline-none cursor-pointer max-w-[14rem]"
+                style={{
+                  background: 'var(--color-bg-secondary)',
+                  color: 'var(--color-text)',
+                  border: '1px solid var(--color-border)',
+                }}
+              >
+                <option value="auto">Auto</option>
+                {(voices.providers || []).map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.label}{p.configured ? '' : ' (not configured)'}
+                  </option>
+                ))}
+              </select>
+            </SettingRow>
+            <SettingRow label="Text-to-Speech backend" description={selectedTtsBackend ? `Using ${selectedTtsBackend}` : 'No TTS backend configured'}>
               <div className="flex items-center gap-2">
                 <span
                   className="w-2 h-2 rounded-full"
                   style={{
                     background: ttsProbe?.ok ? 'var(--color-success)'
                       : ttsProbe && !ttsProbe.ok ? 'var(--color-error)'
-                      : ttsBackendName ? 'var(--color-warning, #d97706)'
+                      : selectedTtsBackend ? 'var(--color-warning, #d97706)'
                       : 'var(--color-text-tertiary)',
                   }}
                 />
@@ -615,14 +668,13 @@ export function SettingsPage() {
                   {ttsAvailable === null ? 'Checking...'
                     : ttsProbe?.ok ? 'Available'
                     : ttsProbe && !ttsProbe.ok ? 'Misconfigured'
-                    : ttsBackendName ? 'Loaded (test to verify)'
+                    : selectedTtsBackend ? 'Loaded (test to verify)'
                     : 'Not configured'}
                 </span>
               </div>
             </SettingRow>
             <SettingRow label="Speak responses" description="Play assistant replies aloud as they stream (requires a working TTS backend)">
               {(() => {
-                const ttsBlocked = !ttsBackendName || (ttsProbe && !ttsProbe.ok);
                 return (
                   <button
                     onClick={() => {
@@ -646,12 +698,22 @@ export function SettingsPage() {
                 );
               })()}
             </SettingRow>
-            {ttsBackendName && (
+            {selectedTtsBackend && (
               <SettingRow label="Voice" description={`${voices.builtin.length} built-in${voices.custom.length ? ` + ${voices.custom.length} custom` : ''}`}>
                 <div className="flex items-center gap-2">
                   <select
-                    value={settings.ttsVoice}
-                    onChange={(e) => { updateSettings({ ttsVoice: e.target.value }); showSaved(); }}
+                    value={currentTtsVoice}
+                    onChange={(e) => {
+                      const nextVoice = e.target.value;
+                      updateSettings({
+                        ttsVoice: nextVoice,
+                        ttsVoicesByProvider: {
+                          ...rememberedTtsVoices,
+                          [selectedTtsProvider]: nextVoice,
+                        },
+                      });
+                      showSaved();
+                    }}
                     className="text-sm px-2 py-1 rounded-lg outline-none cursor-pointer max-w-[14rem]"
                     style={{
                       background: 'var(--color-bg-secondary)',
@@ -693,7 +755,7 @@ export function SettingsPage() {
                 </div>
               </SettingRow>
             )}
-            {ttsBackendName && (
+            {selectedTtsBackend && (
               <SettingRow label="Speed" description={`Playback rate (${settings.ttsSpeed.toFixed(2)}×)`}>
                 <div className="flex items-center gap-2">
                   <input
@@ -717,7 +779,7 @@ export function SettingsPage() {
                 </div>
               </SettingRow>
             )}
-            {ttsBackendName && (
+            {selectedTtsBackend === 'kokoro' && (
               <SettingRow label="Custom voices" description="Mix existing voices or clone from a sample">
                 <button
                   onClick={() => setVoiceCreatorOpen(true)}
@@ -743,7 +805,14 @@ export function SettingsPage() {
                       onClick={async () => {
                         try {
                           await deleteVoice(v.id);
-                          if (settings.ttsVoice === v.id) updateSettings({ ttsVoice: '' });
+                          if (currentTtsVoice === v.id) {
+                            const nextVoices = { ...rememberedTtsVoices };
+                            nextVoices[selectedTtsProvider] = '';
+                            updateSettings({
+                              ttsVoice: '',
+                              ttsVoicesByProvider: nextVoices,
+                            });
+                          }
                           refreshVoices();
                         } catch {}
                       }}
@@ -758,14 +827,14 @@ export function SettingsPage() {
                 ))}
               </div>
             )}
-            {ttsBackendName && (
+            {selectedTtsBackend && (
               <SettingRow label="Test voice" description="Synthesize a short phrase using the selected voice">
                 <button
                   disabled={ttsProbing}
                   onClick={async () => {
                     setTtsProbing(true);
                     setTtsProbe(null);
-                    const result = await synthesizeProbe('Hello, this is a test.', settings.ttsVoice, settings.ttsSpeed);
+                    const result = await synthesizeProbe('Hello, this is a test.', currentTtsVoice, settings.ttsSpeed, selectedTtsProvider);
                     setTtsProbe({ ok: result.ok, reason: result.reason });
                     if (result.ok && result.blob) {
                       try {
@@ -787,7 +856,7 @@ export function SettingsPage() {
             {ttsProbe && !ttsProbe.ok && (
               <div className="text-xs mt-2 px-1 leading-relaxed" style={{ color: 'var(--color-text-tertiary)' }}>
                 <strong style={{ color: 'var(--color-error)' }}>TTS produced no audio.</strong>{' '}
-                {ttsBackendName === 'kokoro' ? (
+                {selectedTtsBackend === 'kokoro' ? (
                   <>
                     Kokoro is installed but its phonemizer requires the <code>espeak-ng</code> system binary.
                     Install with <code>sudo apt install espeak-ng</code> (Linux/WSL), <code>brew install espeak</code> (macOS),
@@ -798,10 +867,10 @@ export function SettingsPage() {
                 )}
               </div>
             )}
-            {!ttsBackendName && ttsAvailable !== null && (
+            {!selectedTtsBackend && ttsAvailable !== null && (
               <div className="text-xs mt-2 px-1" style={{ color: 'var(--color-text-tertiary)' }}>
                 No TTS backend loaded. Install kokoro with <code>uv pip install kokoro</code> for local synthesis,
-                or set <code>CARTESIA_API_KEY</code>/<code>OPENAI_API_KEY</code> for cloud TTS.
+                or add a <code>CARTESIA_API_KEY</code>, <code>ELEVENLABS_API_KEY</code>, or <code>OPENAI_API_KEY</code> above for cloud TTS.
               </div>
             )}
           </Section>
