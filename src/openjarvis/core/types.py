@@ -44,6 +44,82 @@ class StepType(str, Enum):
     RESPOND = "respond"
 
 
+class TaskStatus(str, Enum):
+    """Canonical task lifecycle states.
+
+    Phase-2A addition. The persistence layer (``agents/manager.py``) still
+    writes the legacy four-value vocabulary (``pending``, ``active``,
+    ``completed``, ``failed``) for backwards compatibility; the read/write
+    boundary maps to/from this enum so the rest of the system can speak the
+    canonical 11-state vocabulary required by ``AGENTS.md``.
+    """
+
+    RECEIVED = "received"
+    TRIAGED = "triaged"
+    PLANNED = "planned"
+    DELEGATED = "delegated"
+    IN_PROGRESS = "in_progress"
+    BLOCKED = "blocked"
+    AWAITING_INPUT = "awaiting_input"
+    AWAITING_APPROVAL = "awaiting_approval"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+# Maps the legacy four-value status vocabulary onto canonical TaskStatus.
+# Unknown legacy values fall back to ``RECEIVED`` (logged by callers).
+_LEGACY_TO_CANONICAL: Dict[str, "TaskStatus"] = {
+    "pending": TaskStatus.RECEIVED,
+    "active": TaskStatus.IN_PROGRESS,
+    "completed": TaskStatus.COMPLETED,
+    "failed": TaskStatus.FAILED,
+}
+
+# Reverse direction: canonical → legacy. Used when writing back to the
+# manager's existing 4-state column so older code keeps working.
+_CANONICAL_TO_LEGACY: Dict["TaskStatus", str] = {
+    TaskStatus.RECEIVED: "pending",
+    TaskStatus.TRIAGED: "pending",
+    TaskStatus.PLANNED: "pending",
+    TaskStatus.DELEGATED: "active",
+    TaskStatus.IN_PROGRESS: "active",
+    TaskStatus.BLOCKED: "active",
+    TaskStatus.AWAITING_INPUT: "active",
+    TaskStatus.AWAITING_APPROVAL: "active",
+    TaskStatus.COMPLETED: "completed",
+    TaskStatus.FAILED: "failed",
+    TaskStatus.CANCELLED: "failed",
+}
+
+
+def map_legacy_status(value: Any) -> "TaskStatus":
+    """Convert any legacy or canonical status string into ``TaskStatus``.
+
+    Unknown values fall back to ``TaskStatus.RECEIVED``.
+    """
+    if isinstance(value, TaskStatus):
+        return value
+    raw = str(value or "").strip().casefold()
+    if not raw:
+        return TaskStatus.RECEIVED
+    # Canonical name wins (idempotent for already-canonical input).
+    for status in TaskStatus:
+        if status.value == raw:
+            return status
+    return _LEGACY_TO_CANONICAL.get(raw, TaskStatus.RECEIVED)
+
+
+def to_legacy_status(value: Any) -> str:
+    """Convert a ``TaskStatus`` (or string) into the legacy 4-state vocab.
+
+    Used at the persistence boundary so the existing ``agent_tasks.status``
+    column keeps storing one of ``pending``/``active``/``completed``/``failed``.
+    """
+    canonical = map_legacy_status(value)
+    return _CANONICAL_TO_LEGACY[canonical]
+
+
 # ---------------------------------------------------------------------------
 # Message types
 # ---------------------------------------------------------------------------

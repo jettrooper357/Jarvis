@@ -1486,18 +1486,25 @@ def include_all_routes(app) -> None:
                 create_agent_manager_router,
             )
 
+            # ``create_agent_manager_router`` returns a variable-length
+            # tuple (Phase 2D added approvals, Phase 2E added chief). The
+            # ``*extra_routers`` swallow keeps this resilient to future
+            # additions — we mount every router the factory returns.
+            approval_store = getattr(app.state, "approval_store", None)
             (
                 agents_r,
                 templates_r,
                 global_r,
                 tools_r,
                 sendblue_r,
-            ) = create_agent_manager_router(app.state.agent_manager)
-            app.include_router(agents_r)
-            app.include_router(templates_r)
-            app.include_router(global_r)
-            app.include_router(tools_r)
-            app.include_router(sendblue_r)
+                *extra_routers,
+            ) = create_agent_manager_router(
+                app.state.agent_manager, approval_store=approval_store
+            )
+            for router in (agents_r, templates_r, global_r, tools_r, sendblue_r):
+                app.include_router(router)
+            for router in extra_routers:
+                app.include_router(router)
     except ImportError:
         pass
 

@@ -1260,6 +1260,23 @@ class AgentManagerConfig:
 
 
 @dataclass(slots=True)
+class ChiefIngressConfig:
+    """Phase 2E — Chief-as-canonical-ingress feature gate.
+
+    When ``enabled`` is False (default during Phase-2E rollout commit 1
+    and commit 2) the ``POST /v1/chief/messages`` endpoint exists but
+    returns 412 Precondition Required, and the frontend keeps using
+    the legacy ``/v1/chat/completions`` and direct-to-agent paths.
+
+    Commit 3 of Phase-2E flips this default to ``True`` after frontend
+    wiring is in place. See
+    ``docs/CHANGE_IMPACT_NOTICES/chief-as-canonical-ingress.md``.
+    """
+
+    enabled: bool = False
+
+
+@dataclass(slots=True)
 class MemoryFilesConfig:
     """Persistent memory-file paths and nudge settings."""
 
@@ -1385,6 +1402,7 @@ class JarvisConfig:
     speech: SpeechConfig = field(default_factory=SpeechConfig)
     optimize: OptimizeConfig = field(default_factory=OptimizeConfig)
     agent_manager: AgentManagerConfig = field(default_factory=AgentManagerConfig)
+    chief_ingress: ChiefIngressConfig = field(default_factory=ChiefIngressConfig)
     memory_files: MemoryFilesConfig = field(default_factory=MemoryFilesConfig)
     system_prompt: SystemPromptConfig = field(default_factory=SystemPromptConfig)
     compression: CompressionConfig = field(default_factory=CompressionConfig)
@@ -1644,6 +1662,7 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
             "speech",
             "optimize",
             "agent_manager",
+            "chief_ingress",
             "digest",
         )
         for section_name in top_sections:

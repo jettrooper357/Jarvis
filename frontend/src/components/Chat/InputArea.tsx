@@ -1,8 +1,9 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Send, Square } from 'lucide-react';
+import { Send, Square, Crown } from 'lucide-react';
 import { useAppStore, generateId } from '../../lib/store';
 import { streamChat } from '../../lib/sse';
-import { fetchSavings, getBase } from '../../lib/api';
+import { fetchSavings, getBase, sendChiefMessage } from '../../lib/api';
+import { useChiefHealth } from '../../hooks/useChiefHealth';
 import { resolveModelSelection } from '../../lib/models';
 import { MicButton } from './MicButton';
 import { useSpeech } from '../../hooks/useSpeech';
@@ -56,6 +57,14 @@ export function InputArea() {
   const isStreaming = useAppStore((s) => s.streamState.isStreaming);
   const defaultModel = useAppStore((s) => s.settings.defaultModel);
   const defaultAgent = useAppStore((s) => s.settings.defaultAgent);
+  const chiefDirectMode = useAppStore((s) => s.settings.chiefDirectMode);
+  const updateSettings = useAppStore((s) => s.updateSettings);
+  // Phase 2E — chief ingress health. While the server flag is off this
+  // reports enabled=false and the chat keeps using the legacy ingress.
+  const { status: chiefStatus, chiefIngressActive } = useChiefHealth();
+  // Route through the Chief only when the server enabled it, a Chief is
+  // designated, and the user hasn't opted into Direct mode.
+  const routeThroughChief = chiefIngressActive && !chiefDirectMode;
   const speechEnabled = useAppStore((s) => s.settings.speechEnabled);
   const speechStreaming = useAppStore((s) => s.settings.speechStreaming);
   const ttsAutoplay = useAppStore((s) => s.settings.ttsAutoplay);
@@ -327,81 +336,179 @@ export function InputArea() {
       message: `Request: "${content.slice(0, 80)}${content.length > 80 ? '...' : ''}" -> ${effectiveModel}`,
     });
 
-    try {
-      for await (const sseEvent of streamChat(
-        {
-          model: effectiveModel,
-          messages: apiMessages,
-          agent_id: defaultAgent || undefined,
-          stream: true,
-          temperature,
-          max_tokens: maxTokens,
-        },
-        controller.signal,
-      )) {
-        const eventName = sseEvent.event;
-
-        if (eventName === 'agent_turn_start') {
-          setStreamState({ phase: 'Agent thinking...' });
-        } else if (eventName === 'inference_start') {
-          setStreamState({ phase: 'Generating...' });
-          useAppStore.getState().addLogEntry({
-            timestamp: Date.now(), level: 'info', category: 'chat',
-            message: `Generating with ${effectiveModel}...`,
+    // Legacy /v1/chat/completions SSE event handler. Returns true when
+    // the stream should stop (finish_reason: stop). Shared by the
+    // default-legacy path and the chief-unavailable fallback path.
+    const handleLegacySseEvent = (sseEvent: { event?: string; data: string }): boolean => {
+      const eventName = sseEvent.event;
+      if (eventName === 'agent_turn_start') {
+        setStreamState({ phase: 'Agent thinking...' });
+      } else if (eventName === 'inference_start') {
+        setStreamState({ phase: 'Generating...' });
+        useAppStore.getState().addLogEntry({
+          timestamp: Date.now(), level: 'info', category: 'chat',
+          message: `Generating with ${effectiveModel}...`,
+        });
+      } else if (eventName === 'tool_call_start') {
+        try {
+          const data = JSON.parse(sseEvent.data);
+          const tc: ToolCallInfo = {
+            id: generateId(),
+            tool: data.tool,
+            arguments: data.arguments || '',
+            status: 'running',
+          };
+          toolCalls.push(tc);
+          setStreamState({
+            phase: `Calling ${data.tool}...`,
+            activeToolCalls: [...toolCalls],
           });
-        } else if (eventName === 'tool_call_start') {
-          try {
-            const data = JSON.parse(sseEvent.data);
-            const tc: ToolCallInfo = {
-              id: generateId(),
-              tool: data.tool,
-              arguments: data.arguments || '',
-              status: 'running',
-            };
-            toolCalls.push(tc);
-            setStreamState({
-              phase: `Calling ${data.tool}...`,
-              activeToolCalls: [...toolCalls],
-            });
+          useAppStore.getState().addLogEntry({
+            timestamp: Date.now(), level: 'info', category: 'tool',
+            message: `Calling ${data.tool}(${data.arguments || ''})`,
+          });
+        } catch {}
+      } else if (eventName === 'tool_call_end') {
+        try {
+          const data = JSON.parse(sseEvent.data);
+          const tc = toolCalls.find(
+            (t) => t.tool === data.tool && t.status === 'running',
+          );
+          if (tc) {
+            tc.status = data.success ? 'success' : 'error';
+            tc.latency = data.latency;
+            tc.result = data.result;
+          }
+          setStreamState({
+            phase: 'Generating...',
+            activeToolCalls: [...toolCalls],
+          });
+        } catch {}
+      } else {
+        try {
+          const data = JSON.parse(sseEvent.data);
+          const delta = data.choices?.[0]?.delta;
+          if (data.usage) usage = data.usage;
+          if (data.complexity) complexity = data.complexity;
+          if (delta?.content) {
+            if (!ttftMs) ttftMs = Date.now() - startTime;
+            accumulatedContent += delta.content;
+            const now = Date.now();
+            if (now - lastDraftFlush >= 50) {
+              setStreamState({ content: accumulatedContent, phase: '' });
+              lastDraftFlush = now;
+            }
+            if (autoSpeak) tts.feedToken(delta.content);
+          }
+          if (data.choices?.[0]?.finish_reason === 'stop') return true;
+        } catch {}
+      }
+      return false;
+    };
+
+    try {
+      if (routeThroughChief) {
+        // Phase 2E — route through the Chief Orchestrator. The endpoint
+        // delegates to the same dispatcher as the agent-message route,
+        // so the streamed content/tool events arrive via callbacks.
+        useAppStore.getState().addLogEntry({
+          timestamp: Date.now(), level: 'info', category: 'chat',
+          message: `Routing through Chief Orchestrator (${chiefStatus.chief_name || 'chief'})`,
+        });
+        try {
+          await sendChiefMessage(content, {
+            mode: 'immediate',
+            signal: controller.signal,
+            callbacks: {
+              onProgress: (label) => setStreamState({ phase: label }),
+              onContentDelta: (delta, full) => {
+                if (!ttftMs) ttftMs = Date.now() - startTime;
+                accumulatedContent = full;
+                const now = Date.now();
+                if (now - lastDraftFlush >= 50) {
+                  setStreamState({ content: accumulatedContent, phase: '' });
+                  lastDraftFlush = now;
+                }
+                if (autoSpeak) tts.feedToken(delta);
+              },
+              onToolCallStart: (info) => {
+                const tc: ToolCallInfo = {
+                  id: generateId(),
+                  tool: info.tool,
+                  arguments: typeof info.arguments === 'string'
+                    ? info.arguments
+                    : JSON.stringify(info.arguments ?? ''),
+                  status: 'running',
+                };
+                toolCalls.push(tc);
+                setStreamState({
+                  phase: `Calling ${info.tool}...`,
+                  activeToolCalls: [...toolCalls],
+                });
+              },
+              onToolCallEnd: (info) => {
+                const tc = toolCalls.find(
+                  (t) => t.tool === info.tool && t.status === 'running',
+                );
+                if (tc) {
+                  tc.status = info.success ? 'success' : 'error';
+                  tc.latency = info.latency;
+                  tc.result = typeof info.result === 'string'
+                    ? info.result
+                    : JSON.stringify(info.result ?? '');
+                }
+                setStreamState({
+                  phase: 'Generating...',
+                  activeToolCalls: [...toolCalls],
+                });
+              },
+              onDone: (full, doneUsage) => {
+                if (full) accumulatedContent = full;
+                if (doneUsage) {
+                  usage = doneUsage as unknown as TokenUsage;
+                }
+              },
+            },
+          });
+        } catch (chiefErr) {
+          const code = (chiefErr as Error & { code?: string }).code;
+          if (code === 'chief_ingress_disabled' || code === 'no_chief_designated') {
+            // Server flag flipped off or Chief was removed mid-session —
+            // transparently fall back to the legacy ingress.
             useAppStore.getState().addLogEntry({
-              timestamp: Date.now(), level: 'info', category: 'tool',
-              message: `Calling ${data.tool}(${data.arguments || ''})`,
+              timestamp: Date.now(), level: 'warn', category: 'chat',
+              message: `Chief ingress unavailable (${code}); using direct chat.`,
             });
-          } catch {}
-        } else if (eventName === 'tool_call_end') {
-          try {
-            const data = JSON.parse(sseEvent.data);
-            const tc = toolCalls.find(
-              (t) => t.tool === data.tool && t.status === 'running',
-            );
-            if (tc) {
-              tc.status = data.success ? 'success' : 'error';
-              tc.latency = data.latency;
-              tc.result = data.result;
+            for await (const sseEvent of streamChat(
+              {
+                model: effectiveModel,
+                messages: apiMessages,
+                agent_id: defaultAgent || undefined,
+                stream: true,
+                temperature,
+                max_tokens: maxTokens,
+              },
+              controller.signal,
+            )) {
+              if (handleLegacySseEvent(sseEvent)) break;
             }
-            setStreamState({
-              phase: 'Generating...',
-              activeToolCalls: [...toolCalls],
-            });
-          } catch {}
-        } else {
-          try {
-            const data = JSON.parse(sseEvent.data);
-            const delta = data.choices?.[0]?.delta;
-            if (data.usage) usage = data.usage;
-            if (data.complexity) complexity = data.complexity;
-            if (delta?.content) {
-              if (!ttftMs) ttftMs = Date.now() - startTime;
-              accumulatedContent += delta.content;
-              const now = Date.now();
-              if (now - lastDraftFlush >= 50) {
-                setStreamState({ content: accumulatedContent, phase: '' });
-                lastDraftFlush = now;
-              }
-              if (autoSpeak) tts.feedToken(delta.content);
-            }
-            if (data.choices?.[0]?.finish_reason === 'stop') break;
-          } catch {}
+          } else {
+            throw chiefErr;
+          }
+        }
+      } else {
+        for await (const sseEvent of streamChat(
+          {
+            model: effectiveModel,
+            messages: apiMessages,
+            agent_id: defaultAgent || undefined,
+            stream: true,
+            temperature,
+            max_tokens: maxTokens,
+          },
+          controller.signal,
+        )) {
+          if (handleLegacySseEvent(sseEvent)) break;
         }
       }
     } catch (err: any) {
@@ -610,11 +717,36 @@ export function InputArea() {
           </div>
         )}
       </div>
-      <div className="flex items-center justify-center mt-2 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+      <div className="flex items-center justify-center gap-3 mt-2 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
         <span>
           <kbd className="font-mono">Enter</kbd> to send &middot;{' '}
           <kbd className="font-mono">Shift+Enter</kbd> for new line
         </span>
+        {chiefIngressActive && (
+          <>
+            <span aria-hidden>&middot;</span>
+            <button
+              type="button"
+              onClick={() => updateSettings({ chiefDirectMode: !chiefDirectMode })}
+              className="flex items-center gap-1 cursor-pointer transition-colors"
+              style={{
+                color: routeThroughChief
+                  ? 'var(--color-accent)'
+                  : 'var(--color-text-tertiary)',
+              }}
+              title={
+                routeThroughChief
+                  ? `Routing through ${chiefStatus.chief_name || 'the Chief Orchestrator'}. Click to send directly instead.`
+                  : 'Direct mode — bypassing the Chief Orchestrator. Click to route through the Chief.'
+              }
+            >
+              <Crown size={11} />
+              {routeThroughChief
+                ? `via ${chiefStatus.chief_name || 'Chief'}`
+                : 'Direct mode'}
+            </button>
+          </>
+        )}
       </div>
     </div>
   );

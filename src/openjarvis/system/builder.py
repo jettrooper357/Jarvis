@@ -223,7 +223,7 @@ class SystemBuilder:
                 am_db = config.agent_manager.db_path or str(
                     Path("~/.openjarvis/agents.db").expanduser()
                 )
-                agent_manager = AgentManager(db_path=am_db)
+                agent_manager = AgentManager(db_path=am_db, event_bus=bus)
             except Exception as exc:
                 logger.warning("Failed to initialize agent manager: %s", exc)
 

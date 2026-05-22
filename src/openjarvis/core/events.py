@@ -77,6 +77,17 @@ class EventType(str, Enum):
     OPTIMIZE_TRIAL_END = "optimize_trial_end"
     OPTIMIZE_RUN_END = "optimize_run_end"
     FEEDBACK_RECEIVED = "feedback_received"
+    # Phase 2A — Task lifecycle + approval flow + UI notifications.
+    # Enum values are declared here so subscribers can attach; emitters are
+    # wired in Phase 2C (task.*) and Phase 2D (approval.*).
+    TASK_CREATED = "task.created"
+    TASK_UPDATED = "task.updated"
+    TASK_DELEGATED = "task.delegated"
+    TASK_COMPLETED = "task.completed"
+    TASK_FAILED = "task.failed"
+    APPROVAL_REQUESTED = "approval.requested"
+    APPROVAL_RESOLVED = "approval.resolved"
+    UI_NOTIFICATION = "ui.notification"
 
 
 @dataclass(slots=True)

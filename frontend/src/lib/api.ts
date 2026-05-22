@@ -462,6 +462,18 @@ export interface ManagedAgent {
   auto_tools?: string[];
   effective_tools?: string[];
   knowledge_enabled?: boolean;
+  // Phase 2A — capability axes for the Inspector. Lists are always
+  // present (empty when no policy exists), never undefined at runtime
+  // for a server-built record; typed optional for backwards compatibility
+  // with cached responses.
+  inherited_skills?: string[];
+  inherited_tools?: string[];
+  blocked_skills?: string[];
+  blocked_tools?: string[];
+  requires_approval_skills?: string[];
+  requires_approval_tools?: string[];
+  // Phase 2E — Chief-as-canonical-ingress designation.
+  is_chief?: boolean;
   status: 'idle' | 'running' | 'paused' | 'error' | 'archived' | 'needs_attention' | 'budget_exceeded' | 'stalled' | 'input_required' | 'auth_required' | 'waiting_on_tool';
   summary_memory: string;
   created_at: number;
@@ -603,6 +615,233 @@ export async function updateManagedAgent(
 export async function deleteManagedAgent(agentId: string): Promise<void> {
   const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}`, { method: 'DELETE' });
   if (!res.ok) throw new Error(`Failed: ${res.status}`);
+}
+
+// Phase 2A — Capability Inspector preview (no side effects).
+export async function previewAgentCapabilities(
+  agentId: string,
+  configOverrides?: Record<string, unknown>,
+): Promise<ManagedAgent> {
+  const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}/preview`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ config_overrides: configOverrides || null }),
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+// Phase 2B — append-only config version history.
+export interface AgentConfigVersion {
+  id: string;
+  agent_id: string;
+  version_number: number;
+  snapshot: Record<string, unknown>;
+  diff: {
+    added?: Record<string, unknown>;
+    removed?: Record<string, unknown>;
+    changed?: Record<string, { from: unknown; to: unknown }>;
+  };
+  summary: string;
+  created_at: number;
+  created_by?: string | null;
+}
+
+export async function fetchAgentConfigVersions(
+  agentId: string,
+  limit?: number,
+): Promise<AgentConfigVersion[]> {
+  const qs = limit ? `?limit=${limit}` : '';
+  const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}/versions${qs}`);
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  const body = await res.json();
+  return body.versions ?? [];
+}
+
+export async function revertAgentConfig(
+  agentId: string,
+  versionId: string,
+  updatedBy?: string,
+): Promise<ManagedAgent> {
+  const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}/revert`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ version_id: versionId, updated_by: updatedBy || null }),
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+// Phase 2E — Chief as canonical ingress.
+
+export interface ChiefStatus {
+  enabled: boolean;
+  chief_id: string | null;
+  chief_name: string | null;
+}
+
+export async function getChiefStatus(): Promise<ChiefStatus> {
+  const res = await fetch(`${getBase()}/v1/chief/status`);
+  if (!res.ok) {
+    // Server lacks the endpoint (older build) — treat as "feature off".
+    return { enabled: false, chief_id: null, chief_name: null };
+  }
+  return res.json();
+}
+
+export async function designateChief(agentId: string): Promise<ManagedAgent> {
+  const res = await fetch(`${getBase()}/v1/chief/designate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agent_id: agentId }),
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Send a chat message through the Chief ingress endpoint.
+ *
+ * The endpoint internally delegates to the same dispatcher as
+ * ``sendAgentMessage`` so the SSE wire protocol is bit-identical; this
+ * helper mirrors that function's callback shape so the InputArea can
+ * swap call sites without changing its parsing logic.
+ *
+ * Throws an ``Error`` with ``.code = 'chief_ingress_disabled'`` or
+ * ``'no_chief_designated'`` on a 412 so the caller can fall back to
+ * the legacy ingress without inspecting the raw response.
+ */
+export async function sendChiefMessage(
+  content: string,
+  opts: {
+    mode?: 'immediate' | 'queued';
+    requestingUser?: string;
+    signal?: AbortSignal;
+    callbacks?: {
+      onProgress?: (label: string) => void;
+      onContentDelta?: (delta: string, fullContent: string) => void;
+      onToolCallStart?: (info: AgentToolCallStart) => void;
+      onToolCallEnd?: (info: AgentToolCallEnd) => void;
+      onDone?: (
+        fullContent: string,
+        usage?: Record<string, number>,
+        telemetry?: Record<string, unknown>,
+      ) => void;
+    };
+  } = {},
+): Promise<AgentMessage> {
+  const { mode = 'queued', requestingUser, signal, callbacks } = opts;
+  const res = await fetch(`${getBase()}/v1/chief/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      content,
+      mode,
+      stream: true,
+      requesting_user: requestingUser || null,
+    }),
+    signal,
+  });
+  if (res.status === 412) {
+    const detail = (await res.json().catch(() => ({}))) as {
+      detail?: { error?: string; message?: string };
+    };
+    const err = new Error(detail?.detail?.message || 'Chief ingress unavailable');
+    (err as Error & { code?: string }).code = detail?.detail?.error;
+    throw err;
+  }
+  if (!res.ok) throw new Error(`Chief send failed: ${res.status}`);
+
+  const contentType = res.headers.get('content-type') || '';
+  if (contentType.includes('text/event-stream') && res.body) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let fullContent = '';
+    let buffer = '';
+    let lastUsage: Record<string, number> | undefined;
+    let lastTelemetry: Record<string, unknown> | undefined;
+    let currentEvent: string | undefined;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            currentEvent = line.slice(7).trim();
+            continue;
+          }
+          if (!line.startsWith('data: ')) {
+            if (line.trim() === '') currentEvent = undefined;
+            continue;
+          }
+          const data = line.slice(6);
+          if (data === '[DONE]') {
+            currentEvent = undefined;
+            continue;
+          }
+          const evName = currentEvent;
+          currentEvent = undefined;
+          if (evName === 'tool_call_start') {
+            try {
+              const parsed = JSON.parse(data);
+              callbacks?.onToolCallStart?.({
+                tool: parsed.tool,
+                arguments: parsed.arguments ?? '',
+              });
+            } catch {
+              /* skip */
+            }
+            continue;
+          }
+          if (evName === 'tool_call_end') {
+            try {
+              const parsed = JSON.parse(data);
+              callbacks?.onToolCallEnd?.({
+                tool: parsed.tool,
+                success: !!parsed.success,
+                latency: typeof parsed.latency === 'number' ? parsed.latency : 0,
+                result: parsed.result,
+              });
+            } catch {
+              /* skip */
+            }
+            continue;
+          }
+          try {
+            const chunk = JSON.parse(data);
+            const toolProgress = chunk.choices?.[0]?.tool_progress;
+            if (toolProgress) callbacks?.onProgress?.(toolProgress);
+            const delta = chunk.choices?.[0]?.delta?.content || '';
+            if (delta) {
+              fullContent += delta;
+              callbacks?.onContentDelta?.(delta, fullContent);
+            }
+            if (chunk.usage) lastUsage = chunk.usage;
+            if (chunk.telemetry) lastTelemetry = chunk.telemetry;
+          } catch {
+            /* skip malformed chunks */
+          }
+        }
+      }
+    } catch {
+      /* stream ended */
+    }
+    callbacks?.onDone?.(fullContent, lastUsage, lastTelemetry);
+    return {
+      id: '',
+      agent_id: '',
+      direction: 'agent_to_user',
+      content: fullContent,
+      mode,
+      status: 'delivered',
+      created_at: Date.now() / 1000,
+    };
+  }
+  // Non-streaming path: JSON message record.
+  return res.json();
 }
 
 export async function pauseManagedAgent(agentId: string): Promise<void> {

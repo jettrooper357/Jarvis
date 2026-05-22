@@ -40,13 +40,20 @@ import {
   fetchChiefPending,
   resumeChief,
   fetchTraceTree,
+  previewAgentCapabilities,
+  fetchAgentConfigVersions,
+  revertAgentConfig,
+  sendChiefMessage,
 } from '../lib/api';
+import type { AgentConfigVersion } from '../lib/api';
+import { useChiefHealth } from '../hooks/useChiefHealth';
 import type { TraceTreeNode } from '../lib/api';
 import type { AgentTask, ChannelBinding, AgentTemplate, AgentMessage, ManagedAgent, LearningLogEntry, AgentTrace, ToolInfo, InstalledSkill, MissionControlData, MissionControlProject, MissionControlTask } from '../lib/api';
 import { useAgentEvents, type AgentEvent } from '../lib/useAgentEvents';
 import {
   Plus,
   Bot,
+  Crown,
   Pause,
   Play,
   Trash2,
@@ -2562,6 +2569,432 @@ function skillGroupLabel(name: string): string {
 
 const SKILL_GROUP_ORDER = [...SKILL_GROUPS.map((g) => g.label), 'Other'];
 
+// ── Phase 2B: Capability Inspector ────────────────────────────────────
+//
+// Renders the 6-axis capability view (assigned / inherited / effective /
+// blocked / requires_approval / disabled) backed by the new
+// ``enrich_agent_record`` keys from Phase 2A. Includes a Preview modal
+// (calls /preview) and a Version history drawer (calls /versions and
+// /revert). Wired below AgentPresetToolsSection on the Overview tab.
+//
+// Per the Phase 2 plan: this is additive. AgentPresetToolsSection keeps
+// rendering — the Inspector is a complementary read-mostly surface for
+// now. Bulk actions, drag-reorder, conflict warnings, and search/filter
+// are deferred to a follow-up.
+
+type CapabilityAxis = 'assigned' | 'inherited' | 'effective' | 'blocked' | 'requires_approval';
+
+const AXIS_LABELS: Record<CapabilityAxis, string> = {
+  assigned: 'Assigned',
+  inherited: 'Inherited',
+  effective: 'Effective',
+  blocked: 'Blocked',
+  requires_approval: 'Approval-gated',
+};
+
+const AXIS_COLORS: Record<CapabilityAxis, { bg: string; fg: string; border: string }> = {
+  assigned: { bg: 'var(--color-accent-subtle)', fg: 'var(--color-accent)', border: 'var(--color-accent)' },
+  inherited: { bg: 'var(--color-bg-secondary)', fg: 'var(--color-text-secondary)', border: 'var(--color-border)' },
+  effective: { bg: 'var(--color-bg-tertiary)', fg: 'var(--color-text)', border: 'var(--color-border)' },
+  blocked: { bg: 'transparent', fg: 'var(--color-error)', border: 'var(--color-error)' },
+  requires_approval: { bg: 'var(--color-accent-amber-subtle)', fg: 'var(--color-accent-amber)', border: 'var(--color-accent-amber)' },
+};
+
+function AxisChip({ label, axis, title }: { label: string; axis: CapabilityAxis; title?: string }) {
+  const c = AXIS_COLORS[axis];
+  return (
+    <span
+      title={title || AXIS_LABELS[axis]}
+      className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium"
+      style={{ background: c.bg, color: c.fg, border: `1px solid ${c.border}` }}
+    >
+      <span aria-hidden style={{ width: 4, height: 4, borderRadius: 4, background: c.fg, display: 'inline-block' }} />
+      {label}
+    </span>
+  );
+}
+
+function _formatVersionTime(t: number | undefined): string {
+  if (!t) return '—';
+  const d = new Date(t * 1000);
+  return `${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+}
+
+function CapabilityInspector({
+  agent,
+  onAgentUpdated,
+}: { agent: ManagedAgent; onAgentUpdated: () => void }) {
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [previewData, setPreviewData] = useState<ManagedAgent | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [versions, setVersions] = useState<AgentConfigVersion[]>([]);
+  const [versionsLoading, setVersionsLoading] = useState(false);
+  const [reverting, setReverting] = useState<string | null>(null);
+
+  const assignedSkills = useMemo(
+    () => agent.configured_skills ?? [],
+    [agent.configured_skills],
+  );
+  const inheritedSkills = useMemo(
+    () => agent.inherited_skills ?? [],
+    [agent.inherited_skills],
+  );
+  const blockedSkills = useMemo(
+    () => agent.blocked_skills ?? [],
+    [agent.blocked_skills],
+  );
+  const approvalSkills = useMemo(
+    () => agent.requires_approval_skills ?? [],
+    [agent.requires_approval_skills],
+  );
+  const effectiveSkills = useMemo(
+    () => agent.effective_skills ?? [],
+    [agent.effective_skills],
+  );
+  const assignedTools = useMemo(() => agent.configured_tools ?? [], [agent.configured_tools]);
+  const inheritedTools = useMemo(() => agent.inherited_tools ?? [], [agent.inherited_tools]);
+  const blockedTools = useMemo(() => agent.blocked_tools ?? [], [agent.blocked_tools]);
+  const approvalTools = useMemo(() => agent.requires_approval_tools ?? [], [agent.requires_approval_tools]);
+  const autoTools = useMemo(() => agent.auto_tools ?? [], [agent.auto_tools]);
+  const effectiveTools = useMemo(() => agent.effective_tools ?? [], [agent.effective_tools]);
+
+  async function openPreview() {
+    setPreviewOpen(true);
+    setPreviewLoading(true);
+    try {
+      setPreviewData(await previewAgentCapabilities(agent.id));
+    } catch (err) {
+      toast.error(`Preview failed: ${(err as Error).message}`);
+      setPreviewOpen(false);
+    } finally {
+      setPreviewLoading(false);
+    }
+  }
+
+  async function openHistory() {
+    setHistoryOpen(true);
+    setVersionsLoading(true);
+    try {
+      setVersions(await fetchAgentConfigVersions(agent.id));
+    } catch (err) {
+      toast.error(`History fetch failed: ${(err as Error).message}`);
+      setHistoryOpen(false);
+    } finally {
+      setVersionsLoading(false);
+    }
+  }
+
+  async function doRevert(versionId: string) {
+    setReverting(versionId);
+    try {
+      await revertAgentConfig(agent.id, versionId);
+      toast.success('Reverted — new version appended.');
+      onAgentUpdated();
+      setVersions(await fetchAgentConfigVersions(agent.id));
+    } catch (err) {
+      toast.error(`Revert failed: ${(err as Error).message}`);
+    } finally {
+      setReverting(null);
+    }
+  }
+
+  function renderChipRow(items: string[], axis: CapabilityAxis) {
+    if (items.length === 0) {
+      return (
+        <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+          —
+        </span>
+      );
+    }
+    return (
+      <div className="flex flex-wrap gap-1.5">
+        {items.map((name) => (
+          <AxisChip key={`${axis}-${name}`} label={name} axis={axis} />
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="p-3 rounded-lg"
+      style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
+    >
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <div>
+          <h3 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+            Capability Inspector
+          </h3>
+          <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>
+            Assigned vs inherited vs blocked vs approval-gated — runtime effective view.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={openPreview}
+            className="text-xs px-2.5 py-1 rounded cursor-pointer"
+            style={{ color: 'var(--color-accent)', border: '1px solid var(--color-accent)', opacity: 0.85 }}
+            aria-label="Preview runtime capabilities"
+          >
+            Preview
+          </button>
+          <button
+            onClick={openHistory}
+            className="text-xs px-2.5 py-1 rounded cursor-pointer"
+            style={{ color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)' }}
+            aria-label="View configuration history"
+          >
+            History
+          </button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-3">
+        <section>
+          <div className="text-xs font-semibold uppercase tracking-wide mb-1.5" style={{ color: 'var(--color-text-tertiary)' }}>
+            Skills
+          </div>
+          <div className="space-y-1.5">
+            <Row label="Assigned">{renderChipRow(assignedSkills, 'assigned')}</Row>
+            <Row label="Inherited">{renderChipRow(inheritedSkills, 'inherited')}</Row>
+            <Row label="Blocked">{renderChipRow(blockedSkills, 'blocked')}</Row>
+            <Row label="Approval">{renderChipRow(approvalSkills, 'requires_approval')}</Row>
+            <Row label="Effective">{renderChipRow(effectiveSkills, 'effective')}</Row>
+          </div>
+        </section>
+        <section>
+          <div className="text-xs font-semibold uppercase tracking-wide mb-1.5" style={{ color: 'var(--color-text-tertiary)' }}>
+            Tools
+          </div>
+          <div className="space-y-1.5">
+            <Row label="Assigned">{renderChipRow(assignedTools, 'assigned')}</Row>
+            <Row label="Inherited">{renderChipRow(inheritedTools, 'inherited')}</Row>
+            <Row label="Auto">{renderChipRow(autoTools, 'inherited')}</Row>
+            <Row label="Blocked">{renderChipRow(blockedTools, 'blocked')}</Row>
+            <Row label="Approval">{renderChipRow(approvalTools, 'requires_approval')}</Row>
+            <Row label="Effective">{renderChipRow(effectiveTools, 'effective')}</Row>
+          </div>
+        </section>
+      </div>
+
+      {previewOpen && (
+        <CapabilityPreviewModal
+          loading={previewLoading}
+          data={previewData}
+          onClose={() => { setPreviewOpen(false); setPreviewData(null); }}
+        />
+      )}
+      {historyOpen && (
+        <ConfigHistoryDrawer
+          versions={versions}
+          loading={versionsLoading}
+          reverting={reverting}
+          onRevert={doRevert}
+          onClose={() => setHistoryOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function Row({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-start gap-2 text-xs">
+      <span
+        className="font-medium pt-0.5"
+        style={{ color: 'var(--color-text-secondary)', minWidth: 78, display: 'inline-block' }}
+      >
+        {label}
+      </span>
+      <div className="flex-1 min-w-0">{children}</div>
+    </div>
+  );
+}
+
+function CapabilityPreviewModal({
+  loading,
+  data,
+  onClose,
+}: {
+  loading: boolean;
+  data: ManagedAgent | null;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Effective runtime capabilities"
+      className="fixed inset-0 z-50 flex items-center justify-center"
+      style={{ background: 'rgba(0,0,0,0.4)' }}
+      onClick={onClose}
+    >
+      <div
+        className="rounded-xl p-5 max-w-lg w-full mx-4 max-h-[80vh] overflow-y-auto"
+        style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex justify-between items-center mb-3">
+          <h3 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+            Effective runtime capabilities
+          </h3>
+          <button
+            onClick={onClose}
+            className="text-sm cursor-pointer"
+            style={{ color: 'var(--color-text-tertiary)' }}
+            aria-label="Close preview"
+          >
+            ×
+          </button>
+        </div>
+        {loading && <p className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>Loading…</p>}
+        {!loading && data && (
+          <div className="space-y-3 text-sm">
+            <div>
+              <div className="text-xs uppercase tracking-wide mb-1" style={{ color: 'var(--color-text-tertiary)' }}>
+                Skills ({(data.effective_skills ?? []).length})
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {(data.effective_skills ?? []).map((s) => (
+                  <AxisChip key={`prev-s-${s}`} label={s} axis="effective" />
+                ))}
+                {(data.effective_skills ?? []).length === 0 && (
+                  <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>None</span>
+                )}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs uppercase tracking-wide mb-1" style={{ color: 'var(--color-text-tertiary)' }}>
+                Tools ({(data.effective_tools ?? []).length})
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {(data.effective_tools ?? []).map((t) => (
+                  <AxisChip key={`prev-t-${t}`} label={t} axis="effective" />
+                ))}
+                {(data.effective_tools ?? []).length === 0 && (
+                  <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>None</span>
+                )}
+              </div>
+            </div>
+            {(data.requires_approval_skills ?? []).length + (data.requires_approval_tools ?? []).length > 0 && (
+              <div className="pt-2" style={{ borderTop: '1px solid var(--color-border)' }}>
+                <div className="text-xs uppercase tracking-wide mb-1" style={{ color: 'var(--color-accent-amber)' }}>
+                  Approval-gated
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {(data.requires_approval_skills ?? []).map((s) => (
+                    <AxisChip key={`prev-as-${s}`} label={s} axis="requires_approval" />
+                  ))}
+                  {(data.requires_approval_tools ?? []).map((t) => (
+                    <AxisChip key={`prev-at-${t}`} label={t} axis="requires_approval" />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        <div className="mt-4 flex justify-end">
+          <button
+            onClick={onClose}
+            className="text-xs px-3 py-1 rounded cursor-pointer"
+            style={{ color: 'var(--color-text-tertiary)', border: '1px solid var(--color-border)' }}
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ConfigHistoryDrawer({
+  versions,
+  loading,
+  reverting,
+  onRevert,
+  onClose,
+}: {
+  versions: AgentConfigVersion[];
+  loading: boolean;
+  reverting: string | null;
+  onRevert: (versionId: string) => Promise<void> | void;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Configuration history"
+      className="fixed inset-y-0 right-0 z-50 w-full max-w-md shadow-xl overflow-y-auto"
+      style={{ background: 'var(--color-bg)', borderLeft: '1px solid var(--color-border)' }}
+    >
+      <div className="sticky top-0 flex justify-between items-center px-4 py-3" style={{ background: 'var(--color-bg)', borderBottom: '1px solid var(--color-border)' }}>
+        <h3 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+          Configuration history
+        </h3>
+        <button
+          onClick={onClose}
+          aria-label="Close history"
+          className="text-sm cursor-pointer"
+          style={{ color: 'var(--color-text-tertiary)' }}
+        >
+          ×
+        </button>
+      </div>
+      <div className="p-4 space-y-2">
+        {loading && <p className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>Loading…</p>}
+        {!loading && versions.length === 0 && (
+          <p className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
+            No history yet. Saving a config change will create the first version.
+          </p>
+        )}
+        {!loading && versions.map((v) => {
+          const changedKeys = Object.keys(v.diff?.changed || {});
+          const addedKeys = Object.keys(v.diff?.added || {});
+          const removedKeys = Object.keys(v.diff?.removed || {});
+          return (
+            <div
+              key={v.id}
+              className="rounded-lg p-3"
+              style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
+            >
+              <div className="flex justify-between items-center mb-1">
+                <span className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+                  v{v.version_number}
+                </span>
+                <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                  {_formatVersionTime(v.created_at)}
+                  {v.created_by ? ` · ${v.created_by}` : ''}
+                </span>
+              </div>
+              {v.summary && (
+                <p className="text-xs mb-1" style={{ color: 'var(--color-text-secondary)' }}>{v.summary}</p>
+              )}
+              <div className="text-xs mb-2" style={{ color: 'var(--color-text-tertiary)' }}>
+                {addedKeys.length > 0 && <span>+{addedKeys.length} </span>}
+                {removedKeys.length > 0 && <span>−{removedKeys.length} </span>}
+                {changedKeys.length > 0 && <span>~{changedKeys.length}</span>}
+                {addedKeys.length + removedKeys.length + changedKeys.length === 0 && (
+                  <span>no diff</span>
+                )}
+              </div>
+              <button
+                disabled={reverting === v.id}
+                onClick={() => onRevert(v.id)}
+                className="text-xs px-2 py-0.5 rounded cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                style={{ color: 'var(--color-accent)', border: '1px solid var(--color-accent)' }}
+              >
+                {reverting === v.id ? 'Reverting…' : 'Revert to this version'}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function AgentPresetToolsSection({
   agent,
   managedAgents,
@@ -3537,6 +3970,14 @@ function OrgChartNode({
             <span className="font-medium text-sm truncate" style={{ color: 'var(--color-text)' }}>
               {agent.name}
             </span>
+            {/* Phase 2E — Chief designation badge. */}
+            {agent.is_chief && (
+              <Crown
+                size={13}
+                style={{ color: 'var(--color-accent-amber)', flexShrink: 0 }}
+                aria-label="Chief Orchestrator"
+              />
+            )}
           </div>
           <StatusDot status={agent.status} />
         </div>
@@ -4218,6 +4659,12 @@ function InteractTab({ agentId, agentStatus }: { agentId: string; agentStatus: s
   const [liveStatus, setLiveStatus] = useState(agentStatus);
   const [streamElapsedMs, setStreamElapsedMs] = useState(0);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  // Phase 2E — chief routing for the interact tab.
+  const { status: chiefStatus, chiefIngressActive } = useChiefHealth();
+  const [isChiefAgent, setIsChiefAgent] = useState(false);
+  // null = "use the default for this agent" (resolved once the record
+  // loads: ON for subordinates, OFF for the Chief itself).
+  const [routeThroughChiefPref, setRouteThroughChiefPref] = useState<boolean | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -4264,6 +4711,7 @@ function InteractTab({ agentId, agentStatus }: { agentId: string; agentStatus: s
       setMessages(merged);
       setLiveStatus(agent.status);
       setCurrentActivity(agent.current_activity || '');
+      setIsChiefAgent(!!agent.is_chief);
     } catch {
       // ignore
     }
@@ -4366,14 +4814,20 @@ function InteractTab({ agentId, agentStatus }: { agentId: string; agentStatus: s
     let responseUsage: Record<string, number> | undefined;
     let responseTelemetry: Record<string, unknown> | undefined;
     const collectedToolCalls: ToolCallInfo[] = [];
+    // Phase 2E — route a subordinate's interact message through the
+    // Chief when the feature is active and the user hasn't opted out.
+    // The Chief itself always talks directly (routing it through itself
+    // would be a no-op extra hop).
+    const routeThroughChief =
+      chiefIngressActive && !isChiefAgent && (routeThroughChiefPref ?? true);
     try {
-      const response = await sendAgentMessage(agentId, text, mode, {
-        onProgress: (label) => {
+      const messageCallbacks = {
+        onProgress: (label: string) => {
           setProgressLabel(label);
           toolCount++;
         },
-        onContentDelta: (_delta, full) => setStreamingContent(full),
-        onToolCallStart: ({ tool, arguments: args }) => {
+        onContentDelta: (_delta: string, full: string) => setStreamingContent(full),
+        onToolCallStart: ({ tool, arguments: args }: { tool: string; arguments: string }) => {
           toolCount++;
           const tc: ToolCallInfo = {
             id: `tc-${Date.now()}-${collectedToolCalls.length}`,
@@ -4385,24 +4839,34 @@ function InteractTab({ agentId, agentStatus }: { agentId: string; agentStatus: s
           setStreamingToolCalls([...collectedToolCalls]);
           setProgressLabel(`Calling ${tool}...`);
         },
-        onToolCallEnd: ({ tool, success, latency, result }) => {
+        onToolCallEnd: (
+          { tool, success, latency, result }:
+          { tool: string; success: boolean; latency: number; result?: unknown },
+        ) => {
           const match = [...collectedToolCalls]
             .reverse()
             .find((t) => t.tool === tool && t.status === 'running');
           if (match) {
             match.status = success ? 'success' : 'error';
             match.latency = latency;
-            match.result = result;
+            match.result = result as string | undefined;
           }
           setStreamingToolCalls([...collectedToolCalls]);
           setProgressLabel('');
         },
-        onDone: (_content, usage, telemetry) => {
+        onDone: (
+          _content: string,
+          usage?: Record<string, number>,
+          telemetry?: Record<string, unknown>,
+        ) => {
           setStreamingContent('');
           responseUsage = usage;
           responseTelemetry = telemetry;
         },
-      });
+      };
+      const response = routeThroughChief
+        ? await sendChiefMessage(text, { mode, callbacks: messageCallbacks })
+        : await sendAgentMessage(agentId, text, mode, messageCallbacks);
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       // Add the agent's response as a local bubble immediately
       if (response && (response.content || collectedToolCalls.length > 0)) {
@@ -4583,7 +5047,7 @@ function InteractTab({ agentId, agentStatus }: { agentId: string; agentStatus: s
           className="w-full px-3 py-2 rounded-lg text-sm bg-transparent outline-none resize-none"
           style={{ border: '1px solid var(--color-border)', color: 'var(--color-text)', minHeight: 72 }}
         />
-        <div className="flex gap-2 mt-2">
+        <div className="flex items-center gap-2 mt-2">
           <button
             onClick={() => handleSend('immediate')}
             disabled={sending || waitingForResponse || !input.trim()}
@@ -4592,6 +5056,27 @@ function InteractTab({ agentId, agentStatus }: { agentId: string; agentStatus: s
           >
             <Send size={13} /> Send
           </button>
+          {/* Phase 2E — Route-through-Chief toggle. Shown only for
+              subordinate agents while the Chief ingress is active.
+              The Chief itself always talks directly. */}
+          {chiefIngressActive && !isChiefAgent && (
+            <label
+              className="flex items-center gap-1.5 text-xs cursor-pointer select-none"
+              style={{ color: 'var(--color-text-secondary)' }}
+              title={
+                'When on, your message goes to the Chief Orchestrator, '
+                + 'which decides whether to answer, delegate to this '
+                + 'agent, or decompose the work.'
+              }
+            >
+              <input
+                type="checkbox"
+                checked={routeThroughChiefPref ?? true}
+                onChange={(e) => setRouteThroughChiefPref(e.target.checked)}
+              />
+              Route through {chiefStatus.chief_name || 'Chief'}
+            </label>
+          )}
         </div>
       </div>
     </div>
@@ -6549,6 +7034,10 @@ export function AgentsPage() {
               onAgentUpdated={refresh}
               onOpenLibrary={() => navigate('/library')}
             />
+
+            {/* Phase 2B — Capability Inspector (additive; complements
+                AgentPresetToolsSection above). */}
+            <CapabilityInspector agent={selectedAgent} onAgentUpdated={refresh} />
 
             {/* Hint for deep research agents */}
             {selectedAgent.agent_type === 'deep_research' && (

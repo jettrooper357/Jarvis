@@ -125,7 +125,113 @@ def effective_agent_tool_names(agent_record: Dict[str, Any]) -> List[str]:
     return names
 
 
-def enrich_agent_record(agent_record: Dict[str, Any]) -> Dict[str, Any]:
+def _string_list(value: Any) -> List[str]:
+    """Coerce arbitrary config blob value into a clean list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items: Iterable[Any] = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple, set)):
+        items = value
+    else:
+        return []
+    out: List[str] = []
+    for entry in items:
+        if not isinstance(entry, str):
+            continue
+        cleaned = entry.strip()
+        if cleaned and cleaned not in out:
+            out.append(cleaned)
+    return out
+
+
+def resolve_capability_axes(
+    agent_record: Dict[str, Any],
+    manager_record: Optional[Dict[str, Any]] = None,
+) -> Dict[str, List[str]]:
+    """Compute the 6-axis capability resolution for a single agent.
+
+    Phase-2A addition. ``AGENTS.md`` § "Capability inheritance" requires
+    five resolution layers; this implements the additive portion that
+    plays cleanly with today's ``config`` blob:
+
+    - ``assigned_*`` — what the agent's own config declares.
+    - ``inherited_*`` — drawn from the manager's effective minus blocked,
+      per the recommended default (Phase-2 plan §"Open design questions" 3a).
+    - ``blocked_*`` — agent-local denylist (``config.blocked_skills`` /
+      ``config.blocked_tools``).
+    - ``requires_approval_*`` — agent-local approval-gate list
+      (``config.requires_approval_skills`` /
+      ``config.requires_approval_tools``).
+    - ``effective_*`` — the existing computation in
+      ``effective_agent_tool_names`` / ``configured_agent_skill_names``
+      with inheritance layered in and blocked items removed.
+
+    Returns a dict with 12 keys (6 axes × {skills, tools}). Empty lists
+    when no policy exists, never ``None``.
+    """
+    config = agent_record.get("config", {}) or {}
+    assigned_skills = configured_agent_skill_names(agent_record)
+    assigned_tools = configured_agent_tool_names(agent_record)
+
+    inherited_skills: List[str] = []
+    inherited_tools: List[str] = []
+    if manager_record is not None:
+        mgr_axes = resolve_capability_axes(manager_record, manager_record=None)
+        # Manager's effective minus blocked propagates to the subordinate.
+        inherited_skills = [
+            s for s in mgr_axes["effective_skills"]
+            if s not in assigned_skills
+        ]
+        inherited_tools = [
+            t for t in mgr_axes["effective_tools"]
+            if t not in assigned_tools
+        ]
+
+    blocked_skills = _string_list(config.get("blocked_skills"))
+    blocked_tools = _string_list(config.get("blocked_tools"))
+    requires_approval_skills = _string_list(
+        config.get("requires_approval_skills")
+    )
+    requires_approval_tools = _string_list(
+        config.get("requires_approval_tools")
+    )
+
+    # Effective = assigned ∪ inherited ∪ auto-injected, minus blocked.
+    auto_effective_tools = effective_agent_tool_names(agent_record)
+    union_tools: List[str] = []
+    for source in (
+        assigned_tools,
+        inherited_tools,
+        [t for t in auto_effective_tools if t not in assigned_tools],
+    ):
+        for name in source:
+            if name and name not in union_tools and name not in blocked_tools:
+                union_tools.append(name)
+    union_skills: List[str] = []
+    for source in (assigned_skills, inherited_skills):
+        for name in source:
+            if name and name not in union_skills and name not in blocked_skills:
+                union_skills.append(name)
+
+    return {
+        "assigned_skills": assigned_skills,
+        "assigned_tools": assigned_tools,
+        "inherited_skills": inherited_skills,
+        "inherited_tools": inherited_tools,
+        "blocked_skills": blocked_skills,
+        "blocked_tools": blocked_tools,
+        "requires_approval_skills": requires_approval_skills,
+        "requires_approval_tools": requires_approval_tools,
+        "effective_skills": union_skills,
+        "effective_tools": union_tools,
+    }
+
+
+def enrich_agent_record(
+    agent_record: Dict[str, Any],
+    manager_record: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     config = agent_record.get("config", {}) or {}
     configured_tools = configured_agent_tool_names(agent_record)
     configured_skills = configured_agent_skill_names(agent_record)
@@ -139,6 +245,17 @@ def enrich_agent_record(agent_record: Dict[str, Any]) -> Dict[str, Any]:
     enriched["auto_tools"] = auto_tools
     enriched["effective_tools"] = effective_tools
     enriched["knowledge_enabled"] = "knowledge_search" in effective_tools
+    # Phase 2A — capability axes for the Inspector. Keys are always present
+    # so the frontend type stays stable; lists are empty when no policy
+    # exists. ``manager_record`` is optional today; when supplied the
+    # axes include inherited capabilities (Phase-2B default 3a).
+    axes = resolve_capability_axes(agent_record, manager_record=manager_record)
+    enriched["inherited_skills"] = axes["inherited_skills"]
+    enriched["inherited_tools"] = axes["inherited_tools"]
+    enriched["blocked_skills"] = axes["blocked_skills"]
+    enriched["blocked_tools"] = axes["blocked_tools"]
+    enriched["requires_approval_skills"] = axes["requires_approval_skills"]
+    enriched["requires_approval_tools"] = axes["requires_approval_tools"]
     return enriched
 
 

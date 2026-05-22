@@ -86,6 +86,12 @@ interface Settings {
   wakeWords: string[];
   /** Max recent messages sent verbatim; older turns are condensed. */
   contextMaxMessages: number;
+  /**
+   * Phase 2E — when true, the chat input bypasses the Chief ingress and
+   * goes straight to ``/v1/chat/completions``. Off by default so users
+   * benefit from Chief routing as soon as it's enabled server-side.
+   */
+  chiefDirectMode: boolean;
 }
 
 function loadSettings(): Settings {
@@ -108,6 +114,7 @@ function loadSettings(): Settings {
     ttsSpeed: 1.0,
     wakeWords: [],
     contextMaxMessages: 12,
+    chiefDirectMode: false,
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);

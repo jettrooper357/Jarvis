@@ -89,6 +89,57 @@ class FeedbackRequest(BaseModel):
     reason: Optional[str] = None
 
 
+class PreviewCapabilitiesRequest(BaseModel):
+    """Phase 2A — body for ``POST /{agent_id}/preview``.
+
+    All fields optional. When omitted, the agent's current persisted
+    config is used. When set, the override layers on top of the current
+    config for the resolution only (nothing is persisted).
+    """
+
+    config_overrides: Optional[Dict[str, Any]] = None
+
+
+class RevertConfigRequest(BaseModel):
+    """Phase 2B — body for ``POST /{agent_id}/revert``."""
+
+    version_id: str
+    updated_by: Optional[str] = None
+
+
+class ResolveApprovalRequest(BaseModel):
+    """Phase 2D — body for grant/deny endpoints."""
+
+    resolved_by: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class ChiefMessageRequest(BaseModel):
+    """Phase 2E — body for ``POST /v1/chief/messages``.
+
+    Mirrors :class:`SendMessageRequest` so the new endpoint can delegate
+    100% of its runtime path to the existing managed-agent dispatcher.
+    ``requesting_user`` is captured for the root-task ledger (Phase-2A
+    column ``agent_tasks.requesting_user``) and is the only field beyond
+    the underlying send-message shape.
+    """
+
+    content: str
+    mode: str = "queued"
+    stream: bool = False
+    requesting_user: Optional[str] = None
+
+
+class DesignateChiefRequest(BaseModel):
+    """Phase 2E — body for ``POST /v1/chief/designate``.
+
+    Admin operation: set ``is_chief = 1`` on a specific agent. Atomic
+    (any prior Chief is cleared in the same transaction).
+    """
+
+    agent_id: str
+
+
 _BROWSER_SUB_TOOLS = {
     "browser_navigate",
     "browser_click",
@@ -594,8 +645,29 @@ def _configured_agent_tool_names(agent_record: Dict[str, Any]) -> List[str]:
     return _configured_capability_tool_names(agent_record)
 
 
-def _enrich_agent_record(agent_record: Dict[str, Any]) -> Dict[str, Any]:
-    return _enrich_capability_record(agent_record)
+def _enrich_agent_record(
+    agent_record: Dict[str, Any],
+    manager_record: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return _enrich_capability_record(agent_record, manager_record=manager_record)
+
+
+def _resolve_manager_record(
+    manager: Any, agent_record: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Best-effort lookup of an agent's manager for inheritance resolution.
+
+    Returns ``None`` when the agent has no manager or the manager lookup
+    fails; callers must treat the missing record as "no inheritance",
+    never as an error.
+    """
+    manager_id = agent_record.get("manager_agent_id")
+    if not manager_id:
+        return None
+    try:
+        return manager.get_agent(manager_id)
+    except Exception:
+        return None
 
 
 def _fallback_response_from_tool_calls(tool_calls: List[Dict[str, Any]]) -> str:
@@ -1604,10 +1676,16 @@ async def _stream_managed_agent(
 
 def create_agent_manager_router(
     manager: AgentManager,
-) -> Tuple[APIRouter, APIRouter, APIRouter, APIRouter]:
+    approval_store: Optional[Any] = None,
+) -> Tuple[APIRouter, ...]:
     """Create FastAPI routers with agent management endpoints.
 
-    Returns a 4-tuple: (agents_router, templates_router, global_router, tools_router).
+    Returns a tuple of routers in this order:
+    ``(agents_router, templates_router, global_router, tools_router,
+    sendblue_router, approvals_router, chief_router)``. Callers using
+    the legacy 4-/5-/6-tuple unpacking with a trailing ``*_`` swallow
+    continue to work — Phase 2D appended approvals; Phase 2E appends
+    the Chief-ingress router additively.
     """
     agents_router = APIRouter(prefix="/v1/managed-agents", tags=["managed-agents"])
     templates_router = APIRouter(prefix="/v1/templates", tags=["templates"])
@@ -1616,10 +1694,17 @@ def create_agent_manager_router(
 
     @agents_router.get("")
     async def list_agents():
+        # Pre-build an id→record map so inheritance resolution is O(N),
+        # not N round-trips back through ``manager.get_agent``.
+        all_agents = manager.list_agents()
+        by_id = {a["id"]: a for a in all_agents}
         return {
             "agents": [
-                _enrich_agent_record(agent)
-                for agent in manager.list_agents()
+                _enrich_agent_record(
+                    agent,
+                    manager_record=by_id.get(agent.get("manager_agent_id")),
+                )
+                for agent in all_agents
             ]
         }
 
@@ -1658,7 +1743,8 @@ def create_agent_manager_router(
         agent = manager.get_agent(agent_id)
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
-        return _enrich_agent_record(agent)
+        manager_rec = _resolve_manager_record(manager, agent)
+        return _enrich_agent_record(agent, manager_record=manager_rec)
 
     @agents_router.patch("/{agent_id}")
     async def update_agent(agent_id: str, req: UpdateAgentRequest):
@@ -1680,9 +1766,62 @@ def create_agent_manager_router(
         if "manager_agent_id" in fields_set:
             kwargs["manager_agent_id"] = req.manager_agent_id
         try:
-            return _enrich_agent_record(manager.update_agent(agent_id, **kwargs))
+            updated = manager.update_agent(agent_id, **kwargs)
+            manager_rec = _resolve_manager_record(manager, updated)
+            return _enrich_agent_record(updated, manager_record=manager_rec)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @agents_router.post("/{agent_id}/preview")
+    async def preview_agent_capabilities(
+        agent_id: str, req: PreviewCapabilitiesRequest
+    ):
+        """Phase 2A — return effective capabilities + axes without saving.
+
+        Body may supply ``config_overrides`` to layer on top of the
+        agent's persisted config. Used by the Capability Inspector's
+        "Preview Capabilities" modal. Idempotent: no side effects.
+        """
+        agent = manager.get_agent(agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        # Layer overrides on top of the persisted config for this preview.
+        if req.config_overrides:
+            preview_agent = dict(agent)
+            merged_config = dict(agent.get("config") or {})
+            merged_config.update(req.config_overrides)
+            preview_agent["config"] = merged_config
+            agent_for_preview = preview_agent
+        else:
+            agent_for_preview = agent
+        manager_rec = _resolve_manager_record(manager, agent_for_preview)
+        return _enrich_agent_record(
+            agent_for_preview, manager_record=manager_rec
+        )
+
+    @agents_router.get("/{agent_id}/versions")
+    async def list_agent_versions(agent_id: str, limit: Optional[int] = None):
+        """Phase 2B — list append-only config history for this agent."""
+        if not manager.get_agent(agent_id):
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return {
+            "agent_id": agent_id,
+            "versions": manager.list_agent_config_versions(agent_id, limit=limit),
+        }
+
+    @agents_router.post("/{agent_id}/revert")
+    async def revert_agent_config(agent_id: str, req: RevertConfigRequest):
+        """Phase 2B — non-destructive revert. Appends a new version."""
+        if not manager.get_agent(agent_id):
+            raise HTTPException(status_code=404, detail="Agent not found")
+        try:
+            updated = manager.revert_agent_config_to_version(
+                agent_id, req.version_id, updated_by=req.updated_by
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        manager_rec = _resolve_manager_record(manager, updated)
+        return _enrich_agent_record(updated, manager_record=manager_rec)
 
     @agents_router.delete("/{agent_id}")
     async def delete_agent(agent_id: str):
@@ -2727,10 +2866,183 @@ def create_agent_manager_router(
             "ready": sb is not None and has_bridge,
         }
 
+    # ── Phase 2D — Approvals API (additive) ──────────────────────
+    #
+    # No-op when no ``approval_store`` was supplied: the routes still
+    # exist but every endpoint returns 503 so the frontend can fall
+    # back gracefully. Production wiring supplies the store from
+    # serve.py / system/builder.py.
+
+    approvals_router = APIRouter(prefix="/v1/approvals", tags=["approvals"])
+
+    def _require_store() -> Any:
+        if approval_store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Approval store not configured on this server.",
+            )
+        return approval_store
+
+    @approvals_router.get("")
+    def list_approvals(
+        agent_id: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: Optional[int] = None,
+    ):
+        store = _require_store()
+        return {
+            "approvals": [
+                req.to_dict()
+                for req in store.list(
+                    agent_id=agent_id, state=state, limit=limit
+                )
+            ]
+        }
+
+    @approvals_router.get("/{approval_id}")
+    def get_approval(approval_id: str):
+        store = _require_store()
+        req = store.get(approval_id)
+        if req is None:
+            raise HTTPException(
+                status_code=404, detail="Approval not found"
+            )
+        return req.to_dict()
+
+    @approvals_router.post("/{approval_id}/grant")
+    def grant_approval(approval_id: str, body: ResolveApprovalRequest):
+        store = _require_store()
+        try:
+            return store.grant(
+                approval_id,
+                resolved_by=body.resolved_by,
+                reason=body.reason,
+            ).to_dict()
+        except Exception as exc:  # ApprovalError or any underlying error
+            # Conservative: missing / already-resolved both map to 409
+            # so the UI can surface "stale" approvals deterministically.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @approvals_router.post("/{approval_id}/deny")
+    def deny_approval(approval_id: str, body: ResolveApprovalRequest):
+        store = _require_store()
+        try:
+            return store.deny(
+                approval_id,
+                resolved_by=body.resolved_by,
+                reason=body.reason,
+            ).to_dict()
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    # ── Phase 2E — Chief-as-canonical-ingress (additive, gated) ──
+    #
+    # Lives on its own ``/v1/chief`` prefix to avoid colliding with
+    # ``/v1/managed-agents/{agent_id}`` path params. Gated on
+    # ``config.chief_ingress.enabled`` AND a designated Chief existing;
+    # either being absent returns 412 with a CTA payload so the UI can
+    # prompt the user to either flip the flag or designate a Chief.
+    #
+    # The message dispatch is a thin wrapper that resolves the Chief
+    # and re-invokes the existing ``send_message`` handler so the
+    # streaming / immediate-tick / persistence semantics are 100%
+    # identical and tested by the existing route tests.
+
+    chief_router = APIRouter(prefix="/v1/chief", tags=["chief-ingress"])
+
+    def _chief_ingress_enabled(request: Request) -> bool:
+        config = getattr(request.app.state, "config", None)
+        if config is None:
+            return False
+        chief_cfg = getattr(config, "chief_ingress", None)
+        return bool(getattr(chief_cfg, "enabled", False))
+
+    @chief_router.get("")
+    def get_chief():
+        """Return the currently-designated Chief or 404."""
+        chief = manager.get_chief_agent()
+        if chief is None:
+            raise HTTPException(
+                status_code=404, detail="No Chief agent designated"
+            )
+        manager_rec = _resolve_manager_record(manager, chief)
+        return _enrich_agent_record(chief, manager_record=manager_rec)
+
+    @chief_router.get("/status")
+    def chief_status(request: Request):
+        """One-shot health for the frontend: flag state + Chief presence.
+
+        Returns ``{enabled, chief_id, chief_name}``; the frontend uses
+        ``enabled && chief_id`` as the gate for switching its default
+        ingress to ``/v1/chief/messages``.
+        """
+        chief = manager.get_chief_agent()
+        return {
+            "enabled": _chief_ingress_enabled(request),
+            "chief_id": chief["id"] if chief else None,
+            "chief_name": chief["name"] if chief else None,
+        }
+
+    @chief_router.post("/designate")
+    def designate_chief(body: DesignateChiefRequest):
+        try:
+            updated = manager.set_chief_agent(body.agent_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        manager_rec = _resolve_manager_record(manager, updated)
+        return _enrich_agent_record(updated, manager_record=manager_rec)
+
+    @chief_router.post("/messages")
+    async def chief_send_message(req: ChiefMessageRequest, request: Request):
+        if not _chief_ingress_enabled(request):
+            raise HTTPException(
+                status_code=412,
+                detail={
+                    "error": "chief_ingress_disabled",
+                    "message": (
+                        "Chief-as-ingress is currently disabled. Set "
+                        "`chief_ingress.enabled = true` in config.toml "
+                        "to enable, or send your message to "
+                        "/v1/chat/completions or "
+                        "/v1/managed-agents/{id}/messages directly."
+                    ),
+                },
+            )
+        chief = manager.get_chief_agent()
+        if chief is None:
+            available = [
+                {
+                    "id": a["id"],
+                    "name": a["name"],
+                    "org_role": a.get("org_role", ""),
+                }
+                for a in manager.list_agents()
+                if a.get("status") != "archived"
+            ]
+            raise HTTPException(
+                status_code=412,
+                detail={
+                    "error": "no_chief_designated",
+                    "message": (
+                        "No Chief agent is designated. POST a JSON body "
+                        "with `agent_id` to /v1/chief/designate to "
+                        "choose one."
+                    ),
+                    "action": "designate_chief",
+                    "available_agents": available,
+                },
+            )
+        inner = SendMessageRequest(
+            content=req.content, mode=req.mode, stream=req.stream
+        )
+        return await send_message(chief["id"], inner, request)
+
     return (
         agents_router,
         templates_router,
         global_router,
         tools_router,
         sendblue_router,
+        approvals_router,
+        chief_router,
     )

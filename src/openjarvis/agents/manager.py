@@ -87,6 +87,22 @@ CREATE TABLE IF NOT EXISTS agent_learning_log (
 );
 """
 
+# Phase 2A: append-only history of agent config snapshots. Written by
+# update_agent whenever the config blob actually changes; never updated
+# in place (revert appends a new row with the older snapshot).
+_CREATE_CONFIG_VERSIONS = """\
+CREATE TABLE IF NOT EXISTS agent_config_versions (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL REFERENCES managed_agents(id),
+    version_number INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    diff_json TEXT NOT NULL DEFAULT '{}',
+    summary TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    created_by TEXT
+);
+"""
+
 _SUMMARY_MAX = 2000
 
 # System project that holds agent work not yet tied to a real project task.
@@ -107,13 +123,20 @@ class AgentManager:
     """Persistent agent lifecycle manager with SQLite backing."""
 
     def __init__(
-        self, db_path: str, project_store: Optional[Any] = None
+        self,
+        db_path: str,
+        project_store: Optional[Any] = None,
+        event_bus: Optional[Any] = None,
     ) -> None:
         self._db_path = str(db_path)
         # Lazily-resolved ProjectStore for cross-store linkage validation /
         # backfill. Injectable so tests can isolate the projects DB.
         self._injected_project_store = project_store
         self._proj_store: Optional[Any] = project_store
+        # Phase 2C — optional EventBus for task.* lifecycle emission.
+        # Default None preserves existing test/CLI callers; production
+        # callsites (cli/serve.py, system/builder.py) pass the shared bus.
+        self._event_bus = event_bus
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -124,6 +147,7 @@ class AgentManager:
         self._conn.executescript(_CREATE_CHECKPOINTS)
         self._conn.executescript(_CREATE_MESSAGES)
         self._conn.executescript(_CREATE_LEARNING_LOG)
+        self._conn.executescript(_CREATE_CONFIG_VERSIONS)
         self._conn.commit()
         # Schema migrations for runtime columns
         _MIGRATIONS = [
@@ -144,6 +168,25 @@ class AgentManager:
             # Mission Control: every agent task links to a project task/subtask
             "ALTER TABLE agent_tasks ADD COLUMN project_task_id TEXT",
             "ALTER TABLE agent_tasks ADD COLUMN project_id TEXT",
+            # Phase 2A — agent_tasks additive columns for canonical task model.
+            # All nullable; existing rows continue to read unchanged.
+            "ALTER TABLE agent_tasks ADD COLUMN parent_task_id TEXT",
+            "ALTER TABLE agent_tasks ADD COLUMN root_task_id TEXT",
+            "ALTER TABLE agent_tasks ADD COLUMN request_source TEXT",
+            "ALTER TABLE agent_tasks ADD COLUMN requesting_user TEXT",
+            "ALTER TABLE agent_tasks ADD COLUMN priority INTEGER",
+            "ALTER TABLE agent_tasks ADD COLUMN updated_at REAL",
+            "ALTER TABLE agent_tasks ADD COLUMN completed_at REAL",
+            "ALTER TABLE agent_tasks ADD COLUMN summary TEXT",
+            "ALTER TABLE agent_tasks ADD COLUMN errors_json TEXT",
+            "ALTER TABLE agent_tasks ADD COLUMN requires_user_input INTEGER DEFAULT 0",
+            "ALTER TABLE agent_tasks ADD COLUMN requires_approval INTEGER DEFAULT 0",
+            "ALTER TABLE agent_tasks ADD COLUMN task_session_id TEXT",
+            # Phase 2E — Chief-as-ingress designation. Nullable boolean
+            # (SQLite uses 0/1); exactly one agent should carry the
+            # flag at any time, enforced by ``set_chief_agent`` rather
+            # than a CHECK constraint so back-fill stays simple.
+            "ALTER TABLE managed_agents ADD COLUMN is_chief INTEGER DEFAULT 0",
         ]
         for migration in _MIGRATIONS:
             try:
@@ -154,9 +197,28 @@ class AgentManager:
         # One-time backfill so the new hard linkage requirement does not
         # break agents that already have unlinked tasks.
         self._backfill_unlinked_project_tasks()
+        # Phase 2E — back-fill the Chief designation. Idempotent: only
+        # runs when no agent is currently marked is_chief.
+        self._backfill_chief_designation()
 
     def close(self) -> None:
         self._conn.close()
+
+    # ── Phase 2C — Event emission helpers ─────────────────────────
+
+    def _emit_task_event(self, event_type: Any, payload: Dict[str, Any]) -> None:
+        """Publish a ``task.*`` event on the configured bus.
+
+        No-op when no bus is wired (test/CLI callers). Event publishing
+        is best-effort — a downstream subscriber raising must never break
+        a task lifecycle operation.
+        """
+        if self._event_bus is None:
+            return
+        try:
+            self._event_bus.publish(event_type, payload)
+        except Exception:
+            pass
 
     # ── Project-store linkage (Mission Control) ───────────────────
 
@@ -400,6 +462,11 @@ class AgentManager:
         return self._row_to_agent(row) if row else None
 
     def update_agent(self, agent_id: str, **kwargs: Any) -> Dict[str, Any]:
+        # Capture pre-update snapshot for the version log when config changes.
+        prior_config: Optional[Dict[str, Any]] = None
+        if "config" in kwargs:
+            prior = self.get_agent(agent_id)
+            prior_config = (prior or {}).get("config") or {}
         sets: List[str] = []
         vals: List[Any] = []
         for key in ("name", "agent_type", "status", "current_activity"):
@@ -454,7 +521,235 @@ class AgentManager:
             f"UPDATE managed_agents SET {', '.join(sets)} WHERE id = ?", vals
         )
         self._conn.commit()
+        # Phase 2A — append a config version row whenever the config blob
+        # actually changed (no-op updates don't pollute history).
+        if "config" in kwargs:
+            new_config = kwargs["config"] or {}
+            if (prior_config or {}) != (new_config or {}):
+                try:
+                    self._append_config_version(
+                        agent_id=agent_id,
+                        prior_config=prior_config or {},
+                        new_config=new_config,
+                        created_by=kwargs.get("updated_by"),
+                        summary=kwargs.get("change_summary", ""),
+                    )
+                except Exception:
+                    # Version capture is best-effort; never block an
+                    # otherwise-successful update on a history write failure.
+                    pass
         return self.get_agent(agent_id)  # type: ignore[return-value]
+
+    # ── Config version history (Phase 2A, append-only) ───────────
+
+    def _append_config_version(
+        self,
+        agent_id: str,
+        prior_config: Dict[str, Any],
+        new_config: Dict[str, Any],
+        created_by: Optional[str] = None,
+        summary: str = "",
+    ) -> Dict[str, Any]:
+        next_number = (
+            self._conn.execute(
+                "SELECT COALESCE(MAX(version_number), 0) + 1 AS n"
+                " FROM agent_config_versions WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()["n"]
+        )
+        diff = self._compute_config_diff(prior_config, new_config)
+        version_id = uuid.uuid4().hex[:12]
+        self._conn.execute(
+            "INSERT INTO agent_config_versions"
+            " (id, agent_id, version_number, snapshot_json, diff_json,"
+            " summary, created_at, created_by)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                version_id,
+                agent_id,
+                int(next_number),
+                json.dumps(new_config),
+                json.dumps(diff),
+                str(summary or "").strip(),
+                time.time(),
+                str(created_by or "").strip() or None,
+            ),
+        )
+        self._conn.commit()
+        return {
+            "id": version_id,
+            "agent_id": agent_id,
+            "version_number": int(next_number),
+            "snapshot": new_config,
+            "diff": diff,
+            "summary": str(summary or "").strip(),
+            "created_by": str(created_by or "").strip() or None,
+        }
+
+    @staticmethod
+    def _compute_config_diff(
+        prior: Dict[str, Any], new: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        added: Dict[str, Any] = {}
+        removed: Dict[str, Any] = {}
+        changed: Dict[str, Any] = {}
+        for key in set(prior) | set(new):
+            if key not in prior:
+                added[key] = new[key]
+            elif key not in new:
+                removed[key] = prior[key]
+            elif prior[key] != new[key]:
+                changed[key] = {"from": prior[key], "to": new[key]}
+        return {"added": added, "removed": removed, "changed": changed}
+
+    def list_agent_config_versions(
+        self, agent_id: str, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        query = (
+            "SELECT id, agent_id, version_number, snapshot_json, diff_json,"
+            " summary, created_at, created_by"
+            " FROM agent_config_versions WHERE agent_id = ?"
+            " ORDER BY version_number DESC"
+        )
+        params: List[Any] = [agent_id]
+        if limit is not None and limit > 0:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        rows = self._conn.execute(query, params).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "agent_id": r["agent_id"],
+                "version_number": r["version_number"],
+                "snapshot": json.loads(r["snapshot_json"]),
+                "diff": json.loads(r["diff_json"] or "{}"),
+                "summary": r["summary"] or "",
+                "created_at": r["created_at"],
+                "created_by": r["created_by"],
+            }
+            for r in rows
+        ]
+
+    def revert_agent_config_to_version(
+        self, agent_id: str, version_id: str, updated_by: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Append a new version that restores an earlier snapshot.
+
+        Non-destructive: the prior version row is preserved and the revert
+        itself becomes a new row in history.
+        """
+        row = self._conn.execute(
+            "SELECT snapshot_json, version_number FROM agent_config_versions"
+            " WHERE id = ? AND agent_id = ?",
+            (version_id, agent_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError(
+                f"Version {version_id!r} not found for agent {agent_id!r}"
+            )
+        snapshot = json.loads(row["snapshot_json"])
+        summary = f"Revert to version {int(row['version_number'])}"
+        return self.update_agent(
+            agent_id,
+            config=snapshot,
+            updated_by=updated_by,
+            change_summary=summary,
+        )
+
+    # ── Phase 2E — Chief designation (single-row flag) ────────────
+
+    # Role substrings that already mark an agent as "chief" today in
+    # ``managed_agent_runtime._role_guidance``. Used for the one-time
+    # back-fill so existing installs auto-promote a sensible Chief.
+    _CHIEF_ROLE_HINTS = (
+        "chief orchestrator",
+        "chief executive officer",
+        "ceo",
+    )
+
+    def _backfill_chief_designation(self) -> None:
+        """Mark the first matching agent as Chief if none currently is.
+
+        Idempotent: if any row already has ``is_chief = 1``, this is a
+        no-op. Runs once at startup; subsequent ``set_chief_agent`` calls
+        replace the designation atomically.
+        """
+        try:
+            existing = self._conn.execute(
+                "SELECT id FROM managed_agents WHERE is_chief = 1 LIMIT 1"
+            ).fetchone()
+            if existing is not None:
+                return
+            rows = self._conn.execute(
+                "SELECT id, org_role FROM managed_agents WHERE status != 'archived'"
+            ).fetchall()
+            for row in rows:
+                role = str(row["org_role"] or "").strip().casefold()
+                if any(hint in role for hint in self._CHIEF_ROLE_HINTS):
+                    self._conn.execute(
+                        "UPDATE managed_agents SET is_chief = 1 WHERE id = ?",
+                        (row["id"],),
+                    )
+                    self._conn.commit()
+                    return
+        except Exception:
+            # Back-fill is best-effort. The endpoint already returns
+            # 412 with a CTA when no Chief is set, so a failed back-fill
+            # degrades to "user designates manually".
+            pass
+
+    def get_chief_agent(self) -> Optional[Dict[str, Any]]:
+        """Return the currently-designated Chief agent record, or None."""
+        row = self._conn.execute(
+            "SELECT * FROM managed_agents"
+            " WHERE is_chief = 1 AND status != 'archived' LIMIT 1"
+        ).fetchone()
+        return self._row_to_agent(row) if row else None
+
+    def set_chief_agent(self, agent_id: str) -> Dict[str, Any]:
+        """Atomically clear the Chief flag from any prior row and set it
+        on ``agent_id``.
+
+        Raises ``ValueError`` if the named agent does not exist or is
+        archived. Idempotent: setting the existing Chief is a no-op
+        beyond bumping ``updated_at``.
+        """
+        target = self.get_agent(agent_id)
+        if target is None:
+            raise ValueError(f"Agent not found: {agent_id!r}")
+        if target.get("status") == "archived":
+            raise ValueError(
+                f"Cannot designate archived agent as Chief: {agent_id!r}"
+            )
+        now = time.time()
+        # Single transaction: clear all, set one. SQLite's default
+        # isolation gives us atomicity for this pair of statements
+        # because we commit only once.
+        try:
+            self._conn.execute(
+                "UPDATE managed_agents SET is_chief = 0 WHERE is_chief = 1"
+            )
+            self._conn.execute(
+                "UPDATE managed_agents SET is_chief = 1, updated_at = ?"
+                " WHERE id = ?",
+                (now, agent_id),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return self.get_agent(agent_id)  # type: ignore[return-value]
+
+    def clear_chief_designation(self) -> None:
+        """Remove the Chief flag from all agents.
+
+        Useful for tests and for an admin "no Chief configured" state
+        (the new ingress endpoint then returns 412 with a CTA).
+        """
+        self._conn.execute(
+            "UPDATE managed_agents SET is_chief = 0 WHERE is_chief = 1"
+        )
+        self._conn.commit()
 
     def delete_agent(self, agent_id: str) -> None:
         self._set_status(agent_id, "archived")
@@ -619,6 +914,7 @@ class AgentManager:
         )
         task_id = uuid.uuid4().hex[:12]
         now = time.time()
+        normalized_assigned_by = self._normalize_manager_id(assigned_by_agent_id)
         self._conn.execute(
             "INSERT INTO agent_tasks "
             "(id, agent_id, assigned_by_agent_id, description, status, "
@@ -627,7 +923,7 @@ class AgentManager:
             (
                 task_id,
                 agent_id,
-                self._normalize_manager_id(assigned_by_agent_id),
+                normalized_assigned_by,
                 description,
                 status,
                 str(proj_task["id"]).strip(),
@@ -636,6 +932,37 @@ class AgentManager:
             ),
         )
         self._conn.commit()
+        # Phase 2C — task.created event (no-op when no bus wired).
+        from openjarvis.core.events import EventType
+
+        self._emit_task_event(
+            EventType.TASK_CREATED,
+            {
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "assigned_by_agent_id": normalized_assigned_by,
+                "description": description,
+                "status": status,
+                "project_task_id": str(proj_task["id"]).strip(),
+                "project_id": resolved_project_id,
+                "created_at": now,
+            },
+        )
+        # If the new task was created by another agent, this is a
+        # delegation — also emit task.delegated so the activity sidebar
+        # has a first-class signal (the existing delegation tools no
+        # longer need to emit this separately).
+        if normalized_assigned_by:
+            self._emit_task_event(
+                EventType.TASK_DELEGATED,
+                {
+                    "task_id": task_id,
+                    "from_agent_id": normalized_assigned_by,
+                    "to_agent_id": agent_id,
+                    "description": description,
+                    "project_task_id": str(proj_task["id"]).strip(),
+                },
+            )
         return self._get_task(task_id)  # type: ignore[return-value]
 
     def list_tasks(
@@ -788,6 +1115,8 @@ class AgentManager:
         return [self._row_to_task(r) for r in rows]
 
     def update_task(self, task_id: str, **kwargs: Any) -> Dict[str, Any]:
+        prior = self._get_task(task_id)
+        prior_status = str((prior or {}).get("status") or "")
         sets: List[str] = []
         vals: List[Any] = []
         for key in ("description", "status"):
@@ -807,7 +1136,43 @@ class AgentManager:
             f"UPDATE agent_tasks SET {', '.join(sets)} WHERE id = ?", vals
         )
         self._conn.commit()
-        return self._get_task(task_id)  # type: ignore[return-value]
+        updated = self._get_task(task_id)
+        # Phase 2C — task.* events. Always emit task.updated; emit
+        # task.completed / task.failed when status crosses into a
+        # terminal state.
+        from openjarvis.core.events import EventType
+
+        new_status = str((updated or {}).get("status") or "")
+        self._emit_task_event(
+            EventType.TASK_UPDATED,
+            {
+                "task_id": task_id,
+                "agent_id": (updated or {}).get("agent_id"),
+                "prior_status": prior_status,
+                "status": new_status,
+                "changed_keys": list(kwargs.keys()),
+            },
+        )
+        if new_status != prior_status:
+            if new_status == "completed":
+                self._emit_task_event(
+                    EventType.TASK_COMPLETED,
+                    {
+                        "task_id": task_id,
+                        "agent_id": (updated or {}).get("agent_id"),
+                        "prior_status": prior_status,
+                    },
+                )
+            elif new_status == "failed":
+                self._emit_task_event(
+                    EventType.TASK_FAILED,
+                    {
+                        "task_id": task_id,
+                        "agent_id": (updated or {}).get("agent_id"),
+                        "prior_status": prior_status,
+                    },
+                )
+        return updated  # type: ignore[return-value]
 
     def delete_task(self, task_id: str) -> None:
         self._conn.execute("DELETE FROM agent_tasks WHERE id = ?", (task_id,))
@@ -1139,6 +1504,7 @@ class AgentManager:
     @staticmethod
     def _row_to_agent(row: sqlite3.Row) -> Dict[str, Any]:
         config_raw = row["config_json"]
+        keys = row.keys()
         return {
             "id": row["id"],
             "name": row["name"],
@@ -1159,6 +1525,9 @@ class AgentManager:
             "current_activity": row["current_activity"] or "",
             "input_tokens": row["input_tokens"] or 0,
             "output_tokens": row["output_tokens"] or 0,
+            # Phase 2E — Chief designation. Defaults False so legacy
+            # rows from before the migration read as non-chief.
+            "is_chief": bool(row["is_chief"]) if "is_chief" in keys else False,
         }
 
     @staticmethod
@@ -1166,6 +1535,11 @@ class AgentManager:
         progress_raw = row["progress_json"]
         findings_raw = row["findings_json"]
         keys = row.keys()
+
+        def _opt(name: str) -> Any:
+            return row[name] if name in keys else None
+
+        errors_raw = _opt("errors_json")
         return {
             "id": row["id"],
             "agent_id": row["agent_id"],
@@ -1174,13 +1548,24 @@ class AgentManager:
             "status": row["status"],
             "progress": json.loads(progress_raw) if progress_raw else {},
             "findings": json.loads(findings_raw) if findings_raw else [],
-            "project_task_id": (
-                row["project_task_id"] if "project_task_id" in keys else None
-            ),
-            "project_id": (
-                row["project_id"] if "project_id" in keys else None
-            ),
+            "project_task_id": _opt("project_task_id"),
+            "project_id": _opt("project_id"),
             "created_at": row["created_at"],
+            # Phase 2A — canonical task model fields. All nullable; back-fill
+            # is intentionally lazy (callers see None when the column was
+            # never written, never crash).
+            "parent_task_id": _opt("parent_task_id"),
+            "root_task_id": _opt("root_task_id"),
+            "request_source": _opt("request_source"),
+            "requesting_user": _opt("requesting_user"),
+            "priority": _opt("priority"),
+            "updated_at": _opt("updated_at"),
+            "completed_at": _opt("completed_at"),
+            "summary": _opt("summary"),
+            "errors": json.loads(errors_raw) if errors_raw else [],
+            "requires_user_input": bool(_opt("requires_user_input") or 0),
+            "requires_approval": bool(_opt("requires_approval") or 0),
+            "task_session_id": _opt("task_session_id"),
         }
 
     @staticmethod
