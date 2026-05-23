@@ -17,14 +17,22 @@ def _truncate(value: str, limit: int = 180) -> str:
     return text[: limit - 3] + "..."
 
 
+_BG_CONFIG_OVERRIDE: Any = None  # test hook — set to a BackgroundDelegationConfig to force.
+_WORKER_ISO_OVERRIDE: Any = None  # test hook — set to bool to force the flag.
+
+
 def _background_delegation_config() -> Any:
     """Resolve the ``[background_delegation]`` config block (Phase 2F).
+
+    Tests may set ``_BG_CONFIG_OVERRIDE`` to bypass the load_config path.
 
     Falls back to defaults (disabled) if config cannot be loaded, so the
     delegation path stays byte-identical to pre-Phase-2F behaviour.
     """
     from openjarvis.core.config import BackgroundDelegationConfig
 
+    if _BG_CONFIG_OVERRIDE is not None:
+        return _BG_CONFIG_OVERRIDE
     try:
         from openjarvis.core.config import load_config
 
@@ -35,6 +43,8 @@ def _background_delegation_config() -> Any:
 
 def _worker_session_isolation_enabled() -> bool:
     """Phase 2G — lazy read of the worker-session-isolation feature flag."""
+    if _WORKER_ISO_OVERRIDE is not None:
+        return bool(_WORKER_ISO_OVERRIDE)
     try:
         from openjarvis.core.config import load_config
 
