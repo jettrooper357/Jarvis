@@ -300,6 +300,7 @@ async def _stream_chief_response(
         bus=bus,
         default_model=server_model,
         trace_store=trace_store,
+        approval_store=getattr(app_state, "approval_store", None),
     )
 
     result_holder: dict[str, Any] = {"content": "", "error": None, "status": None}

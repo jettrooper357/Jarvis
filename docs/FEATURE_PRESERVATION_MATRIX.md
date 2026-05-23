@@ -12,6 +12,16 @@
 > **Important:** this matrix is *forecast*, not authorization. No change
 > below is approved. Any non-additive change still requires a Change Impact
 > Notice under `docs/CHANGE_IMPACT_NOTICES/<slug>.md`.
+>
+> **Update 2026-05-22 — Phases 2A–2D and 2E shipped.** The additive
+> phases (foundational schema, Capability Inspector, task events,
+> approval data plane) and Phase 2E (Chief-as-canonical-ingress, approved
+> via `docs/CHANGE_IMPACT_NOTICES/chief-as-canonical-ingress.md`, flag now
+> live) all landed. The surfaces they added — `POST /v1/chief/messages`
+> and siblings, the `is_chief` flag, `task.*` events, the approval store,
+> config version history — are now themselves **protected** features;
+> see `docs/AUGMENTED_FEATURES.md`. The rows below remain the canonical
+> blast-radius forecast for any *further* work.
 
 ---
 

@@ -16,6 +16,10 @@ export interface ManagedAgent {
   summary_memory: string;
   created_at: number;
   updated_at: number;
+  avatar_url?: string | null;
+  avatar_mime_type?: string | null;
+  avatar_file_name?: string | null;
+  avatar_updated_at?: number | string | null;
   total_runs?: number;
   total_cost?: number;
   total_tokens?: number;

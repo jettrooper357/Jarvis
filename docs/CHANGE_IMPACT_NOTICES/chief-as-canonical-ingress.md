@@ -1,7 +1,11 @@
 # Change Impact Notice: Chief as Canonical Ingress
 
 > **Phase 2E** of `docs/PHASE_2_PLAN.md`. Generated 2026-05-20.
-> **Status:** awaiting explicit approval. **No code written.**
+> **Status: APPROVED & SHIPPED (2026-05-22).** All three stages landed:
+> stage 1 (server, schema + endpoint), stage 2 (frontend wiring), and
+> stage 3 (`chief_ingress.enabled` default flipped to `true`). The
+> feature is live. Set `chief_ingress.enabled = false` in `config.toml`
+> to opt out.
 
 ## What Would Change
 
@@ -44,7 +48,7 @@ Concretely, three additive layers and two default-behavior switches:
 
 3. **Configuration flag — `[chief_ingress]` in `config.toml`.**
    - `chief_ingress.enabled` (default `false` on first deploy, then
-     flipped to `true` by a follow-up commit once the rollout window
+     flipped to `true` in a follow-up stage once the rollout window
      ends). Front-end gates the toggle on the `health` endpoint
      reporting `chief_ingress.enabled` and a Chief being designated.
 
@@ -127,7 +131,7 @@ guaranteed.
 | Added latency: Chief makes one extra LLM hop to decide route | Medium | Chief's existing system prompt already includes "answer directly when possible" guidance (`managed_agent_runtime.py:109-127`). For chat where the Chief answers itself, latency is ~unchanged. For delegated work, the second hop is the real subordinate run, which would have happened anyway. |
 | Tests that talk to `/v1/chat/completions` directly behave unchanged | Low | We are not touching `/v1/chat/completions`. Existing 30 route tests still pass after Phase 2A–2D. |
 | **No Chief designated** on first run | Medium | The 412 response includes a CTA payload `{action: "designate_chief", agents: [...]}` so the UI prompts the user to pick one. Back-fill rule auto-promotes the first agent matching the today's chief-role heuristic. |
-| Multiple agents marked as chief (concurrent admin edits) | Low | `set_chief_agent` is atomic: clears all rows then sets one in a single transaction. UNIQUE-like enforcement via `WHERE is_chief = 1` count check before commit. |
+| Multiple agents marked as chief (concurrent admin edits) | Low | `set_chief_agent` is atomic: clears all rows then sets one in a single transaction. UNIQUE-like enforcement via a `WHERE is_chief = 1` count check inside that transaction. |
 | The Chief becomes a single point of failure for chat | Medium | Direct routes are preserved. If the Chief is paused / errored, the UI degrades to a banner "Chief is unavailable — use Direct mode" and the existing `/v1/chat/completions` toggle still works. |
 | Performance regression on InteractTab for power users who *want* direct talk | Low–Medium | "Route through Chief" toggle defaults ON for subordinates but the user can flip it off per-session. Selection is remembered in `useAppStore`. |
 | Chief loop: user sends message → Chief delegates to subordinate → subordinate calls `managed_agent_delegate` back to Chief → infinite recursion | Medium | Already mitigated by existing `visited_agent_ids` cycle protection in `ManagedAgentExecutionContext` (managed_agent_runtime.py:29-42). Add a test exercising user→Chief→subordinate→Chief flow to lock that behavior in. |
@@ -156,10 +160,10 @@ guaranteed.
 
 ## Migration Path
 
-Phased over three commits, all behind the `chief_ingress.enabled`
+Phased over three stages, all behind the `chief_ingress.enabled`
 config flag:
 
-1. **Commit 1 — Schema + back-fill + endpoint (server-only).**
+1. **Stage 1 — Schema + back-fill + endpoint (server-only).**
    - ALTER TABLE `managed_agents` ADD COLUMN `is_chief INTEGER
      DEFAULT 0`.
    - Back-fill: SET `is_chief = 1` for the first row matching the
@@ -174,7 +178,7 @@ config flag:
      when off, endpoint dispatches correctly when on, multi-chief
      guard.
 
-2. **Commit 2 — Frontend wiring (UI gated on health flag).**
+2. **Stage 2 — Frontend wiring (UI gated on health flag).**
    - `sendChiefMessage()` in `lib/api.ts`.
    - `ChatPage` / `InputArea` switches default path when health
      reports `chief_ingress.enabled = true` and a Chief is set.
@@ -186,33 +190,33 @@ config flag:
    - **Tests:** ChatPage default routing, toggle behavior,
      InteractTab toggle defaults.
 
-3. **Commit 3 — Flip the flag.**
+3. **Stage 3 — Flip the flag.**
    - Default `chief_ingress.enabled = true` in `configs/openjarvis/*`.
    - Release notes + `CHANGELOG.md` entry.
    - Update `docs/user-guide/agents.md` and `docs/user-guide/cli.md`
      to describe the Chief-as-ingress behavior.
    - Update `docs/architecture/overview.md` query-flow diagram.
 
-Each commit lands separately. If commit 2 surfaces unacceptable UX
-issues, commit 3 is held — the system stays on the legacy default
+Each stage lands separately. If stage 2 surfaces unacceptable UX
+issues, stage 3 is held — the system stays on the legacy default
 with the new endpoint dormant.
 
 ## Rollback Path
 
-- **Commit 3 rollback:** flip flag back to `false`. Frontend snaps to
+- **Stage 3 rollback:** flip flag back to `false`. Frontend snaps to
   the legacy `/v1/chat/completions` and direct `/v1/managed-agents/{id}/messages`
   paths in the next page load.
-- **Commit 2 rollback:** revert the frontend commit; backend
+- **Stage 2 rollback:** revert the frontend changes; backend
   endpoint stays dormant (no effect when no client calls it).
-- **Commit 1 rollback:** drop the `is_chief` column and remove the
+- **Stage 1 rollback:** drop the `is_chief` column and remove the
   endpoint. The column is nullable and unread by anything else, so
   drop is safe.
 
-Per-commit, no destructive data operations.
+Per-stage, no destructive data operations.
 
 ## Exact Files Affected
 
-Server (commit 1):
+Server (stage 1):
 - `src/openjarvis/agents/manager.py` — schema migration; `get_chief_agent`, `set_chief_agent`; `_row_to_agent` adds `is_chief` key.
 - `src/openjarvis/server/agent_manager_routes.py` — new `POST /v1/chief/messages`; extend `_enrich_agent_record` to surface `is_chief`.
 - `src/openjarvis/server/managed_agent_runtime.py` — no logic change; the new endpoint reuses the existing dispatch path.
@@ -220,14 +224,14 @@ Server (commit 1):
 - `tests/agents/test_phase2e_chief_designation.py` — new.
 - `tests/server/test_phase2e_chief_messages_route.py` — new.
 
-Frontend (commit 2):
+Frontend (stage 2):
 - `frontend/src/lib/api.ts` — `sendChiefMessage()`; `ManagedAgent.is_chief?`.
 - `frontend/src/components/Chat/InputArea.tsx` — default routing switch; Direct toggle.
 - `frontend/src/pages/AgentsPage.tsx` — `InteractTab` adds "Route through Chief" toggle; `AgentOrgChart` Chief badge; capability-inspector banner.
 - `frontend/src/lib/store.ts` — persist the toggle state.
 - `frontend/src/hooks/useChiefHealth.ts` — new tiny hook polling whether ingress is enabled + Chief is designated.
 
-Documentation (commit 3):
+Documentation (stage 3):
 - `docs/user-guide/agents.md`
 - `docs/user-guide/cli.md`
 - `docs/architecture/overview.md` (query-flow section)
@@ -237,7 +241,7 @@ Documentation (commit 3):
 
 ## Reversibility
 
-**Fully reversible** at every commit boundary:
+**Fully reversible** at every stage boundary:
 - The new `is_chief` column is nullable and unread by anything outside
   the new helpers — `DROP COLUMN` (or the SQLite equivalent of marking
   it ignored) is safe.
@@ -250,18 +254,22 @@ Documentation (commit 3):
 
 ## Approval Question
 
-Do you approve implementing this change as three sequential commits,
-with the default flag flip (commit 3) held until you explicitly say
+Do you approve implementing this change as three sequential stages,
+with the default flag flip (stage 3) held until you explicitly say
 "flip it"?
 
-If yes, I will:
-1. Build commit 1 (server-only, flag off, fully tested).
-2. Stop and report.
-3. Build commit 2 (frontend wiring, flag still off — invisible to
-   users until you flip it).
-4. Stop and report.
-5. Hold commit 3 indefinitely until you instruct.
+**Resolved:** approved. All three stages shipped 2026-05-20 → 2026-05-22:
 
-If you'd like a different shape — e.g. commits 1 + 2 in one pass, or a
-fourth commit splitting the migration from the back-fill — say so
-before I start.
+1. **Stage 1** — server: `is_chief` column, `get/set_chief_agent`,
+   back-fill, `chief_ingress.enabled` config field,
+   `POST /v1/chief/messages` + `GET /v1/chief` + `POST /v1/chief/designate`.
+   19 tests.
+2. **Stage 2** — frontend: `sendChiefMessage`, `useChiefHealth`,
+   `GET /v1/chief/status`, `InputArea` Direct-mode toggle + chief
+   routing, `InteractTab` "Route through Chief" toggle, `AgentOrgChart`
+   Chief badge. 3 added tests; `tsc -b` clean.
+3. **Stage 3** — `ChiefIngressConfig.enabled` default flipped to
+   `true`; `[chief_ingress]` section added to `configs/openjarvis/config.toml`;
+   docs + CHANGELOG updated; `AUGMENTED_FEATURES.md` /
+   `FEATURE_PRESERVATION_MATRIX.md` updated to mark the new surfaces
+   protected.

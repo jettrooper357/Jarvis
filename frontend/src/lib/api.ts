@@ -474,6 +474,10 @@ export interface ManagedAgent {
   requires_approval_tools?: string[];
   // Phase 2E — Chief-as-canonical-ingress designation.
   is_chief?: boolean;
+  avatar_url?: string | null;
+  avatar_mime_type?: string | null;
+  avatar_file_name?: string | null;
+  avatar_updated_at?: number | string | null;
   status: 'idle' | 'running' | 'paused' | 'error' | 'archived' | 'needs_attention' | 'budget_exceeded' | 'stalled' | 'input_required' | 'auth_required' | 'waiting_on_tool';
   summary_memory: string;
   created_at: number;
@@ -618,6 +622,31 @@ export async function deleteManagedAgent(agentId: string): Promise<void> {
 }
 
 // Phase 2A — Capability Inspector preview (no side effects).
+export async function uploadAgentAvatar(agentId: string, file: File): Promise<ManagedAgent> {
+  const form = new FormData();
+  form.append('file', file);
+  const res = await fetch(`${getBase()}/v1/agents/${agentId}/avatar`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => res.statusText);
+    throw new Error(`Failed to upload avatar: ${detail || res.status}`);
+  }
+  return res.json();
+}
+
+export async function deleteAgentAvatar(agentId: string): Promise<ManagedAgent> {
+  const res = await fetch(`${getBase()}/v1/agents/${agentId}/avatar`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => res.statusText);
+    throw new Error(`Failed to remove avatar: ${detail || res.status}`);
+  }
+  return res.json();
+}
+
 export async function previewAgentCapabilities(
   agentId: string,
   configOverrides?: Record<string, unknown>,
@@ -925,6 +954,91 @@ export async function resumeChief(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ answer }),
+    },
+  );
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(body.detail || `Failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+// ── Phase 2D — Approvals ─────────────────────────────────────────
+//
+// The approval data plane (GET/POST /v1/approvals) returns 503 when the
+// server has no approval store configured; listApprovals degrades to an
+// empty list so the UI simply shows nothing rather than erroring.
+
+export interface ApprovalRequest {
+  id: string;
+  agent_id: string;
+  task_id: string | null;
+  capability: string;
+  args: Record<string, unknown>;
+  args_hash: string | null;
+  summary: string;
+  state: 'pending' | 'granted' | 'denied';
+  requested_by: string | null;
+  requested_at: number;
+  resolved_by: string | null;
+  resolved_at: number | null;
+  consumed_at: number | null;
+  decision: string | null;
+  reason: string | null;
+}
+
+export async function listApprovals(params?: {
+  agentId?: string;
+  state?: string;
+  limit?: number;
+}): Promise<ApprovalRequest[]> {
+  const qs = new URLSearchParams();
+  if (params?.agentId) qs.set('agent_id', params.agentId);
+  if (params?.state) qs.set('state', params.state);
+  if (params?.limit) qs.set('limit', String(params.limit));
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  const res = await fetch(`${getBase()}/v1/approvals${suffix}`);
+  if (res.status === 503) return [];
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  const data = await res.json();
+  return (data.approvals || []) as ApprovalRequest[];
+}
+
+export async function grantApproval(
+  approvalId: string,
+  opts?: { resolvedBy?: string; reason?: string },
+): Promise<ApprovalRequest> {
+  const res = await fetch(
+    `${getBase()}/v1/approvals/${approvalId}/grant`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        resolved_by: opts?.resolvedBy,
+        reason: opts?.reason,
+      }),
+    },
+  );
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(body.detail || `Failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function denyApproval(
+  approvalId: string,
+  opts?: { resolvedBy?: string; reason?: string },
+): Promise<ApprovalRequest> {
+  const res = await fetch(
+    `${getBase()}/v1/approvals/${approvalId}/deny`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        resolved_by: opts?.resolvedBy,
+        reason: opts?.reason,
+      }),
     },
   );
   if (!res.ok) {

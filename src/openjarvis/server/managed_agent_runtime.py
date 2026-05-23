@@ -388,6 +388,8 @@ class ManagedAgentRuntime:
         trace_store: Any = None,
         credential_scrubber: Any = None,
         credential_vault: Any = None,
+        approval_store: Any = None,
+        approval_gating: Any = None,
     ) -> None:
         from openjarvis.security.credential_scrubber import CredentialScrubber
         from openjarvis.security.credential_vault import CredentialVault
@@ -399,6 +401,12 @@ class ManagedAgentRuntime:
         self._trace_store = trace_store
         self._scrubber = credential_scrubber or CredentialScrubber()
         self._vault = credential_vault or CredentialVault()
+        # Phase 2D enforcement — the approval gate is a transparent
+        # no-op unless an ApprovalStore is wired AND
+        # approval_gating.enabled is set. ``approval_gating`` may be
+        # injected (tests); otherwise it is read lazily from config.
+        self._approval_store = approval_store
+        self._approval_gating = approval_gating
 
     def _scrub_tool_calls(
         self,
@@ -420,6 +428,165 @@ class ManagedAgentRuntime:
                 new_call["result"] = scrub(new_call.get("result", ""), run_id)
             out.append(new_call)
         return out
+
+    # -- approval gating (Phase 2D enforcement) ---------------------
+
+    def _approval_gating_config(self) -> Any:
+        """Lazily resolve the ``approval_gating`` config block."""
+        if self._approval_gating is None:
+            try:
+                from openjarvis.core.config import load_config
+
+                self._approval_gating = load_config().approval_gating
+            except Exception:
+                from openjarvis.core.config import ApprovalGatingConfig
+
+                self._approval_gating = ApprovalGatingConfig()
+        return self._approval_gating
+
+    def _owning_open_task_id(self, agent_id: str) -> Optional[str]:
+        """Best-effort: newest non-terminal task owned by ``agent_id``."""
+        terminal = {"completed", "failed", "cancelled", "done"}
+        try:
+            for task in self._manager.list_tasks(agent_id):
+                if str(task.get("status", "") or "").lower() not in terminal:
+                    return str(task.get("id"))
+        except Exception:
+            logger.exception("Failed to resolve owning task for %s", agent_id)
+        return None
+
+    def _approval_gate(
+        self,
+        agent_record: Dict[str, Any],
+        tool_call: ToolCall,
+    ) -> Optional[ToolResult]:
+        """Consult the approval policy before a managed-agent tool runs.
+
+        Returns ``None`` to allow the call (today's behaviour), or a
+        ``ToolResult`` to short-circuit it (denied / awaiting approval).
+        A transparent no-op unless an ``ApprovalStore`` is wired, the
+        ``approval_gating`` flag is on, and the tool is listed in the
+        owning agent's ``requires_approval_tools`` capability axis.
+        """
+        store = self._approval_store
+        if store is None:
+            return None
+        cfg = self._approval_gating_config()
+        if not getattr(cfg, "enabled", False):
+            return None
+        config = agent_record.get("config", {}) or {}
+        gated = config.get("requires_approval_tools") or []
+        if isinstance(gated, str):
+            gated = [gated]
+        gated_set = {str(t).strip() for t in gated if str(t).strip()}
+        if tool_call.name not in gated_set:
+            return None
+
+        from openjarvis.agents.approvals import args_hash as _args_hash
+
+        agent_id = str(agent_record.get("id", "") or "")
+        a_hash = _args_hash(tool_call.arguments or "")
+        try:
+            actionable = store.find_actionable(
+                agent_id, tool_call.name, a_hash
+            )
+        except Exception:
+            logger.exception(
+                "Approval gate lookup failed for %s", tool_call.name
+            )
+            actionable = None
+
+        if actionable is not None and actionable.state == "granted":
+            try:
+                store.mark_consumed(actionable.id)
+            except Exception:
+                logger.exception(
+                    "Failed to consume approval %s", actionable.id
+                )
+            return None
+
+        if actionable is not None and actionable.state == "denied":
+            reason = (
+                actionable.reason
+                or "A human reviewer denied this action."
+            )
+            return ToolResult(
+                tool_name=tool_call.name,
+                content=f"Approval denied: {reason}",
+                success=False,
+                metadata={
+                    "approval": {"state": "denied", "id": actionable.id}
+                },
+            )
+
+        return self._block_pending_approval(
+            agent_record, tool_call, a_hash
+        )
+
+    def _block_pending_approval(
+        self,
+        agent_record: Dict[str, Any],
+        tool_call: ToolCall,
+        a_hash: str,
+    ) -> ToolResult:
+        """Create a pending approval row and return a blocking result."""
+        store = self._approval_store
+        agent_id = str(agent_record.get("id", "") or "")
+        try:
+            parsed = (
+                json.loads(tool_call.arguments)
+                if tool_call.arguments
+                else {}
+            )
+            args_obj = parsed if isinstance(parsed, dict) else {"_value": parsed}
+        except Exception:
+            args_obj = {"_raw": str(tool_call.arguments or "")}
+
+        task_id = self._owning_open_task_id(agent_id)
+        summary = (
+            f"{agent_record.get('name', agent_id)} requested approval "
+            f"to run {tool_call.name}"
+        )
+        req = None
+        try:
+            req = store.request(
+                agent_id=agent_id,
+                capability=tool_call.name,
+                args=args_obj,
+                task_id=task_id,
+                summary=summary,
+                requested_by=agent_id,
+                args_hash=a_hash,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to create approval request for %s", tool_call.name
+            )
+
+        if task_id:
+            try:
+                self._manager.update_task(
+                    task_id,
+                    status="awaiting_approval",
+                    requires_approval=True,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to mark task %s awaiting_approval", task_id
+                )
+
+        req_id = req.id if req is not None else "pending"
+        return ToolResult(
+            tool_name=tool_call.name,
+            content=(
+                f"Awaiting human approval — request {req_id}. This action "
+                f"({tool_call.name}) is paused until a human grants it. "
+                "Do not retry; report to the user that the action is "
+                "blocked pending approval."
+            ),
+            success=False,
+            metadata={"approval": {"state": "pending", "id": req_id}},
+        )
 
     def run(
         self,
@@ -1206,6 +1373,18 @@ class ManagedAgentRuntime:
         original_execute = dr_agent._executor.execute
 
         def _tracked_execute(tool_call: ToolCall) -> ToolResult:
+            gated = self._approval_gate(agent_record, tool_call)
+            if gated is not None:
+                collected_tool_calls.append(
+                    {
+                        "tool": tool_call.name,
+                        "arguments": tool_call.arguments or "",
+                        "result": gated.content or "",
+                        "success": bool(gated.success),
+                        "latency": 0.0,
+                    }
+                )
+                return gated
             result = original_execute(tool_call)
             collected_tool_calls.append(
                 {
@@ -1267,6 +1446,18 @@ class ManagedAgentRuntime:
         chief_agent_id = str(agent_record["id"])
 
         def _tracked_execute(tool_call: ToolCall) -> ToolResult:
+            gated = self._approval_gate(agent_record, tool_call)
+            if gated is not None:
+                collected_tool_calls.append(
+                    {
+                        "tool": tool_call.name,
+                        "arguments": tool_call.arguments or "",
+                        "result": gated.content or "",
+                        "success": bool(gated.success),
+                        "latency": 0.0,
+                    }
+                )
+                return gated
             # Signal to the UI / Mission Control that the chief is
             # parked on a tool call. Best-effort: a failure to update
             # status must not abort the tool execution.
@@ -1553,6 +1744,9 @@ class ManagedAgentRuntime:
                 original_execute = chief._executor.execute
 
                 def _dereferencing_execute(tc: ToolCall) -> ToolResult:
+                    gated = self._approval_gate(agent_record, tc)
+                    if gated is not None:
+                        return gated
                     resolved_args = self._vault.resolve(
                         tc.arguments or "", effective_run_id
                     )
@@ -1806,6 +2000,25 @@ class ManagedAgentRuntime:
                         "Original result:)\n" + str(cached.get("content", ""))
                     )
                     tool_success = bool(cached.get("success", True))
+                elif (
+                    gate_result := self._approval_gate(
+                        agent_record,
+                        ToolCall(
+                            id=str(raw.get("id", "")),
+                            name=tool_name,
+                            arguments=tool_args,
+                        ),
+                    )
+                ) is not None:
+                    # Phase 2D — the tool requires human approval; the
+                    # gate created/consulted an approval row. Surface
+                    # the blocking/denial result without executing.
+                    tool_result_content = gate_result.content or ""
+                    tool_success = bool(gate_result.success)
+                    seen_calls[call_key] = {
+                        "content": tool_result_content,
+                        "success": tool_success,
+                    }
                 elif (
                     tool_name == "project_create_task"
                     and project_task_created

@@ -44,11 +44,15 @@ import {
   fetchAgentConfigVersions,
   revertAgentConfig,
   sendChiefMessage,
+  uploadAgentAvatar,
+  deleteAgentAvatar,
 } from '../lib/api';
 import type { AgentConfigVersion } from '../lib/api';
 import { useChiefHealth } from '../hooks/useChiefHealth';
 import type { TraceTreeNode } from '../lib/api';
 import type { AgentTask, ChannelBinding, AgentTemplate, AgentMessage, ManagedAgent, LearningLogEntry, AgentTrace, ToolInfo, InstalledSkill, MissionControlData, MissionControlProject, MissionControlTask } from '../lib/api';
+import { AgentAvatar } from '../components/AgentAvatar';
+import { PendingApprovalsList } from '../components/PendingApprovalsList';
 import { useAgentEvents, type AgentEvent } from '../lib/useAgentEvents';
 import {
   Plus,
@@ -85,6 +89,7 @@ import {
   Network,
   Boxes,
   Eye,
+  Upload,
 } from 'lucide-react';
 import { SOURCE_CATALOG } from '../types/connectors';
 import type { ConnectRequest } from '../types/connectors';
@@ -1663,7 +1668,7 @@ function AgentCard({
       {/* Row 1: Name + status dot */}
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2 min-w-0">
-          <Bot size={16} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
+          <AgentAvatar agent={agent} size="sm" active={agent.status === 'running'} />
           <span className="font-medium text-sm truncate" style={{ color: 'var(--color-text)' }}>
             {agent.name}
           </span>
@@ -2086,6 +2091,92 @@ function AgentNameField({ agent, onAgentUpdated }: { agent: ManagedAgent; onAgen
     >
       {agent.name}
     </h1>
+  );
+}
+
+function AgentAvatarSection({ agent, onAgentUpdated }: { agent: ManagedAgent; onAgentUpdated: () => void }) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function upload(file: File | undefined) {
+    if (!file) return;
+    setBusy(true);
+    try {
+      await uploadAgentAvatar(agent.id, file);
+      toast.success('Avatar updated');
+      onAgentUpdated();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to upload avatar');
+    } finally {
+      setBusy(false);
+      if (inputRef.current) inputRef.current.value = '';
+    }
+  }
+
+  async function remove() {
+    setBusy(true);
+    try {
+      await deleteAgentAvatar(agent.id);
+      toast.success('Avatar removed');
+      onAgentUpdated();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to remove avatar');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className="p-3 rounded-lg"
+      style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
+    >
+      <div className="flex items-start gap-3">
+        <AgentAvatar agent={agent} size="lg" active={agent.status === 'running'} />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>Avatar</h3>
+            {agent.avatar_file_name && (
+              <span className="truncate text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                {agent.avatar_file_name}
+              </span>
+            )}
+          </div>
+          <p className="mt-1 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+            Upload a small GIF, WebP, PNG, JPG, or looped MP4. Recommended 256x256. Max 2 MB.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <input
+              ref={inputRef}
+              type="file"
+              accept="image/gif,image/webp,image/png,image/jpeg,video/mp4"
+              className="hidden"
+              onChange={(e) => upload(e.target.files?.[0])}
+            />
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => inputRef.current?.click()}
+              className="inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-xs font-medium disabled:opacity-50"
+              style={{ background: 'var(--color-accent)', color: 'var(--color-on-accent)' }}
+            >
+              <Upload size={13} />
+              {busy ? 'Working...' : 'Upload'}
+            </button>
+            <button
+              type="button"
+              disabled={busy || !agent.avatar_url}
+              onClick={remove}
+              className="inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-xs disabled:opacity-50"
+              style={{ color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)' }}
+            >
+              <Trash2 size={13} />
+              Remove
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -3966,7 +4057,7 @@ function OrgChartNode({
       >
         <div className="flex items-center justify-between gap-2 mb-3">
           <div className="flex items-center gap-2 min-w-0">
-            <Bot size={16} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
+            <AgentAvatar agent={agent} size="orgChart" active={activeAgentIds.has(agent.id)} />
             <span className="font-medium text-sm truncate" style={{ color: 'var(--color-text)' }}>
               {agent.name}
             </span>
@@ -4450,6 +4541,8 @@ function InterAgentActivityPanel({
         {filterButton('alerts', 'Alerts', items.filter((item) => item.type === 'warning').length)}
         {filterButton('direct', 'Direct')}
       </div>
+
+      <PendingApprovalsList agentNameById={agentNameById} />
 
       <div className="space-y-3 overflow-y-auto pr-1 lg:max-h-[calc(100vh-13rem)]">
         {items.length === 0 ? (
@@ -6892,7 +6985,7 @@ export function AgentsPage() {
         {/* Header */}
         <div className="flex items-start justify-between mb-6">
           <div className="flex items-center gap-3">
-            <Bot size={24} style={{ color: 'var(--color-accent)' }} />
+            <AgentAvatar agent={selectedAgent} size="lg" active={selectedAgent.status === 'running'} />
             <div>
               <AgentNameField agent={selectedAgent} onAgentUpdated={refresh} />
               <div className="flex items-center gap-2 mt-1">
@@ -6976,6 +7069,12 @@ export function AgentsPage() {
           <ChiefPendingCard agent={selectedAgent} onResumed={refresh} />
         )}
 
+        <PendingApprovalsList
+          agentId={selectedAgent.id}
+          agentNameById={{ [selectedAgent.id]: selectedAgent.name }}
+          variant="card"
+        />
+
         {/* Tabs */}
         <div className="flex gap-1 mb-6 p-1 rounded-lg overflow-x-auto" style={{ background: 'var(--color-bg-secondary)' }}>
           {DETAIL_TABS.map(({ id, label, icon: Icon }) => (
@@ -6998,6 +7097,8 @@ export function AgentsPage() {
         {/* Tab: Overview */}
         {detailTab === 'overview' && (
           <div className="space-y-3">
+            <AgentAvatarSection agent={selectedAgent} onAgentUpdated={refresh} />
+
             {/* Instruction */}
             <AgentInstructionSection agent={selectedAgent} onAgentUpdated={refresh} />
 

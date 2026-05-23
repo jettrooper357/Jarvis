@@ -17,6 +17,22 @@ def _truncate(value: str, limit: int = 180) -> str:
     return text[: limit - 3] + "..."
 
 
+def _background_delegation_config() -> Any:
+    """Resolve the ``[background_delegation]`` config block (Phase 2F).
+
+    Falls back to defaults (disabled) if config cannot be loaded, so the
+    delegation path stays byte-identical to pre-Phase-2F behaviour.
+    """
+    from openjarvis.core.config import BackgroundDelegationConfig
+
+    try:
+        from openjarvis.core.config import load_config
+
+        return load_config().background_delegation
+    except Exception:
+        return BackgroundDelegationConfig()
+
+
 def _resolve_agent(
     manager: Any,
     agent_name_or_id: str,
@@ -522,30 +538,69 @@ class ManagedAgentAssignTaskTool(BaseTool):
         )
         start_now = bool(params.get("start_now", True))
         initial_response = ""
+        delegation_mode = "none"
         if start_now:
             visited = tuple(ctx.visited_agent_ids) + (ctx.current_agent_id,)
             if target["id"] in visited:
                 initial_response = (
                     "Immediate kickoff skipped because it would create a delegation loop."
                 )
+                delegation_mode = "skipped"
             elif len(visited) >= 6:
                 initial_response = (
                     "Immediate kickoff skipped because the delegation depth limit was reached."
                 )
+                delegation_mode = "skipped"
             else:
                 kickoff_message = _build_task_assignment_message(
                     task,
                     assignee_name=target_name,
                     assigner_name=assigner_name,
                 )
-                initial_response = ctx.runtime.run(
-                    str(target["id"]),
-                    kickoff_message,
-                    parent_agent_id=ctx.current_agent_id,
-                    visited_agent_ids=visited,
-                )
+                bg_config = _background_delegation_config()
+                if bool(getattr(bg_config, "enabled", False)):
+                    # Phase 2F — enqueue instead of blocking the
+                    # delegating agent. The loop/depth guards above are
+                    # evaluated first, so a job is enqueued only if it
+                    # would have run synchronously today.
+                    from openjarvis.server.background_delegation import (
+                        get_background_delegation_executor,
+                        make_parent_notification_callback,
+                    )
+
+                    executor = get_background_delegation_executor(
+                        max_workers=int(getattr(bg_config, "max_workers", 2) or 2)
+                    )
+                    executor.submit(
+                        runtime=ctx.runtime,
+                        agent_id=str(target["id"]),
+                        kickoff_message=kickoff_message,
+                        parent_agent_id=ctx.current_agent_id,
+                        visited_agent_ids=visited,
+                        on_complete=make_parent_notification_callback(
+                            ctx.manager,
+                            parent_agent_id=ctx.current_agent_id,
+                            target_name=target_name,
+                            task_id=str(task["id"]),
+                        ),
+                    )
+                    delegation_mode = "background"
+                else:
+                    initial_response = ctx.runtime.run(
+                        str(target["id"]),
+                        kickoff_message,
+                        parent_agent_id=ctx.current_agent_id,
+                        visited_agent_ids=visited,
+                    )
+                    delegation_mode = "synchronous"
         content = f"Assigned task to {target_name}: {_format_task(task, ctx.manager)}"
-        if initial_response:
+        if delegation_mode == "background":
+            content += (
+                f"\n{target_name} is running this task in the background "
+                f"(task {task['id']}). Its result returns up the chain when "
+                "it finishes."
+            )
+        elif initial_response:
             content += f"\nInitial response from {target_name}: {initial_response}"
         return ToolResult(
             tool_name=self.spec.name,
@@ -555,6 +610,7 @@ class ManagedAgentAssignTaskTool(BaseTool):
                 "task_id": task["id"],
                 "agent_id": target["id"],
                 "started": start_now,
+                "mode": delegation_mode,
                 "initial_response": initial_response,
             },
         )

@@ -210,3 +210,15 @@ def test_status_reports_enabled_but_no_chief(manager_and_client_factory):
     r = client.get("/v1/chief/status")
     body = r.json()
     assert body == {"enabled": True, "chief_id": None, "chief_name": None}
+
+
+# ── Commit 3 — flag default is now live ───────────────────────────────
+
+
+def test_chief_ingress_default_is_enabled():
+    """Phase 2E commit 3 flipped the default to True ("make it live").
+
+    Locks the default so a future edit can't silently disable the
+    feature without updating this test (and the CIN).
+    """
+    assert ChiefIngressConfig().enabled is True

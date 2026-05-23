@@ -10,6 +10,67 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Chief Orchestrator as canonical ingress** — chat-page and
+  agent-interact traffic now routes through the designated Chief
+  Orchestrator, which decides whether to answer directly, delegate to a
+  subordinate, or decompose the work. New `POST /v1/chief/messages`
+  endpoint plus `GET /v1/chief`, `GET /v1/chief/status`, and
+  `POST /v1/chief/designate`. A single agent carries an `is_chief` flag
+  (`managed_agents.is_chief`); fresh installs auto-promote the first
+  agent whose org-role matches the chief heuristic. The OpenAI-compatible
+  `/v1/chat/completions` and direct `/v1/managed-agents/{id}/messages`
+  surfaces are unchanged — the chat input shows a "Direct mode" toggle,
+  the agent-interact tab a "Route through Chief" toggle, and the org
+  chart a Chief badge. Gated by `[chief_ingress] enabled` (default true;
+  set false to opt out). See
+  `docs/CHANGE_IMPACT_NOTICES/chief-as-canonical-ingress.md`.
+- **Capability Inspector** — the agent Overview tab gains a six-axis
+  capability view (assigned / inherited / blocked / approval-gated /
+  effective) backed by new `enrich_agent_record` fields, a
+  "Preview Capabilities" modal (`POST /v1/managed-agents/{id}/preview`),
+  and an append-only config version history with non-destructive revert
+  (`GET /v1/managed-agents/{id}/versions`,
+  `POST /v1/managed-agents/{id}/revert`).
+- **Durable task model + lifecycle events** — `agent_tasks` gains
+  canonical fields (`parent_task_id`, `root_task_id`, `request_source`,
+  `requesting_user`, `priority`, `requires_approval`, …, all nullable
+  and additive). New `task.*` events (`created`/`updated`/`delegated`/
+  `completed`/`failed`) emit on the event bus and stream to the activity
+  sidebar. A canonical 11-state `TaskStatus` enum maps to/from the
+  legacy four-state vocabulary at the persistence boundary.
+- **Approval flow** — new `ApprovalStore` + `agent_approvals` table and
+  `GET/POST /v1/approvals` endpoints with `approval.requested` /
+  `approval.resolved` events. Decisions are immutable once made.
+- **Approval gating (tool-dispatch enforcement)** — a managed agent now
+  pauses for human sign-off before running a tool listed in its
+  `requires_approval_tools` capability axis. The dispatch gate consults
+  the approval store per `(agent, capability, arguments)` triple: a
+  pending request blocks the call and moves the owning task to
+  `awaiting_approval`; a grant is single-use and argument-scoped; a
+  denial returns the reason to the agent. Granting re-dispatches the
+  blocked agent automatically (no need to re-send the message). Pending
+  approvals surface in the Inter-Agent Activity sidebar and an agent
+  Overview card with Grant/Deny actions. Gated by `[approval_gating]
+  enabled` (**default false** — an opt-in security posture; turning it
+  on changes whether a tool runs). Direct CLI/SDK tool use is out of
+  scope and ungated. See `docs/user-guide/approvals.md` and
+  `docs/CHANGE_IMPACT_NOTICES/approval-enforcement-at-tool-dispatch.md`.
+- **Background delegation execution** —
+  `managed_agent_assign_task(start_now=True)` can now enqueue the
+  subordinate's kickoff turn on a bounded worker pool instead of
+  running it inline on the delegating agent's thread, so a Chief can
+  fan work out to several subordinates in parallel. The existing
+  loop/depth guards are evaluated before enqueue. When a background
+  turn finishes the executor posts a short completion (or failure)
+  message to the **parent agent's** message log so the upward return
+  path is honored; the parent picks it up on its next turn (no
+  re-dispatch). In-memory job queue — a server crash leaves the
+  owning task in `delegated` / `in_progress` and re-runnable. Gated
+  by `[background_delegation] enabled` (**default false** — changes
+  an existing tool's observable behavior, so opt-in). With the flag
+  off the synchronous path is byte-identical. See
+  `docs/user-guide/agents.md` → "Background delegation" and
+  `docs/CHANGE_IMPACT_NOTICES/background-delegation-execution.md`.
 - **Project Management workspace** — local-first projects with nested
   tasks/subtasks, assignee/status/priority/dates metadata, notes, a
   timeline/Gantt view, a KPI dashboard, and AI summaries. Backed by a

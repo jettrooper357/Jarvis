@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from openjarvis.core.config import DEFAULT_CONFIG_DIR
 from openjarvis.server.api_routes import include_all_routes
 from openjarvis.server.comparison import comparison_router
 from openjarvis.server.connectors_router import (
@@ -301,6 +302,24 @@ def create_app(
     app.state.agent_scheduler = agent_scheduler
     app.state.session_start = time.time()
 
+    # Phase 2D — approval store. Colocated in the agent DB so approval
+    # rows join cleanly against agents/tasks. The approvals API and the
+    # tool-dispatch gate both read it from ``app.state``; both degrade
+    # gracefully when it is absent.
+    app.state.approval_store = None
+    try:
+        if agent_manager is not None:
+            from openjarvis.agents.approvals import ApprovalStore
+
+            app.state.approval_store = ApprovalStore(
+                agent_manager._db_path,
+                event_bus=getattr(app.state, "bus", None),
+            )
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Failed to initialise ApprovalStore"
+        )
+
     # Wire up trace store if traces are enabled
     app.state.trace_store = None
     try:
@@ -377,6 +396,13 @@ def create_app(
     app.include_router(create_projects_router())
     app.include_router(create_digest_router())
     app.include_router(upload_router)
+    uploads_dir = DEFAULT_CONFIG_DIR / "data" / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    app.mount(
+        "/uploads",
+        _NoCacheStaticFiles(directory=uploads_dir),
+        name="uploads",
+    )
     include_all_routes(app)
 
     # Restore SendBlue channel bindings from database on startup

@@ -185,6 +185,7 @@ nav:
       - Scheduler: user-guide/scheduler.md
       - Telemetry: user-guide/telemetry.md
       - Security: user-guide/security.md
+      - Approvals: user-guide/approvals.md
       - Learning & Distillation: user-guide/learning-distillation.md
   - Leaderboard: leaderboard.md
   - Roadmap: development/roadmap.md

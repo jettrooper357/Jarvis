@@ -96,7 +96,7 @@ unused event types, and richer optional output fields.
 **User-visible effect.** None. The only externally observable change is
 the new `/preview` endpoint (which the UI doesn't call yet).
 
-**Rollback plan.** Each subtask is its own commit:
+**Rollback plan.** Each subtask is an independently revertable change:
 - Status enum + mapper: revert is a single-file revert; no data touched.
 - ALTER TABLE: rollback is `ALTER TABLE … DROP COLUMN` (or
   `PRAGMA writable_schema` if SQLite version forces it). New columns are
@@ -295,7 +295,7 @@ task events, and 2B's UI.
 surfaces a CTA on the agent detail card and a sidebar entry; the user
 grants/denies; the task continues or fails.
 
-**Rollback plan.** Each piece is a separate commit; revert in reverse
+**Rollback plan.** Each piece is a separate change; revert in reverse
 order. The `agent_approvals` table is independent; drop is safe.
 Tool-dispatch gating is feature-flagged (`approval_gating_enabled`)
 defaulting to false until 2D ships.
@@ -453,11 +453,11 @@ if you'd prefer different choices, picking them now avoids rework.
 
 | Phase | Status | Needs approval before code? |
 |---|---|---|
-| 2A — Foundational additions | Ready to implement | No (purely additive) |
-| 2B — Capability Inspector + UI | Ready to implement after 2A and answers to the four open questions above | No (purely additive) |
-| 2C — Task lifecycle event emission | Ready after 2A | No (purely additive) |
-| 2D — Approval flow | Ready after 2A + 2B + 2C | No (purely additive) |
-| 2E — Chief as canonical ingress | Stop → CIN | **Yes** |
+| 2A — Foundational additions | **Shipped 2026-05-22** | No (purely additive) |
+| 2B — Capability Inspector + UI | **Shipped 2026-05-22** | No (purely additive) |
+| 2C — Task lifecycle event emission | **Shipped 2026-05-22** | No (purely additive) |
+| 2D — Approval flow (data plane) | **Shipped 2026-05-22** — tool-dispatch enforcement still pending a CIN | No (purely additive) |
+| 2E — Chief as canonical ingress | **Shipped 2026-05-22** (CIN approved; flag live) | Yes — done |
 | 2F — Background delegation | Stop → CIN | **Yes** |
 | 2G — Worker session isolation | Stop → CIN, depends on 2F | **Yes** |
 

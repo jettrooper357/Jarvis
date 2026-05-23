@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 import re as _re
+import time
+import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from openjarvis.agents.capabilities import (
@@ -25,10 +28,11 @@ from openjarvis.agents.library import (
     save_template_document,
 )
 from openjarvis.agents.manager import AgentManager
+from openjarvis.core.config import DEFAULT_CONFIG_DIR
 
 try:
-    from fastapi import APIRouter, HTTPException, Request
-    from fastapi.responses import StreamingResponse
+    from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+    from fastapi.responses import FileResponse, StreamingResponse
     from pydantic import BaseModel
 except ImportError:
     raise ImportError("fastapi and pydantic are required for server routes")
@@ -214,6 +218,118 @@ def _parse_param_count(model_name: str) -> float:
 
 
 _CLOUD_PREFIXES = ("gpt-", "claude-", "gemini-", "o1-", "o3-", "o4-")
+
+_AVATAR_MAX_BYTES = 2 * 1024 * 1024
+_AVATAR_UPLOAD_ROOT = DEFAULT_CONFIG_DIR / "data" / "uploads" / "agent-avatars"
+_AVATAR_ALLOWED = {
+    ".gif": "image/gif",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".mp4": "video/mp4",
+}
+
+
+def _sniff_avatar_mime(data: bytes) -> Optional[str]:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return "video/mp4"
+    return None
+
+
+def _safe_avatar_path(agent_id: str, file_name: str) -> Path:
+    root = (_AVATAR_UPLOAD_ROOT / agent_id).resolve()
+    candidate = (root / file_name).resolve()
+    if root != candidate.parent:
+        raise HTTPException(status_code=400, detail="Invalid avatar path")
+    return candidate
+
+
+def _avatar_url(agent_id: str, file_name: str) -> str:
+    return f"/uploads/agent-avatars/{agent_id}/{file_name}"
+
+
+def _avatar_path_from_url(avatar_url: str | None) -> Optional[Path]:
+    prefix = "/uploads/agent-avatars/"
+    if not avatar_url or not avatar_url.startswith(prefix):
+        return None
+    rel = avatar_url.removeprefix(prefix)
+    parts = rel.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None
+    try:
+        return _safe_avatar_path(parts[0], parts[1])
+    except HTTPException:
+        return None
+
+
+def _delete_avatar_file(agent: Dict[str, Any]) -> None:
+    path = _avatar_path_from_url(agent.get("avatar_url"))
+    if path and path.is_file():
+        try:
+            path.unlink()
+        except OSError:
+            logger.debug("Could not delete avatar file %s", path, exc_info=True)
+
+
+async def _store_avatar_upload(
+    manager: AgentManager,
+    agent_id: str,
+    upload: UploadFile,
+) -> Dict[str, Any]:
+    agent = manager.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    original_name = upload.filename or "avatar"
+    ext = Path(original_name).suffix.lower()
+    if ext not in _AVATAR_ALLOWED:
+        allowed = ", ".join(sorted(_AVATAR_ALLOWED))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported avatar type. Allowed: {allowed}",
+        )
+
+    data = await upload.read(_AVATAR_MAX_BYTES + 1)
+    if len(data) > _AVATAR_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Avatar must be 2 MB or smaller")
+    if not data:
+        raise HTTPException(status_code=400, detail="Avatar file is empty")
+
+    sniffed = _sniff_avatar_mime(data)
+    expected = _AVATAR_ALLOWED[ext]
+    declared = (upload.content_type or "").split(";", 1)[0].strip().lower()
+    allowed_declared = {expected, "application/octet-stream"}
+    if sniffed != expected or (declared and declared not in allowed_declared):
+        raise HTTPException(
+            status_code=400,
+            detail="Avatar file content does not match its declared image type",
+        )
+
+    file_name = f"{uuid.uuid4().hex}{ext}"
+    dest = _safe_avatar_path(agent_id, file_name)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    _delete_avatar_file(agent)
+    with dest.open("wb") as fh:
+        fh.write(data)
+
+    updated = manager.update_agent(
+        agent_id,
+        avatar_url=_avatar_url(agent_id, file_name),
+        avatar_mime_type=expected,
+        avatar_file_name=file_name,
+        avatar_updated_at=time.time(),
+    )
+    return updated
 
 
 def _pick_recommended_model(
@@ -901,6 +1017,7 @@ async def _stream_managed_agent(
         engine,
         bus=bus,
         default_model=getattr(app_state, "model", "") if app_state is not None else "",
+        approval_store=getattr(app_state, "approval_store", None),
     )
     runtime_context = ManagedAgentExecutionContext(
         runtime=managed_runtime,
@@ -1682,12 +1799,13 @@ def create_agent_manager_router(
 
     Returns a tuple of routers in this order:
     ``(agents_router, templates_router, global_router, tools_router,
-    sendblue_router, approvals_router, chief_router)``. Callers using
+    sendblue_router, avatar_router, approvals_router, chief_router)``. Callers using
     the legacy 4-/5-/6-tuple unpacking with a trailing ``*_`` swallow
     continue to work — Phase 2D appended approvals; Phase 2E appends
     the Chief-ingress router additively.
     """
     agents_router = APIRouter(prefix="/v1/managed-agents", tags=["managed-agents"])
+    avatar_router = APIRouter(prefix="/v1/agents", tags=["agent-avatars"])
     templates_router = APIRouter(prefix="/v1/templates", tags=["templates"])
 
     # ── Agent lifecycle ──────────────────────────────────────
@@ -1771,6 +1889,69 @@ def create_agent_manager_router(
             return _enrich_agent_record(updated, manager_record=manager_rec)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def _upload_avatar(agent_id: str, file: UploadFile) -> Dict[str, Any]:
+        updated = await _store_avatar_upload(manager, agent_id, file)
+        manager_rec = _resolve_manager_record(manager, updated)
+        return _enrich_agent_record(updated, manager_record=manager_rec)
+
+    async def _delete_avatar(agent_id: str) -> Dict[str, Any]:
+        agent = manager.get_agent(agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        _delete_avatar_file(agent)
+        updated = manager.update_agent(
+            agent_id,
+            avatar_url=None,
+            avatar_mime_type=None,
+            avatar_file_name=None,
+            avatar_updated_at=None,
+        )
+        manager_rec = _resolve_manager_record(manager, updated)
+        return _enrich_agent_record(updated, manager_record=manager_rec)
+
+    def _get_avatar_file(agent_id: str) -> FileResponse:
+        agent = manager.get_agent(agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        path = _avatar_path_from_url(agent.get("avatar_url"))
+        if not path or not path.is_file():
+            raise HTTPException(status_code=404, detail="Avatar not found")
+        return FileResponse(
+            path,
+            media_type=agent.get("avatar_mime_type") or "application/octet-stream",
+            filename=agent.get("avatar_file_name") or path.name,
+        )
+
+    @agents_router.post("/{agent_id}/avatar")
+    async def upload_managed_agent_avatar(
+        agent_id: str,
+        file: UploadFile = File(...),
+    ):
+        return await _upload_avatar(agent_id, file)
+
+    @agents_router.delete("/{agent_id}/avatar")
+    async def delete_managed_agent_avatar(agent_id: str):
+        return await _delete_avatar(agent_id)
+
+    @agents_router.get("/{agent_id}/avatar")
+    async def get_managed_agent_avatar(agent_id: str):
+        return _get_avatar_file(agent_id)
+
+    @avatar_router.post("/{agent_id}/avatar")
+    async def upload_agent_avatar(
+        agent_id: str,
+        file: UploadFile = File(...),
+    ):
+        return await _upload_avatar(agent_id, file)
+
+    @avatar_router.delete("/{agent_id}/avatar")
+    async def delete_agent_avatar(agent_id: str):
+        return await _delete_avatar(agent_id)
+
+    @avatar_router.get("/{agent_id}/avatar")
+    async def get_agent_avatar(agent_id: str):
+        return _get_avatar_file(agent_id)
 
     @agents_router.post("/{agent_id}/preview")
     async def preview_agent_capabilities(
@@ -2001,6 +2182,9 @@ def create_agent_manager_router(
             bus=get_event_bus(),
             default_model=server_model,
             trace_store=trace_store,
+            approval_store=getattr(
+                request.app.state, "approval_store", None
+            ),
         )
         try:
             response = runtime.resume(agent_id, answer)
@@ -2909,19 +3093,91 @@ def create_agent_manager_router(
             )
         return req.to_dict()
 
+    def _redispatch_after_grant(granted: Any, app_state: Any) -> None:
+        """Option B — re-run the agent after a human grants its request.
+
+        Phase 2D enforcement, stage 2. Fire-and-forget: re-dispatches the
+        agent's most recent user message so the gate, now finding the
+        granted approval, lets the previously-blocked tool through. A
+        no-op unless ``approval_gating.enabled`` is set — with the flag
+        off the grant simply records the decision (Option A behaviour).
+        """
+        config = getattr(app_state, "config", None)
+        gating = getattr(config, "approval_gating", None)
+        if not bool(getattr(gating, "enabled", False)):
+            return
+        agent_id = getattr(granted, "agent_id", "") or ""
+        if not agent_id or manager.get_agent(agent_id) is None:
+            return
+        engine = getattr(app_state, "engine", None)
+        if engine is None:
+            return
+        original = ""
+        try:
+            for m in manager.list_messages(agent_id, limit=50):
+                if m.get("direction") == "user_to_agent":
+                    original = str(m.get("content") or "")
+                    break
+        except Exception:
+            logger.exception(
+                "Approval re-dispatch: message lookup failed for %s",
+                agent_id,
+            )
+            return
+        if not original:
+            return
+
+        def _run() -> None:
+            from openjarvis.core.events import get_event_bus
+            from openjarvis.server.managed_agent_runtime import (
+                ManagedAgentRuntime,
+            )
+
+            try:
+                runtime = ManagedAgentRuntime(
+                    manager,
+                    engine,
+                    bus=get_event_bus(),
+                    default_model=getattr(app_state, "model", "") or "",
+                    trace_store=getattr(app_state, "trace_store", None),
+                    approval_store=getattr(
+                        app_state, "approval_store", None
+                    ),
+                )
+                runtime.run(agent_id, original)
+            except Exception:
+                logger.exception(
+                    "Approval re-dispatch failed for agent %s", agent_id
+                )
+
+        import threading
+
+        threading.Thread(target=_run, daemon=True).start()
+
     @approvals_router.post("/{approval_id}/grant")
-    def grant_approval(approval_id: str, body: ResolveApprovalRequest):
+    def grant_approval(
+        approval_id: str,
+        body: ResolveApprovalRequest,
+        request: Request,
+    ):
         store = _require_store()
         try:
-            return store.grant(
+            granted = store.grant(
                 approval_id,
                 resolved_by=body.resolved_by,
                 reason=body.reason,
-            ).to_dict()
+            )
         except Exception as exc:  # ApprovalError or any underlying error
             # Conservative: missing / already-resolved both map to 409
             # so the UI can surface "stale" approvals deterministically.
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # Option B auto-resume — re-dispatch the blocked agent so the
+        # human need not re-send. Best-effort; never fails the grant.
+        try:
+            _redispatch_after_grant(granted, request.app.state)
+        except Exception:
+            logger.exception("Approval re-dispatch dispatch failed")
+        return granted.to_dict()
 
     @approvals_router.post("/{approval_id}/deny")
     def deny_approval(approval_id: str, body: ResolveApprovalRequest):
@@ -3043,6 +3299,7 @@ def create_agent_manager_router(
         global_router,
         tools_router,
         sendblue_router,
+        avatar_router,
         approvals_router,
         chief_router,
     )

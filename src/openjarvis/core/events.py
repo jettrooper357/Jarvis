@@ -88,6 +88,11 @@ class EventType(str, Enum):
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_RESOLVED = "approval.resolved"
     UI_NOTIFICATION = "ui.notification"
+    # Phase 2G — worker session isolation. A delegation minted a fresh
+    # scoped session for the worker (FORKED) or the per-task session
+    # ended and its summary was rolled up to the parent (MERGED).
+    AGENT_SESSION_FORKED = "agent.session.forked"
+    AGENT_SESSION_MERGED = "agent.session.merged"
 
 
 @dataclass(slots=True)

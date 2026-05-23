@@ -1263,14 +1263,86 @@ class AgentManagerConfig:
 class ChiefIngressConfig:
     """Phase 2E — Chief-as-canonical-ingress feature gate.
 
-    When ``enabled`` is False (default during Phase-2E rollout commit 1
-    and commit 2) the ``POST /v1/chief/messages`` endpoint exists but
-    returns 412 Precondition Required, and the frontend keeps using
-    the legacy ``/v1/chat/completions`` and direct-to-agent paths.
+    When ``enabled`` is True the chat page and agent-interact tab route
+    user messages through the designated Chief Orchestrator via
+    ``POST /v1/chief/messages``. The endpoint still falls back to a 412
+    with a CTA payload when no Chief is designated, and the frontend
+    transparently degrades to the legacy ``/v1/chat/completions`` path
+    in that case.
 
-    Commit 3 of Phase-2E flips this default to ``True`` after frontend
-    wiring is in place. See
+    Default flipped to ``True`` in Phase-2E commit 3 ("make it live")
+    after the server + frontend wiring shipped behind the flag in
+    commits 1 and 2. Set ``chief_ingress.enabled = false`` in
+    ``config.toml`` to opt back out. See
     ``docs/CHANGE_IMPACT_NOTICES/chief-as-canonical-ingress.md``.
+    """
+
+    enabled: bool = True
+
+
+@dataclass(slots=True)
+class ApprovalGatingConfig:
+    """Phase 2D (enforcement) — human-approval gating at tool dispatch.
+
+    When ``enabled`` is True, a managed-agent tool call whose tool name
+    appears in the owning agent's ``requires_approval_tools`` capability
+    axis is blocked until a human grants it. While False (default) tool
+    dispatch is byte-identical to pre-Phase-2D behaviour — no gate, no
+    approval rows.
+
+    This flag is an opt-in security posture an admin chooses per
+    deployment; unlike ``chief_ingress`` it is **not** flipped on by
+    default, because turning it on changes whether tools run. See
+    ``docs/CHANGE_IMPACT_NOTICES/approval-enforcement-at-tool-dispatch.md``.
+
+    ``require_human_grant`` rejects a grant whose resolver is the
+    requesting agent itself (self-approval hardening). ``timeout_seconds``
+    auto-denies stale pending requests when > 0 (0 = no timeout).
+    """
+
+    enabled: bool = False
+    require_human_grant: bool = True
+    timeout_seconds: float = 0.0
+
+
+@dataclass(slots=True)
+class BackgroundDelegationConfig:
+    """Phase 2F — background execution for immediate-kickoff delegation.
+
+    When ``enabled`` is True, ``managed_agent_assign_task(start_now=True)``
+    enqueues the subordinate's kickoff turn on a bounded worker pool and
+    returns immediately, instead of running it inline and blocking the
+    delegating agent. While False (default) the tool is byte-identical to
+    pre-Phase-2F behaviour — the kickoff runs synchronously.
+
+    This flag changes an existing tool's observable behaviour, so it is
+    an opt-in posture an admin chooses per deployment; it is **not**
+    flipped on by default. See
+    ``docs/CHANGE_IMPACT_NOTICES/background-delegation-execution.md``.
+
+    ``max_workers`` bounds concurrent background subordinate turns.
+    """
+
+    enabled: bool = False
+    max_workers: int = 2
+
+
+@dataclass(slots=True)
+class WorkerSessionIsolationConfig:
+    """Phase 2G — per-task scoped sessions for delegated worker turns.
+
+    When ``enabled`` is True, a delegation mints a fresh ``session_id``,
+    writes it to ``agent_tasks.task_session_id``, and tags messages
+    produced during that delegated turn (via ``agent_messages.session_id``)
+    so the subordinate sees only its per-task slice instead of the
+    worker's full history. While False (default) the loader and writers
+    behave exactly as before — untagged read/write against the full
+    per-agent log.
+
+    This flag changes what context flows into delegated turns, so it is
+    an opt-in posture an admin chooses per deployment; it is **not**
+    flipped on by default. See
+    ``docs/CHANGE_IMPACT_NOTICES/worker-session-isolation.md``.
     """
 
     enabled: bool = False
@@ -1403,6 +1475,15 @@ class JarvisConfig:
     optimize: OptimizeConfig = field(default_factory=OptimizeConfig)
     agent_manager: AgentManagerConfig = field(default_factory=AgentManagerConfig)
     chief_ingress: ChiefIngressConfig = field(default_factory=ChiefIngressConfig)
+    approval_gating: ApprovalGatingConfig = field(
+        default_factory=ApprovalGatingConfig
+    )
+    background_delegation: BackgroundDelegationConfig = field(
+        default_factory=BackgroundDelegationConfig
+    )
+    worker_session_isolation: WorkerSessionIsolationConfig = field(
+        default_factory=WorkerSessionIsolationConfig
+    )
     memory_files: MemoryFilesConfig = field(default_factory=MemoryFilesConfig)
     system_prompt: SystemPromptConfig = field(default_factory=SystemPromptConfig)
     compression: CompressionConfig = field(default_factory=CompressionConfig)
@@ -1663,6 +1744,9 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
             "optimize",
             "agent_manager",
             "chief_ingress",
+            "approval_gating",
+            "background_delegation",
+            "worker_session_isolation",
             "digest",
         )
         for section_name in top_sections:

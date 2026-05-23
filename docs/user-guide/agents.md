@@ -506,6 +506,113 @@ jarvis ask --agent monitor_operative "Analyze the security audit findings"
 
 ---
 
+## Chief Orchestrator ingress
+
+When `chief_ingress.enabled` is `true` (the default), user-facing
+traffic from the **chat page** and the **agent-interact tab** routes
+through a single designated **Chief Orchestrator**. The Chief decides
+whether to answer directly, delegate to one subordinate, or decompose
+the request into subtasks — and all subordinate work returns up the
+hierarchy through the Chief.
+
+**Designating the Chief.** Exactly one agent carries the `is_chief`
+flag. On a fresh install the first agent whose `org_role` matches the
+chief heuristic (`chief orchestrator`, `chief executive officer`,
+`ceo`) is auto-promoted. To set it explicitly:
+
+```bash
+curl -X POST localhost:8000/v1/chief/designate \
+  -H 'Content-Type: application/json' \
+  -d '{"agent_id": "<agent-id>"}'
+```
+
+**Endpoints:**
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /v1/chief/messages` | Send a user message through the Chief. SSE when `stream: true`. |
+| `GET /v1/chief` | The currently-designated Chief record (404 if none). |
+| `GET /v1/chief/status` | `{enabled, chief_id, chief_name}` — feature health for the UI. |
+| `POST /v1/chief/designate` | Set `is_chief` on a given agent (atomic). |
+
+If no Chief is designated, `POST /v1/chief/messages` returns **412**
+with a CTA payload listing the available agents — the UI prompts the
+user to pick one, and the chat transparently falls back to the legacy
+`/v1/chat/completions` path in the meantime.
+
+**Opting out.** The OpenAI-compatible `/v1/chat/completions` endpoint
+and direct `/v1/managed-agents/{id}/messages` messaging are never
+removed. The chat input has a **Direct mode** toggle and the
+agent-interact tab a **Route through Chief** toggle. To disable Chief
+ingress globally, set `chief_ingress.enabled = false` in `config.toml`.
+
+---
+
+## Background delegation
+
+By default a subordinate kickoff started via
+`managed_agent_assign_task(start_now=True)` runs **inline** on the
+delegating agent's thread — the tool returns only when the subordinate's
+turn finishes. Background delegation switches that to a bounded
+worker pool so the delegating agent (and the user) are not blocked while
+the subordinate works.
+
+It is **opt-in**, because it changes an existing tool's observable
+behavior. Enable it in `config.toml`:
+
+```toml
+[background_delegation]
+enabled = true     # default: false
+max_workers = 2    # bound on concurrent subordinate turns
+```
+
+With the flag off, the synchronous path is byte-identical to before.
+
+### What changes when it's on
+
+- `managed_agent_assign_task(start_now=True)` **enqueues** the kickoff
+  and returns immediately. The `ToolResult` reports
+  `mode: "background"`, the `task_id`, and an `initial_response` of
+  `""` (the subordinate hasn't run yet).
+- The job runs on a bounded `ThreadPoolExecutor`; up to `max_workers`
+  subordinates execute concurrently. Extra jobs queue.
+- The existing **loop guard** (a delegation that would revisit an
+  agent already in the chain) and **depth-6 cap** are evaluated
+  *before* enqueue, so a job is queued only if it would have run
+  synchronously before. The `visited` chain is carried into the job
+  so the subordinate's own delegations stay bounded.
+
+### Upward return path (Option B)
+
+`AGENTS.md` requires that subordinate results roll back up the chain.
+When a background turn finishes, the executor posts a short
+delegated-mode message to the **parent agent's** message log:
+
+- success — `"Background task {id} delegated to {name} finished: {summary}"`
+- failure — `"Background task {id} delegated to {name} failed: {error}"`
+
+The parent picks it up on its next turn; the executor does **not**
+re-dispatch the parent. The Inter-Agent Activity sidebar already shows
+`task.delegated` / `task.completed` / `task.failed` events from the
+background run.
+
+### Limitations
+
+- The in-memory job queue is not persisted: a job lost to a server
+  crash leaves its owning task in `delegated` / `in_progress`,
+  visible in the UI and re-runnable.
+- Cancelling a task drops a queued job; a job already running its
+  turn runs to completion (cooperative mid-turn cancellation is out
+  of scope).
+- The model engine usually serializes its calls regardless, so the
+  practical concurrency ceiling is small.
+
+See
+`docs/CHANGE_IMPACT_NOTICES/background-delegation-execution.md`
+for the full rationale and rollback plan.
+
+---
+
 ## SandboxedAgent
 
 `SandboxedAgent` is a transparent wrapper that runs **any** `BaseAgent` inside a Docker (or Podman) container. It follows the same wrapper pattern as `GuardrailsEngine` -- the inner agent's configuration is serialized and sent to the container's stdin, and the result is read back from stdout.

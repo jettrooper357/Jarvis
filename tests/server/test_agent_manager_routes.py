@@ -11,6 +11,15 @@ import pytest
 
 from openjarvis.agents.manager import AgentManager
 
+_TINY_GIF = (
+    b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff,"
+    b"\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
+)
+_TINY_MP4 = (
+    b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+    b"\x00\x00\x00\x08free"
+)
+
 
 @pytest.fixture
 def manager():
@@ -39,10 +48,8 @@ class TestAgentManagerRoutes:
         app = FastAPI()
         routers = create_agent_manager_router(manager)
         agents_router, templates_router, global_router, tools_router, *_ = routers
-        app.include_router(agents_router)
-        app.include_router(templates_router)
-        app.include_router(global_router)
-        app.include_router(tools_router)
+        for router in routers:
+            app.include_router(router)
         return TestClient(app)
 
     def test_list_agents_empty(self, client):
@@ -62,6 +69,7 @@ class TestAgentManagerRoutes:
         data = resp.json()
         assert data["name"] == "researcher"
         assert data["status"] == "idle"
+        assert data["avatar_url"] is None
 
     def test_get_agent(self, client):
         create_resp = client.post("/v1/managed-agents", json={"name": "test"})
@@ -69,6 +77,7 @@ class TestAgentManagerRoutes:
         resp = client.get(f"/v1/managed-agents/{agent_id}")
         assert resp.status_code == 200
         assert resp.json()["id"] == agent_id
+        assert "avatar_mime_type" in resp.json()
 
     def test_get_agent_not_found(self, client):
         resp = client.get("/v1/managed-agents/nonexistent")
@@ -80,6 +89,110 @@ class TestAgentManagerRoutes:
         resp = client.patch(f"/v1/managed-agents/{agent_id}", json={"name": "new"})
         assert resp.status_code == 200
         assert resp.json()["name"] == "new"
+
+    def test_upload_agent_avatar_gif(self, client, tmp_path, monkeypatch):
+        import openjarvis.server.agent_manager_routes as routes
+
+        monkeypatch.setattr(routes, "_AVATAR_UPLOAD_ROOT", tmp_path / "avatars")
+        create_resp = client.post("/v1/managed-agents", json={"name": "avatar"})
+        agent_id = create_resp.json()["id"]
+        resp = client.post(
+            f"/v1/managed-agents/{agent_id}/avatar",
+            files={"file": ("avatar.gif", _TINY_GIF, "image/gif")},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["avatar_url"].startswith(f"/uploads/agent-avatars/{agent_id}/")
+        assert body["avatar_mime_type"] == "image/gif"
+
+    def test_upload_agent_avatar_exact_agents_route(
+        self, client, tmp_path, monkeypatch
+    ):
+        import openjarvis.server.agent_manager_routes as routes
+
+        monkeypatch.setattr(routes, "_AVATAR_UPLOAD_ROOT", tmp_path / "avatars")
+        create_resp = client.post("/v1/managed-agents", json={"name": "avatar"})
+        agent_id = create_resp.json()["id"]
+        resp = client.post(
+            f"/v1/agents/{agent_id}/avatar",
+            files={"file": ("avatar.gif", _TINY_GIF, "image/gif")},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["avatar_mime_type"] == "image/gif"
+
+    def test_upload_agent_avatar_png(self, client, tmp_path, monkeypatch):
+        import openjarvis.server.agent_manager_routes as routes
+
+        monkeypatch.setattr(routes, "_AVATAR_UPLOAD_ROOT", tmp_path / "avatars")
+        create_resp = client.post("/v1/managed-agents", json={"name": "avatar"})
+        agent_id = create_resp.json()["id"]
+        data = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+            b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+        )
+        resp = client.post(
+            f"/v1/managed-agents/{agent_id}/avatar",
+            files={"file": ("avatar.png", data, "image/png")},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["avatar_mime_type"] == "image/png"
+
+    def test_upload_agent_avatar_mp4(self, client, tmp_path, monkeypatch):
+        import openjarvis.server.agent_manager_routes as routes
+
+        monkeypatch.setattr(routes, "_AVATAR_UPLOAD_ROOT", tmp_path / "avatars")
+        create_resp = client.post("/v1/managed-agents", json={"name": "avatar"})
+        agent_id = create_resp.json()["id"]
+        resp = client.post(
+            f"/v1/managed-agents/{agent_id}/avatar",
+            files={"file": ("avatar.mp4", _TINY_MP4, "video/mp4")},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["avatar_mime_type"] == "video/mp4"
+
+    def test_upload_agent_avatar_rejects_oversized(self, client, tmp_path, monkeypatch):
+        import openjarvis.server.agent_manager_routes as routes
+
+        monkeypatch.setattr(routes, "_AVATAR_UPLOAD_ROOT", tmp_path / "avatars")
+        create_resp = client.post("/v1/managed-agents", json={"name": "avatar"})
+        agent_id = create_resp.json()["id"]
+        data = b"\x89PNG\r\n\x1a\n" + (b"0" * (2 * 1024 * 1024 + 1))
+        resp = client.post(
+            f"/v1/managed-agents/{agent_id}/avatar",
+            files={"file": ("avatar.png", data, "image/png")},
+        )
+        assert resp.status_code == 413
+
+    def test_upload_agent_avatar_rejects_unsupported_type(
+        self, client, tmp_path, monkeypatch
+    ):
+        import openjarvis.server.agent_manager_routes as routes
+
+        monkeypatch.setattr(routes, "_AVATAR_UPLOAD_ROOT", tmp_path / "avatars")
+        create_resp = client.post("/v1/managed-agents", json={"name": "avatar"})
+        agent_id = create_resp.json()["id"]
+        resp = client.post(
+            f"/v1/managed-agents/{agent_id}/avatar",
+            files={"file": ("avatar.svg", b"<svg></svg>", "image/svg+xml")},
+        )
+        assert resp.status_code == 400
+
+    def test_delete_agent_avatar(self, client, tmp_path, monkeypatch):
+        import openjarvis.server.agent_manager_routes as routes
+
+        monkeypatch.setattr(routes, "_AVATAR_UPLOAD_ROOT", tmp_path / "avatars")
+        create_resp = client.post("/v1/managed-agents", json={"name": "avatar"})
+        agent_id = create_resp.json()["id"]
+        upload = client.post(
+            f"/v1/managed-agents/{agent_id}/avatar",
+            files={"file": ("avatar.gif", _TINY_GIF, "image/gif")},
+        )
+        stored = tmp_path / "avatars" / agent_id / upload.json()["avatar_file_name"]
+        assert stored.exists()
+        resp = client.delete(f"/v1/managed-agents/{agent_id}/avatar")
+        assert resp.status_code == 200
+        assert resp.json()["avatar_url"] is None
+        assert not stored.exists()
 
     def test_delete_agent(self, client):
         create_resp = client.post("/v1/managed-agents", json={"name": "doomed"})

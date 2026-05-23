@@ -175,6 +175,12 @@ src/openjarvis/
     server/             API server -- OpenAI-compatible HTTP API
         app.py              FastAPI application factory
         routes.py           /v1/chat/completions, /v1/models, /health
+        background_delegation.py  BackgroundDelegationExecutor: bounded thread
+                                  pool that runs subordinate kickoffs off the
+                                  delegating agent's thread when
+                                  ``[background_delegation] enabled``
+                                  (default off). See ``user-guide/agents.md``
+                                  → "Background delegation".
 
     bench/              Benchmarking framework
         _stubs.py           BaseBenchmark ABC, BenchmarkSuite
@@ -228,6 +234,7 @@ All primitives communicate through a **thread-safe pub/sub EventBus** defined in
 | `CHANNEL_MESSAGE_RECEIVED` / `CHANNEL_MESSAGE_SENT` | WhatsAppBaileysChannel | Track channel messaging |
 | `SECURITY_SCAN` / `SECURITY_ALERT` / `SECURITY_BLOCK` | GuardrailsEngine | Track security scanning |
 | `scheduler_task_start` / `scheduler_task_end` | TaskScheduler | Track scheduled task execution |
+| `APPROVAL_REQUESTED` / `APPROVAL_RESOLVED` | ApprovalStore | Human-approval request created / granted or denied (see [Approvals](../user-guide/approvals.md)) |
 
 ### Dependency Flow
 

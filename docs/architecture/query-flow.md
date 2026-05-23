@@ -97,6 +97,23 @@ jarvis ask --agent orchestrator --tools calculator,think "What is 2^10 + 3^5?"
 response = j.ask("What is 2^10 + 3^5?", agent="orchestrator", tools=["calculator"])
 ```
 
+### Chief Ingress (web / desktop UI)
+
+The chat page and agent-interact tab add a third path. With
+`chief_ingress.enabled = true` (default), a user message is posted to
+`POST /v1/chief/messages`; the server resolves the designated **Chief
+Orchestrator** (`managed_agents.is_chief`) and dispatches the message
+through the same managed-agent runtime that powers
+`/v1/managed-agents/{id}/messages`. The Chief then either answers
+directly, delegates to a subordinate, or decomposes the request — and
+subordinate results return up the hierarchy to the Chief.
+
+This path does not replace Direct or Agent mode: `/v1/chat/completions`
+(OpenAI-compatible) is unchanged, and the UI exposes a "Direct mode"
+toggle that bypasses the Chief. When no Chief is designated the endpoint
+returns 412 and the UI falls back to Direct mode. See
+[Agents → Chief Orchestrator ingress](../user-guide/agents.md#chief-orchestrator-ingress).
+
 ---
 
 ## Step-by-Step Walkthrough

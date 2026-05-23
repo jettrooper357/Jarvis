@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS managed_agents (
     config_json     TEXT NOT NULL DEFAULT '{}',
     status          TEXT NOT NULL DEFAULT 'idle',
     summary_memory  TEXT NOT NULL DEFAULT '',
+    avatar_url      TEXT,
+    avatar_mime_type TEXT,
+    avatar_file_name TEXT,
+    avatar_updated_at REAL,
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL
 );
@@ -111,6 +115,21 @@ _SUMMARY_MAX = 2000
 _UNASSIGNED_PROJECT_NAME = "Unassigned Work"
 
 
+def _worker_session_isolation_enabled() -> bool:
+    """Phase 2G — lazy read of the worker-session-isolation feature flag.
+
+    Falls back to False (today's behaviour) on any config-loader error
+    so a missing or malformed config never alters message-listing
+    semantics by accident.
+    """
+    try:
+        from openjarvis.core.config import load_config
+
+        return bool(load_config().worker_session_isolation.enabled)
+    except Exception:
+        return False
+
+
 def _default_agent_project_task_dates() -> Dict[str, str]:
     start = datetime.now().date()
     return {
@@ -162,6 +181,10 @@ class AgentManager:
             "ALTER TABLE managed_agents ADD COLUMN current_activity TEXT DEFAULT ''",
             "ALTER TABLE managed_agents ADD COLUMN input_tokens INTEGER DEFAULT 0",
             "ALTER TABLE managed_agents ADD COLUMN output_tokens INTEGER DEFAULT 0",
+            "ALTER TABLE managed_agents ADD COLUMN avatar_url TEXT",
+            "ALTER TABLE managed_agents ADD COLUMN avatar_mime_type TEXT",
+            "ALTER TABLE managed_agents ADD COLUMN avatar_file_name TEXT",
+            "ALTER TABLE managed_agents ADD COLUMN avatar_updated_at REAL",
             "ALTER TABLE agent_tasks ADD COLUMN assigned_by_agent_id TEXT",
             # JSON-encoded array of {tool, arguments, result, success, latency}
             "ALTER TABLE agent_messages ADD COLUMN tool_calls TEXT",
@@ -187,6 +210,10 @@ class AgentManager:
             # flag at any time, enforced by ``set_chief_agent`` rather
             # than a CHECK constraint so back-fill stays simple.
             "ALTER TABLE managed_agents ADD COLUMN is_chief INTEGER DEFAULT 0",
+            # Phase 2G — worker session isolation. Nullable: NULL/'' means
+            # "general session" (today's behaviour). Populated for
+            # delegated turns when ``worker_session_isolation.enabled``.
+            "ALTER TABLE agent_messages ADD COLUMN session_id TEXT",
         ]
         for migration in _MIGRATIONS:
             try:
@@ -469,7 +496,16 @@ class AgentManager:
             prior_config = (prior or {}).get("config") or {}
         sets: List[str] = []
         vals: List[Any] = []
-        for key in ("name", "agent_type", "status", "current_activity"):
+        for key in (
+            "name",
+            "agent_type",
+            "status",
+            "current_activity",
+            "avatar_url",
+            "avatar_mime_type",
+            "avatar_file_name",
+            "avatar_updated_at",
+        ):
             if key in kwargs:
                 sets.append(f"{key} = ?")
                 vals.append(kwargs[key])
@@ -1123,6 +1159,10 @@ class AgentManager:
             if key in kwargs:
                 sets.append(f"{key} = ?")
                 vals.append(kwargs[key])
+        for key in ("requires_approval", "requires_user_input"):
+            if key in kwargs:
+                sets.append(f"{key} = ?")
+                vals.append(1 if kwargs[key] else 0)
         if "progress" in kwargs:
             sets.append("progress_json = ?")
             vals.append(json.dumps(kwargs["progress"]))
@@ -1332,15 +1372,24 @@ class AgentManager:
 
     # ── Message queue ─────────────────────────────────────────────
 
-    def send_message(self, agent_id: str, content: str, mode: str = "queued") -> dict:
+    def send_message(
+        self,
+        agent_id: str,
+        content: str,
+        mode: str = "queued",
+        *,
+        session_id: Optional[str] = None,
+    ) -> dict:
         msg_id = uuid4().hex[:16]
         now = time.time()
-        _sql = (
+        scope = str(session_id or "").strip() or None
+        self._conn.execute(
             "INSERT INTO agent_messages"
-            " (id, agent_id, direction, content, mode, status, created_at)"
-            " VALUES (?, ?, 'user_to_agent', ?, ?, 'pending', ?)"
+            " (id, agent_id, direction, content, mode, status, created_at,"
+            " session_id)"
+            " VALUES (?, ?, 'user_to_agent', ?, ?, 'pending', ?, ?)",
+            (msg_id, agent_id, content, mode, now, scope),
         )
-        self._conn.execute(_sql, (msg_id, agent_id, content, mode, now))
         self._conn.commit()
         return {
             "id": msg_id,
@@ -1350,6 +1399,7 @@ class AgentManager:
             "mode": mode,
             "status": "pending",
             "created_at": now,
+            "session_id": scope,
         }
 
     def store_agent_response(
@@ -1357,6 +1407,8 @@ class AgentManager:
         agent_id: str,
         content: str,
         tool_calls: Optional[list] = None,
+        *,
+        session_id: Optional[str] = None,
     ) -> dict:
         """Store an agent-to-user response message.
 
@@ -1364,16 +1416,21 @@ class AgentManager:
         success, latency}`` dicts captured during the turn. They are stored
         as JSON alongside the message so the UI can replay them after a
         page reload.
+
+        ``session_id`` (Phase 2G) tags the row with a per-task scope so
+        delegated turns can read a clean slice. ``None`` / empty means
+        the general per-agent session (today's behaviour).
         """
         msg_id = uuid4().hex[:16]
         now = time.time()
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+        scope = str(session_id or "").strip() or None
         self._conn.execute(
             "INSERT INTO agent_messages"
             " (id, agent_id, direction, content, mode, status, created_at,"
-            " tool_calls)"
-            " VALUES (?, ?, 'agent_to_user', ?, 'immediate', 'delivered', ?, ?)",
-            (msg_id, agent_id, content, now, tool_calls_json),
+            " tool_calls, session_id)"
+            " VALUES (?, ?, 'agent_to_user', ?, 'immediate', 'delivered', ?, ?, ?)",
+            (msg_id, agent_id, content, now, tool_calls_json, scope),
         )
         self._conn.commit()
         return {
@@ -1382,17 +1439,54 @@ class AgentManager:
             "direction": "agent_to_user",
             "content": content,
             "mode": "immediate",
+            "session_id": scope,
             "status": "delivered",
             "created_at": now,
             "tool_calls": tool_calls or None,
         }
 
-    def list_messages(self, agent_id: str, limit: int = 50) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT * FROM agent_messages"
-            " WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
-            (agent_id, limit),
-        ).fetchall()
+    def list_messages(
+        self,
+        agent_id: str,
+        limit: int = 50,
+        *,
+        session_id: Optional[str] = None,
+        include_all_sessions: bool = False,
+    ) -> list[dict]:
+        """List messages for ``agent_id`` (newest first).
+
+        Phase 2G scope rules:
+
+        * ``session_id`` non-empty — return rows tagged with exactly that
+          scope (regardless of the isolation flag).
+        * ``include_all_sessions`` True — return every row for the agent
+          (the audit view's full read, regardless of the flag).
+        * Otherwise: when ``worker_session_isolation.enabled`` is True,
+          return only **untagged** rows (general session); when False,
+          return every row (byte-identical to pre-Phase-2G behaviour).
+        """
+        scope = str(session_id or "").strip()
+        if scope:
+            rows = self._conn.execute(
+                "SELECT * FROM agent_messages"
+                " WHERE agent_id = ? AND session_id = ?"
+                " ORDER BY created_at DESC LIMIT ?",
+                (agent_id, scope, limit),
+            ).fetchall()
+        elif include_all_sessions or not _worker_session_isolation_enabled():
+            rows = self._conn.execute(
+                "SELECT * FROM agent_messages"
+                " WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
+                (agent_id, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM agent_messages"
+                " WHERE agent_id = ?"
+                " AND (session_id IS NULL OR session_id = '')"
+                " ORDER BY created_at DESC LIMIT ?",
+                (agent_id, limit),
+            ).fetchall()
         return [self._row_to_message(r) for r in rows]
 
     def get_pending_messages(self, agent_id: str) -> list[dict]:
@@ -1435,6 +1529,10 @@ class AgentManager:
     def _row_to_message(row: sqlite3.Row) -> dict:
         tool_calls = None
         try:
+            session_id = row["session_id"]
+        except (IndexError, KeyError):
+            session_id = None
+        try:
             raw = row["tool_calls"]
         except (IndexError, KeyError):
             raw = None
@@ -1452,6 +1550,7 @@ class AgentManager:
             "status": row["status"],
             "created_at": row["created_at"],
             "tool_calls": tool_calls,
+            "session_id": session_id,
         }
 
     # ── Learning log ──────────────────────────────────────────
@@ -1525,6 +1624,16 @@ class AgentManager:
             "current_activity": row["current_activity"] or "",
             "input_tokens": row["input_tokens"] or 0,
             "output_tokens": row["output_tokens"] or 0,
+            "avatar_url": row["avatar_url"] if "avatar_url" in keys else None,
+            "avatar_mime_type": (
+                row["avatar_mime_type"] if "avatar_mime_type" in keys else None
+            ),
+            "avatar_file_name": (
+                row["avatar_file_name"] if "avatar_file_name" in keys else None
+            ),
+            "avatar_updated_at": (
+                row["avatar_updated_at"] if "avatar_updated_at" in keys else None
+            ),
             # Phase 2E — Chief designation. Defaults False so legacy
             # rows from before the migration read as non-chief.
             "is_chief": bool(row["is_chief"]) if "is_chief" in keys else False,

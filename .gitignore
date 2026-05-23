@@ -49,6 +49,7 @@ Thumbs.db
 results/
 logs/
 traces/
+data/uploads/
 coding_task_*
 get-pip.py
 # Junk from mocked-path tests that write to their mock's __repr__ as a path
