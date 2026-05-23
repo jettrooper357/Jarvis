@@ -47,11 +47,17 @@ FIELD_MAPPING: Dict[str, tuple[str, str]] = {
     "author": ("field", "author"),
     "tags": ("field", "tags"),
     "depends": ("field", "depends"),
+    # Synonym for ``depends`` used by some community skill packs.
+    "dependencies": ("field", "depends"),
     "required_capabilities": ("field", "required_capabilities"),
     "user_invocable": ("field", "user_invocable"),
     "disable_model_invocation": ("field", "disable_model_invocation"),
     "platforms": ("openjarvis_meta", "platforms"),
     "prerequisites": ("openjarvis_meta", "prerequisites"),
+    # Human-readable display name distinct from the kebab-case ``name``.
+    "title": ("openjarvis_meta", "title"),
+    # Keyword / phrase triggers that suggest this skill is relevant.
+    "triggers": ("openjarvis_meta", "triggers"),
 }
 
 # Naming pattern: lowercase alnum + hyphens, no leading/trailing/consecutive hyphens
