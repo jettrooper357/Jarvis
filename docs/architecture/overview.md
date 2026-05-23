@@ -235,6 +235,7 @@ All primitives communicate through a **thread-safe pub/sub EventBus** defined in
 | `SECURITY_SCAN` / `SECURITY_ALERT` / `SECURITY_BLOCK` | GuardrailsEngine | Track security scanning |
 | `scheduler_task_start` / `scheduler_task_end` | TaskScheduler | Track scheduled task execution |
 | `APPROVAL_REQUESTED` / `APPROVAL_RESOLVED` | ApprovalStore | Human-approval request created / granted or denied (see [Approvals](../user-guide/approvals.md)) |
+| `AGENT_SESSION_FORKED` / `AGENT_SESSION_MERGED` | `managed_agent_tools` / `BackgroundDelegationExecutor` | Phase 2G worker session isolation: a delegation minted a per-task session for the worker (forked) and the per-task session ended with its summary rolled back to the parent (merged). See [Agents → Worker session isolation](../user-guide/agents.md#worker-session-isolation). |
 
 ### Dependency Flow
 

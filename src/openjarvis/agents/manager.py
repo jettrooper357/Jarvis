@@ -1163,6 +1163,11 @@ class AgentManager:
             if key in kwargs:
                 sets.append(f"{key} = ?")
                 vals.append(1 if kwargs[key] else 0)
+        if "task_session_id" in kwargs:
+            sets.append("task_session_id = ?")
+            vals.append(
+                str(kwargs["task_session_id"] or "").strip() or None
+            )
         if "progress" in kwargs:
             sets.append("progress_json = ?")
             vals.append(json.dumps(kwargs["progress"]))

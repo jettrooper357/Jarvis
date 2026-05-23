@@ -53,8 +53,15 @@ class BackgroundDelegationExecutor:
         parent_agent_id: str = "",
         visited_agent_ids: Sequence[str] = (),
         on_complete: Optional[OnComplete] = None,
+        task_session_id: Optional[str] = None,
     ) -> None:
-        """Enqueue a subordinate kickoff turn for background execution."""
+        """Enqueue a subordinate kickoff turn for background execution.
+
+        ``task_session_id`` (Phase 2G) scopes the subordinate's writes and
+        history reads to a per-task session inside the worker's message
+        log. ``None`` / empty means the subordinate runs against its
+        general session (today's behaviour).
+        """
         visited = tuple(visited_agent_ids)
         future: Future[None] = self._pool.submit(
             self._run_job,
@@ -64,6 +71,7 @@ class BackgroundDelegationExecutor:
             parent_agent_id,
             visited,
             on_complete,
+            task_session_id,
         )
         with self._lock:
             self._futures.add(future)
@@ -81,6 +89,7 @@ class BackgroundDelegationExecutor:
         parent_agent_id: str,
         visited: tuple[str, ...],
         on_complete: Optional[OnComplete],
+        task_session_id: Optional[str] = None,
     ) -> None:
         result: Optional[str] = None
         error: Optional[BaseException] = None
@@ -90,6 +99,7 @@ class BackgroundDelegationExecutor:
                 kickoff_message,
                 parent_agent_id=parent_agent_id,
                 visited_agent_ids=visited,
+                task_session_id=task_session_id,
             )
         except Exception as exc:  # a job must never kill the worker
             error = exc
@@ -125,6 +135,9 @@ def make_parent_notification_callback(
     parent_agent_id: str,
     target_name: str,
     task_id: str,
+    worker_agent_id: str = "",
+    worker_session_id: str = "",
+    bus: Any = None,
     summary_limit: int = 600,
 ) -> OnComplete:
     """Build an ``on_complete`` callback that reports back up the chain.
@@ -134,6 +147,10 @@ def make_parent_notification_callback(
     message log so the upward return path is honored. The parent picks
     it up on its next turn; this callback does not re-dispatch the
     parent, only informs it.
+
+    Phase 2G — when ``worker_session_id`` is non-empty, the callback also
+    emits ``AGENT_SESSION_MERGED`` on the supplied ``bus`` after the
+    parent notification succeeds, marking the per-task session closed.
     """
 
     def _on_complete(
@@ -162,6 +179,24 @@ def make_parent_notification_callback(
                 parent_agent_id,
                 task_id,
             )
+            return
+        if worker_session_id and bus is not None:
+            try:
+                from openjarvis.core.events import EventType
+
+                bus.publish(
+                    EventType.AGENT_SESSION_MERGED,
+                    {
+                        "parent_agent_id": parent_agent_id,
+                        "worker_agent_id": worker_agent_id,
+                        "task_id": task_id,
+                        "session_id": worker_session_id,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Background delegation: failed to emit session merged event"
+                )
 
     return _on_complete
 
@@ -195,9 +230,15 @@ def _shutdown_at_exit() -> None:
 
 
 def reset_background_delegation_executor() -> None:
-    """Test hook — drop the process-wide executor so the next call rebuilds."""
+    """Test hook — drain and drop the process-wide executor.
+
+    Waits briefly for in-flight jobs to finish so a stale background
+    thread from a prior test can't reach into a manager its test has
+    already closed. Test-only; production code uses the atexit hook.
+    """
     global _executor
     with _executor_lock:
-        if _executor is not None:
-            _executor.shutdown(timeout=0.0)
+        previous = _executor
         _executor = None
+    if previous is not None:
+        previous.shutdown(timeout=5.0)

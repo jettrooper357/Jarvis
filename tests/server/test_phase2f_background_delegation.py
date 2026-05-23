@@ -67,6 +67,7 @@ class _RecordingRuntime:
         *,
         parent_agent_id: str = "",
         visited_agent_ids: Any = (),
+        task_session_id: Any = None,
     ) -> str:
         with self._lock:
             self.concurrent += 1

@@ -1041,8 +1041,12 @@ async def _stream_managed_agent(
         if app_state is not None and dr_tools:
             app_state._dr_tools = dr_tools
 
-    # Load prior conversation context (DESC order, reverse for chronological)
-    history = manager.list_messages(agent_id, limit=50)
+    # Load prior conversation context (DESC order, reverse for chronological).
+    # Phase 2G — this is the chief/inline route load; not a session-aware
+    # runtime read, so include every row regardless of isolation flag.
+    history = manager.list_messages(
+        agent_id, limit=50, include_all_sessions=True
+    )
     for m in reversed(history):
         if m["id"] == message_id:
             continue
@@ -2503,7 +2507,13 @@ def create_agent_manager_router(
 
     @agents_router.get("/{agent_id}/messages")
     def list_messages(agent_id: str):
-        return {"messages": manager.list_messages(agent_id)}
+        # Phase 2G — audit view sees every row regardless of the
+        # worker-session-isolation flag.
+        return {
+            "messages": manager.list_messages(
+                agent_id, include_all_sessions=True
+            )
+        }
 
     @agents_router.post("/{agent_id}/messages")
     async def send_message(agent_id: str, req: SendMessageRequest, request: Request):
@@ -2623,7 +2633,7 @@ def create_agent_manager_router(
             "agent": agent,
             "tasks": manager.list_tasks(agent_id),
             "channels": manager.list_channel_bindings(agent_id),
-            "messages": manager.list_messages(agent_id),
+            "messages": manager.list_messages(agent_id, include_all_sessions=True),
             "checkpoint": manager.get_latest_checkpoint(agent_id),
         }
 
@@ -3114,7 +3124,11 @@ def create_agent_manager_router(
             return
         original = ""
         try:
-            for m in manager.list_messages(agent_id, limit=50):
+            # Phase 2G — the approval re-dispatch lookup needs the original
+            # *user* message regardless of which session it lives in.
+            for m in manager.list_messages(
+                agent_id, limit=50, include_all_sessions=True
+            ):
                 if m.get("direction") == "user_to_agent":
                     original = str(m.get("content") or "")
                     break

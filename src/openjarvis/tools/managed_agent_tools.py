@@ -33,6 +33,51 @@ def _background_delegation_config() -> Any:
         return BackgroundDelegationConfig()
 
 
+def _worker_session_isolation_enabled() -> bool:
+    """Phase 2G — lazy read of the worker-session-isolation feature flag."""
+    try:
+        from openjarvis.core.config import load_config
+
+        return bool(load_config().worker_session_isolation.enabled)
+    except Exception:
+        return False
+
+
+def _mint_worker_session_id() -> str:
+    """Mint a fresh worker session id for a delegated turn."""
+    import uuid as _uuid
+
+    return _uuid.uuid4().hex[:16]
+
+
+def _emit_session_forked(
+    ctx: Any,
+    *,
+    worker_agent_id: str,
+    task_id: str,
+    session_id: str,
+) -> None:
+    """Best-effort emit of ``AGENT_SESSION_FORKED`` on the runtime's bus."""
+    bus = getattr(ctx.runtime, "_bus", None)
+    if bus is None:
+        return
+    try:
+        from openjarvis.core.events import EventType
+
+        bus.publish(
+            EventType.AGENT_SESSION_FORKED,
+            {
+                "parent_agent_id": ctx.current_agent_id,
+                "worker_agent_id": worker_agent_id,
+                "task_id": task_id,
+                "session_id": session_id,
+            },
+        )
+    except Exception:
+        # Event emission is best-effort — never break a delegation on it.
+        pass
+
+
 def _resolve_agent(
     manager: Any,
     agent_name_or_id: str,
@@ -375,6 +420,19 @@ class ManagedAgentDelegateTool(BaseTool):
                 success=False,
                 content="tools_allowed must be a list of tool names or null.",
             )
+        # Phase 2G — mint an ephemeral worker session for this delegated
+        # turn when isolation is enabled. No task row exists in the
+        # ``managed_agent_delegate`` path, so the FORKED event carries
+        # an empty task_id.
+        worker_session_id = ""
+        if _worker_session_isolation_enabled():
+            worker_session_id = _mint_worker_session_id()
+            _emit_session_forked(
+                ctx,
+                worker_agent_id=str(target_id),
+                task_id="",
+                session_id=worker_session_id,
+            )
         reply = ctx.runtime.run(
             target_id,
             str(params.get("message", "")),
@@ -383,6 +441,7 @@ class ManagedAgentDelegateTool(BaseTool):
             parent_trace_id=ctx.current_trace_id,
             run_id=ctx.run_id,
             tools_allowed=tools_allowed,
+            task_session_id=worker_session_id or None,
         )
         target_name = str(target.get("name", target_id))
         return ToolResult(
@@ -557,6 +616,27 @@ class ManagedAgentAssignTaskTool(BaseTool):
                     assignee_name=target_name,
                     assigner_name=assigner_name,
                 )
+                # Phase 2G — mint and persist a worker session id when
+                # isolation is enabled. The session id is shared by the
+                # synchronous and background paths below.
+                worker_session_id = ""
+                if _worker_session_isolation_enabled():
+                    worker_session_id = _mint_worker_session_id()
+                    try:
+                        ctx.manager.update_task(
+                            task["id"], task_session_id=worker_session_id
+                        )
+                    except Exception:
+                        # If persistence fails the session id stays
+                        # in-memory — the run still tags messages with it,
+                        # but the task row will not show the link.
+                        pass
+                    _emit_session_forked(
+                        ctx,
+                        worker_agent_id=str(target["id"]),
+                        task_id=str(task["id"]),
+                        session_id=worker_session_id,
+                    )
                 bg_config = _background_delegation_config()
                 if bool(getattr(bg_config, "enabled", False)):
                     # Phase 2F — enqueue instead of blocking the
@@ -577,11 +657,15 @@ class ManagedAgentAssignTaskTool(BaseTool):
                         kickoff_message=kickoff_message,
                         parent_agent_id=ctx.current_agent_id,
                         visited_agent_ids=visited,
+                        task_session_id=worker_session_id or None,
                         on_complete=make_parent_notification_callback(
                             ctx.manager,
                             parent_agent_id=ctx.current_agent_id,
                             target_name=target_name,
                             task_id=str(task["id"]),
+                            worker_agent_id=str(target["id"]),
+                            worker_session_id=worker_session_id,
+                            bus=getattr(ctx.runtime, "_bus", None),
                         ),
                     )
                     delegation_mode = "background"
@@ -591,6 +675,7 @@ class ManagedAgentAssignTaskTool(BaseTool):
                         kickoff_message,
                         parent_agent_id=ctx.current_agent_id,
                         visited_agent_ids=visited,
+                        task_session_id=worker_session_id or None,
                     )
                     delegation_mode = "synchronous"
         content = f"Assigned task to {target_name}: {_format_task(task, ctx.manager)}"

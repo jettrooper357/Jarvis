@@ -613,6 +613,74 @@ for the full rationale and rollback plan.
 
 ---
 
+## Worker session isolation
+
+By default a Worker agent has a single conversation log: a delegated
+turn sees **all** of that agent's prior messages, including unrelated
+prior delegations and direct chat. With background delegation (above)
+making parallel work real, that cross-task bleed becomes a correctness
+risk — two concurrent background tasks against the same Worker would
+interleave their context.
+
+Worker session isolation gives each delegated task its own scoped
+session inside the worker's message log, so the delegated turn runs
+against a clean per-task slice. It is **opt-in**, because it changes
+what context flows into delegated turns. Enable it in `config.toml`:
+
+```toml
+[worker_session_isolation]
+enabled = true     # default: false
+```
+
+With the flag off, the runtime and message log are byte-identical to
+before.
+
+### What changes when it's on
+
+- At delegation time — `managed_agent_assign_task` /
+  `managed_agent_delegate` — a fresh `session_id` is minted, written to
+  `agent_tasks.task_session_id`, and the runtime threads it through the
+  subordinate's writes and history reads.
+- The subordinate's kickoff message, agent reply, and intermediate
+  tool-call records are tagged with that session id
+  (`agent_messages.session_id`).
+- `manager.list_messages(agent_id)` returns **untagged-only** rows by
+  default — the worker's general session, free of per-task chatter.
+- The audit hatch `list_messages(agent_id, include_all_sessions=True)`
+  returns every row; the agent-detail and per-agent messages routes
+  pass it automatically so the UI's full view is preserved.
+- Two new lifecycle events fire on the bus:
+  - `AGENT_SESSION_FORKED` — a delegation minted a scoped session
+    (payload: `parent_agent_id`, `worker_agent_id`, `task_id`,
+    `session_id`).
+  - `AGENT_SESSION_MERGED` — the per-task session ended and its
+    summary was rolled back to the parent.
+
+### Upward return path (reuses Phase 2F Option B)
+
+The **merge** is the Phase 2F parent notification: when a background
+turn finishes, the executor posts a short delegated-mode message to the
+parent agent's general session, then emits `AGENT_SESSION_MERGED`. The
+parent picks the message up on its next turn; full per-task transcript
+stays in the child's `session_id` slice for audit.
+
+### Trade-offs and limitations
+
+- A Worker that historically relied on cross-task memory loses it
+  inside delegated turns. The general session is unchanged.
+- The child session is **not seeded** from the parent (Option C in the
+  CIN, deferred): the subordinate sees only its kickoff message and
+  its own subsequent activity.
+- `agent_messages.session_id` rows are append-only; no cleanup TTL.
+- A crashed background job leaves its tagged messages and an
+  in-progress / delegated task row visible in the audit view.
+
+See
+`docs/CHANGE_IMPACT_NOTICES/worker-session-isolation.md`
+for the full rationale, schema migration, and rollback plan.
+
+---
+
 ## SandboxedAgent
 
 `SandboxedAgent` is a transparent wrapper that runs **any** `BaseAgent` inside a Docker (or Podman) container. It follows the same wrapper pattern as `GuardrailsEngine` -- the inner agent's configuration is serialized and sent to the container's stdin, and the result is read back from stdout.

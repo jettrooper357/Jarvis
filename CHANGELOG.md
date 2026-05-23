@@ -71,6 +71,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   off the synchronous path is byte-identical. See
   `docs/user-guide/agents.md` → "Background delegation" and
   `docs/CHANGE_IMPACT_NOTICES/background-delegation-execution.md`.
+- **Worker session isolation** — each delegated task can now run
+  against its own scoped session inside the worker's message log, so
+  the subordinate sees only its per-task slice instead of the worker's
+  full history. At delegation time a fresh `session_id` is minted and
+  written to `agent_tasks.task_session_id`; the runtime threads it
+  through the subordinate's writes and history reads. The Phase 2F
+  parent notification doubles as the merge. New schema column
+  `agent_messages.session_id` (nullable, additive) and new event
+  types `AGENT_SESSION_FORKED` / `AGENT_SESSION_MERGED`. Two
+  concurrent background delegations against the same worker no longer
+  interleave their context. Audit-facing routes pass
+  `include_all_sessions=True` so the UI's full view is preserved.
+  Gated by `[worker_session_isolation] enabled` (**default false** —
+  changes what context flows into delegated turns, so opt-in). With
+  the flag off the runtime and message log are byte-identical. See
+  `docs/user-guide/agents.md` → "Worker session isolation" and
+  `docs/CHANGE_IMPACT_NOTICES/worker-session-isolation.md`.
 - **Project Management workspace** — local-first projects with nested
   tasks/subtasks, assignee/status/priority/dates metadata, notes, a
   timeline/Gantt view, a KPI dashboard, and AI summaries. Backed by a

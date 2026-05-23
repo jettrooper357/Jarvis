@@ -46,6 +46,34 @@ _execution_context: contextvars.ContextVar[ManagedAgentExecutionContext | None] 
     contextvars.ContextVar("openjarvis_managed_agent_execution", default=None)
 )
 
+# Phase 2G — active per-task session id for the current run. Empty string
+# means "general session" (today's behaviour). Set by ``run()`` from its
+# ``task_session_id`` argument when worker session isolation is enabled.
+_active_task_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "openjarvis_active_task_session_id", default=""
+)
+
+
+def _current_active_session_id() -> Optional[str]:
+    """Return the active per-task session id, or ``None`` if unset."""
+    value = _active_task_session_id.get()
+    return value or None
+
+
+def _worker_session_isolation_enabled() -> bool:
+    """Phase 2G — lazy read of the worker-session-isolation feature flag.
+
+    Mirrors ``openjarvis.agents.manager._worker_session_isolation_enabled``
+    so the runtime can decide whether to set the active session id without
+    a circular import.
+    """
+    try:
+        from openjarvis.core.config import load_config
+
+        return bool(load_config().worker_session_isolation.enabled)
+    except Exception:
+        return False
+
 
 def get_managed_agent_context() -> ManagedAgentExecutionContext | None:
     """Return the current managed-agent tool execution context, if any."""
@@ -598,7 +626,16 @@ class ManagedAgentRuntime:
         parent_trace_id: Optional[str] = None,
         run_id: Optional[str] = None,
         tools_allowed: Optional[Sequence[str]] = None,
+        task_session_id: Optional[str] = None,
     ) -> str:
+        # Phase 2G — scope the active per-task session id for this call.
+        # Only takes effect when worker_session_isolation is enabled AND a
+        # non-empty session id is supplied; otherwise the contextvar is
+        # cleared so a prior tagged run in the same context can't bleed in.
+        if task_session_id and _worker_session_isolation_enabled():
+            _active_task_session_id.set(str(task_session_id))
+        else:
+            _active_task_session_id.set("")
         agent_record = self._manager.get_agent(agent_id)
         if agent_record is None:
             raise KeyError(f"Agent {agent_id!r} not found")
@@ -650,7 +687,12 @@ class ManagedAgentRuntime:
                 )
             except Exception:
                 logger.exception("Failed to publish AGENT_TICK_START for %s", agent_id)
-        message = self._manager.send_message(agent_id, user_content, mode=mode)
+        message = self._manager.send_message(
+            agent_id,
+            user_content,
+            mode=mode,
+            session_id=_current_active_session_id(),
+        )
         message_id = message["id"]
         if self._bus is not None:
             try:
@@ -725,6 +767,7 @@ class ManagedAgentRuntime:
             agent_id,
             safe_response,
             tool_calls=safe_tool_calls or None,
+            session_id=_current_active_session_id(),
         )
         if (
             not had_error
@@ -1708,7 +1751,10 @@ class ManagedAgentRuntime:
             else:
                 message_to_persist = user_answer
             user_msg = self._manager.send_message(
-                agent_id, message_to_persist, mode="channel"
+                agent_id,
+                message_to_persist,
+                mode="channel",
+                session_id=_current_active_session_id(),
             )
             message_id = user_msg["id"]
 
@@ -1809,7 +1855,11 @@ class ManagedAgentRuntime:
             safe_response_text = self._scrubber.scrub(
                 response_text, effective_run_id
             )
-            self._manager.store_agent_response(agent_id, safe_response_text)
+            self._manager.store_agent_response(
+                agent_id,
+                safe_response_text,
+                session_id=_current_active_session_id(),
+            )
             try:
                 self._manager.mark_message_delivered(message_id)
             except Exception:
@@ -1911,7 +1961,14 @@ class ManagedAgentRuntime:
         if system_prompt:
             messages.append(Message(role=Role.SYSTEM, content=str(system_prompt)))
 
-        history = self._manager.list_messages(agent_record["id"], limit=50)
+        # Phase 2G — the history loader honours the active per-task session
+        # id. When unset, the manager's flag-gated default applies (untagged-
+        # only with isolation on, every-row otherwise).
+        history = self._manager.list_messages(
+            agent_record["id"],
+            limit=50,
+            session_id=_current_active_session_id(),
+        )
         for item in reversed(history):
             if item["id"] == message_id:
                 continue
