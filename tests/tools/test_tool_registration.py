@@ -25,6 +25,7 @@ EXPECTED_TOOLS = {
     "web_search",
     # news.py
     "get_todays_news",
+    "get_news",
     # code_interpreter.py
     "code_interpreter",
     # code_interpreter_docker.py
