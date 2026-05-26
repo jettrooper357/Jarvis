@@ -196,3 +196,13 @@ the "Breaking — needs Notice" column above must produce
 `docs/CHANGE_IMPACT_NOTICES/<slug>.md` and **stop for explicit user
 approval** before implementation, per `AGENTS.md` § "Change-control
 protocol".
+# Agent Assigned Jobs
+
+| Feature | Protected behavior | Preservation rule | Validation |
+| --- | --- | --- | --- |
+| Per-agent jobs | Jobs are created, listed, paused/resumed, deleted, and run from the selected agent context. | Do not move jobs to a global-only surface or detach them from `managed_agents`. | `tests/agents/test_scheduler.py::TestSchedulerBasic::test_job_fire_creates_tracked_task_and_run` |
+| Cron job display | Cron expression stays raw in persistence while next-run display is localized in the browser. | Do not persist user-localized display strings as the job schedule source of truth. | Frontend build/typecheck |
+| Job run ledger | Every job fire creates an append-only run record with status, task link, summary/error, and event metadata. | Do not replace run history with mutable UI state. | Scheduler regression test |
+| Chief/delegation path | Fired jobs materialize tracked agent work and attribute assignment to the designated Chief when available. | Do not execute scheduled jobs as direct human-facing subordinate ingress. | Scheduler regression test |
+| Job capabilities | Job permissions appear in capability axes and include create/update/run/delegate semantics. | Do not hard-code job permission state only in the UI. | Frontend build/typecheck |
+| App-event IFTTT jobs | Conditional jobs fire from app events such as login, logoff, task/project start, and task/project completion, plus registered custom events. | Do not turn IFTTT jobs into UI-only polling or hard-coded event lists. | `tests/agents/test_scheduler.py::TestSchedulerBasic::test_ifttt_job_fires_from_app_event` |

@@ -54,6 +54,7 @@ author = "openjarvis-user"
 
 type LibraryKind = 'skill' | 'preset';
 type TabId = 'skills' | 'presets' | 'tools' | 'data' | 'templates' | 'deprecated';
+type CatalogFilter = 'all' | 'built-in' | 'user' | 'risk';
 
 interface EditorState {
   kind: LibraryKind;
@@ -111,6 +112,7 @@ export function LibraryPage() {
   const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState('');
   const [catalogFilter, setCatalogFilter] = useState('');
+  const [sourceFilter, setSourceFilter] = useState<CatalogFilter>('all');
   const [selectedKey, setSelectedKey] = useState('');
 
   const [downloadOpen, setDownloadOpen] = useState(false);
@@ -162,12 +164,21 @@ export function LibraryPage() {
   }, [skills, tab, templates]);
 
   const filteredItems = useMemo(() => {
-    const needle = catalogFilter.trim().toLowerCase();
-    if (!needle) return catalogItems;
-    return catalogItems.filter((item) =>
-      `${item.name} ${item.description} ${item.source}`.toLowerCase().includes(needle),
-    );
-  }, [catalogFilter, catalogItems]);
+    const needles = [query, catalogFilter]
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean);
+
+    return catalogItems.filter((item) => {
+      const searchable = `${item.name} ${item.description} ${item.source}`.toLowerCase();
+      const matchesSearch = needles.every((needle) => searchable.includes(needle));
+      if (!matchesSearch) return false;
+
+      if (sourceFilter === 'all') return true;
+      if (sourceFilter === 'built-in') return item.source === 'built-in';
+      if (sourceFilter === 'user') return item.source === 'user' || item.source === 'workspace';
+      return tagFor(item).label !== 'Safe';
+    });
+  }, [catalogFilter, catalogItems, query, sourceFilter]);
 
   const selectedItem = filteredItems.find((item) => item.key === selectedKey) || filteredItems[0];
 
@@ -377,9 +388,28 @@ export function LibraryPage() {
               <input value={catalogFilter} onChange={(e) => setCatalogFilter(e.target.value)} placeholder={`Filter ${tab}...`} className="min-w-0 flex-1 bg-transparent text-sm outline-none" style={{ color: 'var(--color-text)' }} />
             </div>
             <div className="mb-4 flex gap-2 text-xs">
-              {['All', 'Built-in', 'User', 'Risk'].map((label) => (
-                <span key={label} className="rounded-full px-3 py-1" style={{ color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)' }}>{label}</span>
-              ))}
+              {([
+                ['all', 'All'],
+                ['built-in', 'Built-in'],
+                ['user', 'User'],
+                ['risk', 'Risk'],
+              ] as Array<[CatalogFilter, string]>).map(([id, label]) => {
+                const active = sourceFilter === id;
+                return (
+                  <button
+                    key={id}
+                    onClick={() => setSourceFilter(id)}
+                    className="rounded-full px-3 py-1"
+                    style={{
+                      background: active ? 'var(--color-accent-subtle)' : 'transparent',
+                      color: active ? 'var(--color-text)' : 'var(--color-text-secondary)',
+                      border: active ? '1px solid var(--color-accent)' : '1px solid var(--color-border)',
+                    }}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
             </div>
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
               {filteredItems.length === 0 ? (

@@ -46,11 +46,16 @@ import {
   sendChiefMessage,
   uploadAgentAvatar,
   deleteAgentAvatar,
+  fetchAgentJobs,
+  createAgentJob,
+  updateAgentJob,
+  deleteAgentJob,
+  runAgentJob,
 } from '../lib/api';
 import type { AgentConfigVersion } from '../lib/api';
 import { useChiefHealth } from '../hooks/useChiefHealth';
 import type { TraceTreeNode } from '../lib/api';
-import type { AgentTask, ChannelBinding, AgentTemplate, AgentMessage, ManagedAgent, LearningLogEntry, AgentTrace, ToolInfo, InstalledSkill, MissionControlData, MissionControlProject, MissionControlTask } from '../lib/api';
+import type { AgentJob, AgentJobType, AgentTask, ChannelBinding, AgentTemplate, AgentMessage, ManagedAgent, LearningLogEntry, AgentTrace, ToolInfo, InstalledSkill, MissionControlData, MissionControlProject, MissionControlTask } from '../lib/api';
 import { AgentAvatar } from '../components/AgentAvatar';
 import { PendingApprovalsList } from '../components/PendingApprovalsList';
 import { useAgentEvents, type AgentEvent } from '../lib/useAgentEvents';
@@ -90,6 +95,7 @@ import {
   Boxes,
   Eye,
   Upload,
+  CalendarClock,
 } from 'lucide-react';
 import { SOURCE_CATALOG } from '../types/connectors';
 import type { ConnectRequest } from '../types/connectors';
@@ -2749,6 +2755,11 @@ function CapabilityInspector({
   const approvalTools = useMemo(() => agent.requires_approval_tools ?? [], [agent.requires_approval_tools]);
   const autoTools = useMemo(() => agent.auto_tools ?? [], [agent.auto_tools]);
   const effectiveTools = useMemo(() => agent.effective_tools ?? [], [agent.effective_tools]);
+  const assignedJobCaps = useMemo(() => agent.assigned_job_capabilities ?? [], [agent.assigned_job_capabilities]);
+  const inheritedJobCaps = useMemo(() => agent.inherited_job_capabilities ?? [], [agent.inherited_job_capabilities]);
+  const blockedJobCaps = useMemo(() => agent.blocked_job_capabilities ?? [], [agent.blocked_job_capabilities]);
+  const approvalJobCaps = useMemo(() => agent.requires_approval_job_capabilities ?? [], [agent.requires_approval_job_capabilities]);
+  const effectiveJobCaps = useMemo(() => agent.effective_job_capabilities ?? [], [agent.effective_job_capabilities]);
 
   async function openPreview() {
     setPreviewOpen(true);
@@ -2841,7 +2852,7 @@ function CapabilityInspector({
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-3">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-x-6 gap-y-3">
         <section>
           <div className="text-xs font-semibold uppercase tracking-wide mb-1.5" style={{ color: 'var(--color-text-tertiary)' }}>
             Skills
@@ -2865,6 +2876,18 @@ function CapabilityInspector({
             <Row label="Blocked">{renderChipRow(blockedTools, 'blocked')}</Row>
             <Row label="Approval">{renderChipRow(approvalTools, 'requires_approval')}</Row>
             <Row label="Effective">{renderChipRow(effectiveTools, 'effective')}</Row>
+          </div>
+        </section>
+        <section>
+          <div className="text-xs font-semibold uppercase tracking-wide mb-1.5" style={{ color: 'var(--color-text-tertiary)' }}>
+            Jobs
+          </div>
+          <div className="space-y-1.5">
+            <Row label="Assigned">{renderChipRow(assignedJobCaps, 'assigned')}</Row>
+            <Row label="Inherited">{renderChipRow(inheritedJobCaps, 'inherited')}</Row>
+            <Row label="Blocked">{renderChipRow(blockedJobCaps, 'blocked')}</Row>
+            <Row label="Approval">{renderChipRow(approvalJobCaps, 'requires_approval')}</Row>
+            <Row label="Effective">{renderChipRow(effectiveJobCaps, 'effective')}</Row>
           </div>
         </section>
       </div>
@@ -5490,7 +5513,7 @@ function InlineConnectForm({
   loading,
   onSubmit,
 }: {
-  fields: Array<{ name: string; placeholder: string; type?: string }>;
+  fields: Array<{ name: string; placeholder: string; type?: string; autoComplete?: string }>;
   loading: boolean;
   onSubmit: (req: ConnectRequest) => void;
 }) {
@@ -5506,8 +5529,14 @@ function InlineConnectForm({
     for (const f of fields) {
       if (f.name === 'email') req.email = inputs.email;
       else if (f.name === 'password') req.password = inputs.password;
+      else if (f.name === 'client_id') req.client_id = inputs.client_id;
+      else if (f.name === 'client_secret') req.client_secret = inputs.client_secret;
       else if (f.name === 'token') req.token = inputs.token;
       else if (f.name === 'path') req.path = inputs.path;
+    }
+    if (req.client_id && req.client_secret) {
+      req.token = `${req.client_id}:${req.client_secret}`;
+      req.code = req.token;
     }
     if (req.email && req.password) {
       req.token = `${req.email}:${req.password}`;
@@ -5526,6 +5555,8 @@ function InlineConnectForm({
           onChange={(e) => update(f.name, e.target.value)}
           placeholder={f.placeholder}
           type={f.type || 'text'}
+          autoComplete={f.autoComplete || (f.type === 'password' ? 'new-password' : 'off')}
+          name={f.name}
           style={{
             width: '100%', padding: '7px 10px',
             background: 'var(--color-bg)',
@@ -6780,6 +6811,145 @@ function LogsTab({ agentId }: { agentId: string }) {
 // Main page component
 // ---------------------------------------------------------------------------
 
+function JobsTab({
+  agent,
+  jobs,
+  onChanged,
+}: {
+  agent: ManagedAgent;
+  jobs: AgentJob[];
+  onChanged: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState('');
+  const [jobType, setJobType] = useState<AgentJobType>('cron');
+  const [triggerValue, setTriggerValue] = useState('0 9 * * *');
+  const [prompt, setPrompt] = useState('');
+  const [delegable, setDelegable] = useState(true);
+
+  const buildTrigger = (): Record<string, unknown> => {
+    if (jobType === 'cron') return { cron: triggerValue || '0 9 * * *' };
+    if (jobType === 'interval') return { seconds: Number(triggerValue || 3600) };
+    if (jobType === 'once') return { run_at: triggerValue };
+    if (jobType === 'if_this_then_that') return { event: triggerValue || 'task.completed' };
+    return {};
+  };
+
+  const createJob = async () => {
+    await createAgentJob(agent.id, {
+      name: name || 'New job',
+      job_type: jobType,
+      prompt,
+      trigger: buildTrigger(),
+      required_capabilities: ['job:run'],
+      delegation_policy: { enabled: delegable, mode: delegable ? 'hierarchical' : 'none' },
+    });
+    setName('');
+    setPrompt('');
+    setOpen(false);
+    onChanged();
+  };
+
+  const userTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const formatRunAt = (value?: number | null) => {
+    if (!value) return 'Not scheduled';
+    return new Intl.DateTimeFormat(undefined, {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+      timeZone: userTimeZone,
+      timeZoneName: 'short',
+    }).format(new Date(value * 1000));
+  };
+  const formatTrigger = (job: AgentJob) => {
+    if (job.job_type === 'cron') {
+      return `Cron: ${String(job.trigger?.cron || job.trigger?.expression || '')}`;
+    }
+    if (job.job_type === 'interval') {
+      return `Every ${String(job.trigger?.seconds || job.trigger?.interval_seconds || '?')} seconds`;
+    }
+    if (job.job_type === 'once') {
+      return `Once: ${String(job.trigger?.run_at || job.trigger?.at || '')}`;
+    }
+    if (job.job_type === 'if_this_then_that') {
+      return `On event: ${String(job.trigger?.event || job.trigger?.event_name || 'task.completed')}`;
+    }
+    return 'Manual run';
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="p-3 rounded-lg flex items-start justify-between gap-3" style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}>
+        <div>
+          <div className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Agent jobs</div>
+          <div className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>
+            Capability-governed automations assigned to this agent. Fired jobs create tracked tasks through the Chief path and may delegate by policy.
+          </div>
+        </div>
+        <button onClick={() => setOpen((v) => !v)} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm cursor-pointer" style={{ background: 'var(--color-accent)', color: 'var(--color-on-accent)' }}>
+          <Plus size={13} /> New Job
+        </button>
+      </div>
+
+      {open && (
+        <div className="p-3 rounded-lg grid grid-cols-1 md:grid-cols-2 gap-3" style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Job name" className="px-3 py-2 rounded text-sm outline-none" style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }} />
+          <select value={jobType} onChange={(e) => setJobType(e.target.value as AgentJobType)} className="px-3 py-2 rounded text-sm outline-none" style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}>
+            <option value="cron">Cron</option>
+            <option value="interval">Interval</option>
+            <option value="once">Once</option>
+            <option value="if_this_then_that">If This Then That</option>
+            <option value="manual">Manual</option>
+          </select>
+          {jobType !== 'manual' && (
+            <input value={triggerValue} onChange={(e) => setTriggerValue(e.target.value)} placeholder={jobType === 'cron' ? '0 9 * * *' : jobType === 'interval' ? '3600' : jobType === 'once' ? '2026-05-24T09:00:00' : 'task.completed'} className="px-3 py-2 rounded text-sm outline-none" style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }} />
+          )}
+          <label className="flex items-center gap-2 text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+            <input type="checkbox" checked={delegable} onChange={(e) => setDelegable(e.target.checked)} />
+            May delegate hierarchically
+          </label>
+          <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="What should this job ask the agent to do?" className="md:col-span-2 min-h-24 px-3 py-2 rounded text-sm outline-none resize-none" style={{ background: 'var(--color-bg)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }} />
+          <div className="md:col-span-2 flex justify-end gap-2">
+            <button onClick={() => setOpen(false)} className="px-3 py-1.5 rounded-lg text-sm" style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}>Cancel</button>
+            <button onClick={createJob} disabled={!prompt.trim()} className="px-3 py-1.5 rounded-lg text-sm disabled:opacity-50" style={{ background: 'var(--color-accent)', color: 'var(--color-on-accent)' }}>Create Job</button>
+          </div>
+        </div>
+      )}
+
+      {jobs.map((job) => (
+        <div key={job.id} className="p-4 rounded-lg" style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}>
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="font-medium truncate" style={{ color: 'var(--color-text)' }}>{job.name}</span>
+                <span className="text-[11px] px-2 py-0.5 rounded-full" style={{ background: 'var(--color-accent-subtle)', color: 'var(--color-accent)' }}>{job.job_type}</span>
+                <span className="text-[11px] px-2 py-0.5 rounded-full" style={{ background: 'var(--color-bg)', color: 'var(--color-text-secondary)' }}>{job.status}</span>
+              </div>
+              <div className="mt-1 text-sm" style={{ color: 'var(--color-text-secondary)' }}>{job.prompt}</div>
+              <div className="mt-2 flex flex-wrap gap-2 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+                <span>{formatTrigger(job)}</span>
+                <span>Next in {userTimeZone}: {formatRunAt(job.next_run_at)}</span>
+                <span>Capabilities: {(job.required_capabilities || []).join(', ') || 'job:run'}</span>
+                <span>Delegation: {job.delegation_policy?.enabled ? 'allowed' : 'off'}</span>
+              </div>
+            </div>
+            <div className="flex shrink-0 gap-2">
+              <button onClick={async () => { await runAgentJob(agent.id, job.id); toast.success('Job fired'); onChanged(); }} className="px-3 py-1.5 rounded-lg text-xs" style={{ background: 'var(--color-accent)', color: 'var(--color-on-accent)' }}>Run</button>
+              <button onClick={async () => { await updateAgentJob(agent.id, job.id, { status: job.status === 'paused' ? 'active' : 'paused' }); onChanged(); }} className="px-3 py-1.5 rounded-lg text-xs" style={{ border: '1px solid var(--color-border)', color: 'var(--color-text)' }}>{job.status === 'paused' ? 'Resume' : 'Pause'}</button>
+              <button onClick={async () => { if (window.confirm(`Delete job "${job.name}"?`)) { await deleteAgentJob(agent.id, job.id); onChanged(); } }} className="px-3 py-1.5 rounded-lg text-xs" style={{ border: '1px solid var(--color-border)', color: 'var(--color-error)' }}>Delete</button>
+            </div>
+          </div>
+        </div>
+      ))}
+
+      {jobs.length === 0 && (
+        <div className="text-sm py-8 text-center" style={{ color: 'var(--color-text-tertiary)' }}>
+          No jobs assigned to this agent yet.
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function AgentsPage() {
   const navigate = useNavigate();
   const managedAgents = useAppStore((s) => s.managedAgents);
@@ -6790,6 +6960,7 @@ export function AgentsPage() {
   const [loading, setLoading] = useState(true);
   const [agentManagerAvailable, setAgentManagerAvailable] = useState<boolean | null>(null);
   const [tasks, setTasks] = useState<AgentTask[]>([]);
+  const [jobs, setJobs] = useState<AgentJob[]>([]);
   const [taskStatusFilter, setTaskStatusFilter] = useState<AgentTaskStatusFilter>('all');
   const [taskProjectFilter, setTaskProjectFilter] = useState('all');
   const [missionControlData, setMissionControlData] = useState<MissionControlData | null>(null);
@@ -6797,7 +6968,7 @@ export function AgentsPage() {
   const [templates, setTemplates] = useState<AgentTemplate[]>([]);
   const [skills, setSkills] = useState<InstalledSkill[]>([]);
   const [showWizard, setShowWizard] = useState(false);
-  const [detailTab, setDetailTab] = useState<'overview' | 'interact' | 'channels' | 'messaging' | 'tasks' | 'memory' | 'learning' | 'logs'>('interact');
+  const [detailTab, setDetailTab] = useState<'overview' | 'interact' | 'channels' | 'messaging' | 'tasks' | 'jobs' | 'memory' | 'learning' | 'logs'>('interact');
 
   const refreshLibrary = useCallback(() => {
     fetchTemplates().then(setTemplates).catch(() => {});
@@ -6854,14 +7025,20 @@ export function AgentsPage() {
     fetchMissionControl().then(setMissionControlData).catch(() => setMissionControlData(null));
   }, [selectedAgentId]);
 
+  const reloadJobs = useCallback(() => {
+    if (!selectedAgentId) return;
+    fetchAgentJobs(selectedAgentId).then(setJobs).catch(() => setJobs([]));
+  }, [selectedAgentId]);
+
   useEffect(() => {
     if (selectedAgentId) {
       setTaskStatusFilter('all');
       setTaskProjectFilter('all');
       reloadTasks();
+      reloadJobs();
       fetchAgentChannels(selectedAgentId).then(setChannels).catch(() => setChannels([]));
     }
-  }, [selectedAgentId, reloadTasks]);
+  }, [selectedAgentId, reloadTasks, reloadJobs]);
 
   const handlePause = async (id: string) => {
     await pauseManagedAgent(id).catch(() => {});
@@ -6965,6 +7142,7 @@ export function AgentsPage() {
       { id: 'channels', label: 'Data Sources', icon: Database },
       { id: 'messaging', label: 'Messaging Channels', icon: Wifi },
       { id: 'tasks', label: 'Tasks', icon: ListTodo },
+      { id: 'jobs', label: 'Jobs', icon: CalendarClock },
       { id: 'memory', label: 'Memory', icon: Brain },
       { id: 'learning', label: 'Learning', icon: Settings },
       { id: 'logs', label: 'Logs', icon: FileText },
@@ -7365,6 +7543,10 @@ export function AgentsPage() {
               </div>
             )}
           </div>
+        )}
+
+        {detailTab === 'jobs' && (
+          <JobsTab agent={selectedAgent} jobs={jobs} onChanged={reloadJobs} />
         )}
 
         {/* Tab: Memory */}

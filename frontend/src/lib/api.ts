@@ -472,6 +472,11 @@ export interface ManagedAgent {
   blocked_tools?: string[];
   requires_approval_skills?: string[];
   requires_approval_tools?: string[];
+  assigned_job_capabilities?: string[];
+  inherited_job_capabilities?: string[];
+  blocked_job_capabilities?: string[];
+  requires_approval_job_capabilities?: string[];
+  effective_job_capabilities?: string[];
   // Phase 2E — Chief-as-canonical-ingress designation.
   is_chief?: boolean;
   avatar_url?: string | null;
@@ -511,6 +516,50 @@ export interface AgentTask {
   // Mission Control: every agent task is tied to a project task/subtask.
   project_task_id?: string | null;
   project_id?: string | null;
+  created_at: number;
+}
+
+export type AgentJobType = 'cron' | 'interval' | 'once' | 'manual' | 'if_this_then_that';
+export type AgentJobStatus = 'active' | 'paused' | 'completed' | 'failed';
+
+export interface AgentJob {
+  id: string;
+  agent_id: string;
+  name: string;
+  description: string;
+  job_type: AgentJobType;
+  trigger: Record<string, unknown>;
+  prompt: string;
+  status: AgentJobStatus;
+  next_run_at?: number | null;
+  last_run_at?: number | null;
+  cooldown_seconds: number;
+  required_capabilities: string[];
+  approval_required_capabilities: string[];
+  delegation_policy: Record<string, unknown>;
+  task_overrides: Record<string, unknown>;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface AgentJobRun {
+  id: string;
+  job_id: string;
+  agent_id: string;
+  task_id?: string | null;
+  status: string;
+  started_at: number;
+  finished_at?: number | null;
+  summary: string;
+  error: string;
+  event: Record<string, unknown>;
+}
+
+export interface AppEventType {
+  name: string;
+  description: string;
+  source: string;
+  payload_schema: Record<string, unknown>;
   created_at: number;
 }
 
@@ -1200,6 +1249,102 @@ export async function deleteAgentTask(agentId: string, taskId: string): Promise<
     method: 'DELETE',
   });
   if (!res.ok) throw new Error(`Failed: ${res.status}`);
+}
+
+export async function fetchAgentJobs(agentId: string): Promise<AgentJob[]> {
+  const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}/jobs`);
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  const data = await res.json();
+  return data.jobs || [];
+}
+
+export async function createAgentJob(
+  agentId: string,
+  body: {
+    name: string;
+    job_type: AgentJobType;
+    prompt: string;
+    description?: string;
+    trigger?: Record<string, unknown>;
+    status?: AgentJobStatus;
+    cooldown_seconds?: number;
+    required_capabilities?: string[];
+    approval_required_capabilities?: string[];
+    delegation_policy?: Record<string, unknown>;
+    task_overrides?: Record<string, unknown>;
+  },
+): Promise<AgentJob> {
+  const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}/jobs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export async function updateAgentJob(
+  agentId: string,
+  jobId: string,
+  body: Partial<AgentJob>,
+): Promise<AgentJob> {
+  const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}/jobs/${jobId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export async function deleteAgentJob(agentId: string, jobId: string): Promise<void> {
+  const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}/jobs/${jobId}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+}
+
+export async function runAgentJob(agentId: string, jobId: string): Promise<AgentJobRun> {
+  const res = await fetch(`${getBase()}/v1/managed-agents/${agentId}/jobs/${jobId}/run`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchAppEvents(): Promise<AppEventType[]> {
+  const res = await fetch(`${getBase()}/v1/app-events`);
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  const data = await res.json();
+  return data.events || [];
+}
+
+export async function registerAppEvent(body: {
+  name: string;
+  description?: string;
+  source?: string;
+  payload_schema?: Record<string, unknown>;
+}): Promise<AppEventType> {
+  const res = await fetch(`${getBase()}/v1/app-events`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export async function emitAppEvent(
+  name: string,
+  payload: Record<string, unknown> = {},
+): Promise<{ event: string; fired_jobs: string[] }> {
+  const res = await fetch(`${getBase()}/v1/app-events/emit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, payload }),
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
 }
 
 export async function fetchAgentChannels(agentId: string): Promise<ChannelBinding[]> {

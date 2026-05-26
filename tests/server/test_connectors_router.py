@@ -130,6 +130,37 @@ def test_save_google_oauth_client(app, monkeypatch) -> None:
     assert "abc123.apps" in data["client_id_preview"]
 
 
+def test_google_connect_accepts_client_id_and_secret(app, monkeypatch) -> None:
+    """Google OAuth connect accepts explicit client_id/client_secret fields."""
+    from openjarvis.core.registry import ConnectorRegistry
+    from openjarvis.server.connectors_router import _ensure_connectors_registered
+    from openjarvis.server.connectors_router import _instances
+
+    _ensure_connectors_registered()
+    gcontacts_cls = ConnectorRegistry.get("gcontacts")
+    received: list[str] = []
+
+    def _fake_handle_callback(self, code: str) -> None:
+        received.append(code)
+
+    monkeypatch.setattr(gcontacts_cls, "handle_callback", _fake_handle_callback)
+    _instances.pop("gcontacts", None)
+
+    try:
+        resp = app.post(
+            "/v1/connectors/gcontacts/connect",
+            json={
+                "client_id": "abc123.apps.googleusercontent.com",
+                "client_secret": "super-secret",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert received == ["abc123.apps.googleusercontent.com:super-secret"]
+    finally:
+        _instances.pop("gcontacts", None)
+
+
 def test_google_oauth_callback_clears_all_provider_instances(app, monkeypatch) -> None:
     """A successful Google callback should invalidate all cached Google connectors."""
     from openjarvis.connectors.oauth import OAUTH_PROVIDERS

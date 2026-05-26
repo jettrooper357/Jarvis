@@ -50,7 +50,7 @@ function InlineConnectForm({
   loading,
   onSubmit,
 }: {
-  fields: Array<{ name: string; placeholder: string; type?: string }>;
+  fields: Array<{ name: string; placeholder: string; type?: string; autoComplete?: string }>;
   loading: boolean;
   onSubmit: (req: ConnectRequest) => void;
 }) {
@@ -66,8 +66,14 @@ function InlineConnectForm({
     for (const f of fields) {
       if (f.name === 'email') req.email = inputs.email;
       else if (f.name === 'password') req.password = inputs.password;
+      else if (f.name === 'client_id') req.client_id = inputs.client_id;
+      else if (f.name === 'client_secret') req.client_secret = inputs.client_secret;
       else if (f.name === 'token') req.token = inputs.token;
       else if (f.name === 'path') req.path = inputs.path;
+    }
+    if (req.client_id && req.client_secret) {
+      req.token = `${req.client_id}:${req.client_secret}`;
+      req.code = req.token;
     }
     if (req.email && req.password) {
       req.token = `${req.email}:${req.password}`;
@@ -86,6 +92,8 @@ function InlineConnectForm({
           onChange={(e) => update(f.name, e.target.value)}
           placeholder={f.placeholder}
           type={f.type || 'text'}
+          autoComplete={f.autoComplete || (f.type === 'password' ? 'new-password' : 'off')}
+          name={f.name}
           style={{
             width: '100%', padding: '7px 10px',
             background: 'var(--color-bg)',

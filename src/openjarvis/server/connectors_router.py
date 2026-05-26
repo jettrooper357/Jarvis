@@ -256,6 +256,8 @@ try:
         code: Optional[str] = None
         email: Optional[str] = None
         password: Optional[str] = None
+        client_id: Optional[str] = None
+        client_secret: Optional[str] = None
 
 except ImportError:
     ConnectRequest = None  # type: ignore[assignment,misc]
@@ -501,7 +503,11 @@ def create_connectors_router():
                     instance._connected = Path(req.path).is_dir()
 
             elif auth_type == "oauth":
-                if req.code:
+                if req.client_id and req.client_secret:
+                    instance.handle_callback(
+                        f"{req.client_id.strip()}:{req.client_secret.strip()}"
+                    )
+                elif req.code:
                     instance.handle_callback(req.code)
                 elif req.token:
                     # Some OAuth connectors accept a pre-existing token.

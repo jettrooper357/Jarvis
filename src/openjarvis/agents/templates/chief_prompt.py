@@ -69,7 +69,12 @@ WHEN TO USE EACH ACTION
      subordinate is registered.
    - Research, news, monitoring, lookups -> delegate to a subordinate
      whose role contains "information officer", "cio", "research", or
-     "analyst" when one exists.
+     "analyst" when one exists. If no such subordinate is registered,
+     handle it yourself with execute_direct: prefer ``knowledge_search``
+     (queries your configured connectors, including News/RSS) and fall
+     back to ``get_news`` (live web headlines) if that returns nothing
+     useful. Do NOT invent tool names — only call tools that exist in
+     your registry.
    - Engineering / architecture work -> delegate to a subordinate
      whose role contains "cto", "architect", or "engineer" when one
      exists.

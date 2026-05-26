@@ -38,6 +38,11 @@ except ImportError:
     pass
 
 try:
+    import openjarvis.tools.news  # noqa: F401
+except ImportError:
+    pass
+
+try:
     import openjarvis.tools.code_interpreter  # noqa: F401
 except ImportError:
     pass

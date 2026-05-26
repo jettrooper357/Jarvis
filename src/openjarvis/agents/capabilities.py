@@ -30,6 +30,10 @@ AUTO_COLLABORATION_TOOLS = (
     "managed_agent_update_task",
     "managed_agent_inspect",
 )
+AUTO_INFORMATION_TOOLS = (
+    "get_news",
+    "get_todays_news",
+)
 AUTO_PROJECT_TOOLS = (
     "project_create",
     "project_create_task",
@@ -43,6 +47,13 @@ AUTO_PROJECT_TOOLS = (
     "project_add_category",
     "project_rename_category",
     "project_delete_category",
+)
+AUTO_JOB_CAPABILITIES = (
+    "job:create",
+    "job:update",
+    "job:run",
+    "job:delegate",
+    "schedule:create",
 )
 PROJECT_TOOL_ROLES = (
     "chief orchestrator",
@@ -110,6 +121,9 @@ def effective_agent_tool_names(agent_record: Dict[str, Any]) -> List[str]:
                 names.append(tool_name)
     if should_enable_project_tools(agent_record):
         for tool_name in AUTO_PROJECT_TOOLS:
+            if tool_name not in names:
+                names.append(tool_name)
+        for tool_name in AUTO_INFORMATION_TOOLS:
             if tool_name not in names:
                 names.append(tool_name)
     if should_enable_agent_knowledge(agent_record):
@@ -196,6 +210,32 @@ def resolve_capability_axes(
     requires_approval_tools = _string_list(
         config.get("requires_approval_tools")
     )
+    assigned_job_capabilities = _string_list(config.get("job_capabilities"))
+    blocked_job_capabilities = _string_list(config.get("blocked_job_capabilities"))
+    requires_approval_job_capabilities = _string_list(
+        config.get("requires_approval_job_capabilities")
+    )
+    inherited_job_capabilities: List[str] = []
+    if manager_record is not None:
+        mgr_axes = resolve_capability_axes(manager_record, manager_record=None)
+        inherited_job_capabilities = [
+            c
+            for c in mgr_axes.get("effective_job_capabilities", [])
+            if c not in assigned_job_capabilities
+        ]
+    effective_job_capabilities: List[str] = []
+    for source in (
+        assigned_job_capabilities,
+        inherited_job_capabilities,
+        list(AUTO_JOB_CAPABILITIES),
+    ):
+        for name in source:
+            if (
+                name
+                and name not in effective_job_capabilities
+                and name not in blocked_job_capabilities
+            ):
+                effective_job_capabilities.append(name)
 
     # Effective = assigned ∪ inherited ∪ auto-injected, minus blocked.
     auto_effective_tools = effective_agent_tool_names(agent_record)
@@ -225,6 +265,11 @@ def resolve_capability_axes(
         "requires_approval_tools": requires_approval_tools,
         "effective_skills": union_skills,
         "effective_tools": union_tools,
+        "assigned_job_capabilities": assigned_job_capabilities,
+        "inherited_job_capabilities": inherited_job_capabilities,
+        "blocked_job_capabilities": blocked_job_capabilities,
+        "requires_approval_job_capabilities": requires_approval_job_capabilities,
+        "effective_job_capabilities": effective_job_capabilities,
     }
 
 
@@ -256,6 +301,13 @@ def enrich_agent_record(
     enriched["blocked_tools"] = axes["blocked_tools"]
     enriched["requires_approval_skills"] = axes["requires_approval_skills"]
     enriched["requires_approval_tools"] = axes["requires_approval_tools"]
+    enriched["assigned_job_capabilities"] = axes["assigned_job_capabilities"]
+    enriched["inherited_job_capabilities"] = axes["inherited_job_capabilities"]
+    enriched["blocked_job_capabilities"] = axes["blocked_job_capabilities"]
+    enriched["requires_approval_job_capabilities"] = axes[
+        "requires_approval_job_capabilities"
+    ]
+    enriched["effective_job_capabilities"] = axes["effective_job_capabilities"]
     return enriched
 
 

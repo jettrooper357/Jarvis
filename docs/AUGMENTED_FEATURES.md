@@ -233,3 +233,23 @@ Any Phase 2 (or later) work that proposes to:
 must produce `docs/CHANGE_IMPACT_NOTICES/<slug>.md` and **stop for explicit
 approval** before implementation. See `AGENTS.md` § "Change-control
 protocol".
+# Agent Assigned Jobs
+
+Status: Protected augmented feature
+
+Jarvis supports per-agent assigned jobs managed from each agent's Overview surface.
+Jobs are durable agent capabilities, not transient UI state. Supported first-pass
+job types are `cron`, `interval`, `once`, `manual`, and app-event-driven
+`if_this_then_that` jobs. Cron expressions are stored as cron strings in the
+agents database; the UI converts computed next-run timestamps to the user's
+browser timezone for display.
+
+Protected behavior:
+- jobs remain assigned to managed agents,
+- job definitions and job runs are persisted in the agents database,
+- job firing creates tracked agent work and records job run history,
+- designated Chief attribution is preserved when a job materializes work,
+- delegation policy is stored with the job and copied into task progress,
+- job capabilities are exposed through the Capability Inspector axes,
+- IFTTT jobs trigger from built-in or registered app events without polling,
+- existing per-agent `schedule_type` / `schedule_value` config remains supported.

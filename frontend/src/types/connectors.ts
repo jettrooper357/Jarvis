@@ -19,6 +19,7 @@ export interface ConnectorMeta {
     name: string;
     placeholder: string;
     type?: 'text' | 'password';
+    autoComplete?: string;
   }>;
 }
 
@@ -47,6 +48,8 @@ export interface ConnectRequest {
   code?: string;
   email?: string;
   password?: string;
+  client_id?: string;
+  client_secret?: string;
 }
 
 export type WizardStep = "pick" | "connect" | "ingest" | "ready";
@@ -307,8 +310,8 @@ export const SOURCE_CATALOG: ConnectorMeta[] = [
       },
     ],
     inputFields: [
-      { name: 'email', placeholder: 'Client ID (e.g. 123456-abc.apps.googleusercontent.com)', type: 'text' },
-      { name: 'password', placeholder: 'Client Secret', type: 'password' },
+      { name: 'client_id', placeholder: 'OAuth Client ID (e.g. 123456-abc.apps.googleusercontent.com)', type: 'text', autoComplete: 'off' },
+      { name: 'client_secret', placeholder: 'OAuth Client Secret', type: 'password', autoComplete: 'new-password' },
     ],
   },
   // ── PIM (Calendar, Contacts) ───────────────────────────────────────
@@ -342,8 +345,8 @@ export const SOURCE_CATALOG: ConnectorMeta[] = [
       },
     ],
     inputFields: [
-      { name: 'email', placeholder: 'Client ID', type: 'text' },
-      { name: 'password', placeholder: 'Client Secret', type: 'password' },
+      { name: 'client_id', placeholder: 'OAuth Client ID', type: 'text', autoComplete: 'off' },
+      { name: 'client_secret', placeholder: 'OAuth Client Secret', type: 'password', autoComplete: 'new-password' },
     ],
   },
   {
@@ -376,8 +379,8 @@ export const SOURCE_CATALOG: ConnectorMeta[] = [
       },
     ],
     inputFields: [
-      { name: 'email', placeholder: 'Client ID', type: 'text' },
-      { name: 'password', placeholder: 'Client Secret', type: 'password' },
+      { name: 'client_id', placeholder: 'OAuth Client ID', type: 'text', autoComplete: 'off' },
+      { name: 'client_secret', placeholder: 'OAuth Client Secret', type: 'password', autoComplete: 'new-password' },
     ],
   },
   {

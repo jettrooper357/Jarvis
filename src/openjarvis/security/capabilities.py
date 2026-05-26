@@ -25,6 +25,10 @@ class Capability(str, Enum):
     CHANNEL_SEND = "channel:send"
     TOOL_INVOKE = "tool:invoke"
     SCHEDULE_CREATE = "schedule:create"
+    JOB_CREATE = "job:create"
+    JOB_UPDATE = "job:update"
+    JOB_RUN = "job:run"
+    JOB_DELEGATE = "job:delegate"
     SYSTEM_ADMIN = "system:admin"
 
 

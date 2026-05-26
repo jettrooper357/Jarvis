@@ -210,3 +210,70 @@ class TestSchedulerBasic:
         finally:
             mgr.close()
             project_store.close()
+
+    def test_job_fire_creates_tracked_task_and_run(self, tmp_path):
+        from openjarvis.agents.manager import AgentManager
+        from openjarvis.agents.scheduler import AgentScheduler
+        from openjarvis.projects.store import ProjectStore
+
+        project_store = ProjectStore(tmp_path / "projects.db")
+        mgr = AgentManager(str(tmp_path / "agents.db"), project_store=project_store)
+        try:
+            chief = mgr.create_agent(
+                name="Chief",
+                agent_type="monitor_operative",
+                org_role="Chief Orchestrator",
+            )
+            mgr.set_chief_agent(chief["id"])
+            agent = mgr.create_agent(name="worker", agent_type="monitor_operative")
+            job = mgr.create_job(
+                agent["id"],
+                name="Morning review",
+                job_type="manual",
+                prompt="Review open work.",
+                required_capabilities=["job:run"],
+                delegation_policy={"enabled": True},
+            )
+            executor = MagicMock()
+            scheduler = AgentScheduler(manager=mgr, executor=executor)
+
+            run = scheduler.run_job_now(job["id"])
+
+            assert run["status"] == "completed"
+            assert run["task_id"]
+            task = mgr._get_task(run["task_id"])
+            assert task["assigned_by_agent_id"] == chief["id"]
+            assert task["progress"]["job_id"] == job["id"]
+            assert task["progress"]["delegation_policy"]["enabled"] is True
+            executor.execute_tick.assert_called_once_with(agent["id"])
+        finally:
+            mgr.close()
+            project_store.close()
+
+    def test_ifttt_job_fires_from_app_event(self, tmp_path):
+        from openjarvis.agents.manager import AgentManager
+        from openjarvis.agents.scheduler import AgentScheduler
+        from openjarvis.projects.store import ProjectStore
+
+        project_store = ProjectStore(tmp_path / "projects.db")
+        mgr = AgentManager(str(tmp_path / "agents.db"), project_store=project_store)
+        try:
+            agent = mgr.create_agent(name="worker", agent_type="monitor_operative")
+            job = mgr.create_job(
+                agent["id"],
+                name="On task complete",
+                job_type="if_this_then_that",
+                prompt="Summarize completed work.",
+                trigger={"event": "task.completed"},
+            )
+            executor = MagicMock()
+            scheduler = AgentScheduler(manager=mgr, executor=executor)
+
+            fired = scheduler.handle_app_event("task.completed", {"task_id": "t1"})
+
+            assert len(fired) == 1
+            assert fired[0]["job_id"] == job["id"]
+            executor.execute_tick.assert_called_once_with(agent["id"])
+        finally:
+            mgr.close()
+            project_store.close()

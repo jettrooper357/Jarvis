@@ -119,6 +119,16 @@ class AgentScheduler:
             return
         if self._bus:
             self._bus.subscribe(EventType.AGENT_TICK_END, self._on_tick_event)
+            for event_type in (
+                EventType.TASK_CREATED,
+                EventType.TASK_COMPLETED,
+                EventType.TASK_FAILED,
+                EventType.APP_LOGIN,
+                EventType.APP_LOGOFF,
+                EventType.PROJECT_STARTED,
+                EventType.PROJECT_COMPLETED,
+            ):
+                self._bus.subscribe(event_type, self._on_app_event)
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="agent-scheduler"
@@ -131,6 +141,16 @@ class AgentScheduler:
         self._stop_event.set()
         if self._bus:
             self._bus.unsubscribe(EventType.AGENT_TICK_END, self._on_tick_event)
+            for event_type in (
+                EventType.TASK_CREATED,
+                EventType.TASK_COMPLETED,
+                EventType.TASK_FAILED,
+                EventType.APP_LOGIN,
+                EventType.APP_LOGOFF,
+                EventType.PROJECT_STARTED,
+                EventType.PROJECT_COMPLETED,
+            ):
+                self._bus.unsubscribe(event_type, self._on_app_event)
         if self._thread is not None:
             self._thread.join(timeout=10)
             self._thread = None
@@ -143,6 +163,7 @@ class AgentScheduler:
         while not self._stop_event.is_set():
             try:
                 self._check_due_agents()
+                self._check_due_jobs()
                 self._check_task_backlog()
                 now = time.time()
                 if now - last_reconcile >= reconcile_interval:
@@ -198,6 +219,99 @@ class AgentScheduler:
             "error",
             "needs_attention",
         )
+
+    def run_job_now(self, job_id: str) -> dict[str, Any]:
+        """Materialize and execute a job immediately."""
+        return self._fire_job(job_id, event={"source": "manual"})
+
+    def _check_due_jobs(self) -> None:
+        for job in self._manager.list_due_jobs():
+            try:
+                if not self._job_condition_satisfied(job):
+                    self._manager.update_job(job["id"], trigger=job.get("trigger") or {})
+                    continue
+                self._fire_job(job["id"], event={"source": "schedule"})
+            except Exception:
+                logger.exception("Error firing job %s", job.get("id"))
+
+    def _job_condition_satisfied(self, job: dict[str, Any]) -> bool:
+        if job.get("job_type") != "if_this_then_that":
+            return True
+        trigger = job.get("trigger") or {}
+        condition = str(trigger.get("condition") or "").strip().casefold()
+        if condition in ("always", "true"):
+            return True
+        agent = self._manager.get_agent(job["agent_id"]) or {}
+        if condition.startswith("agent.status"):
+            expected = condition.split("==", 1)[-1].strip() if "==" in condition else ""
+            return bool(expected and str(agent.get("status") or "").casefold() == expected)
+        if condition == "has_runnable_task":
+            return bool(self._manager.has_runnable_task(job["agent_id"]))
+        # Unsupported predicates remain dormant until an allowlisted evaluator exists.
+        return False
+
+    def handle_app_event(self, event_name: str, payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Fire active IFTTT jobs whose trigger event matches ``event_name``."""
+        name = str(event_name or "").strip()
+        if not name:
+            return []
+        fired: list[dict[str, Any]] = []
+        for job in self._manager.list_jobs(status="active"):
+            if job.get("job_type") != "if_this_then_that":
+                continue
+            trigger = job.get("trigger") or {}
+            wanted = str(trigger.get("event") or trigger.get("event_name") or "").strip()
+            if wanted != name:
+                continue
+            fired.append(
+                self._fire_job(
+                    job["id"],
+                    event={"source": "app_event", "event_name": name, "payload": payload or {}},
+                )
+            )
+        return fired
+
+    def _on_app_event(self, event: Any) -> None:
+        raw_name = getattr(event, "event_type", "") or ""
+        event_name = str(getattr(raw_name, "value", raw_name))
+        try:
+            self.handle_app_event(event_name, getattr(event, "data", {}) or {})
+        except Exception:
+            logger.exception("Failed handling app event %s", event_name)
+
+    def _fire_job(self, job_id: str, event: dict[str, Any] | None = None) -> dict[str, Any]:
+        job = self._manager.get_job(job_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} not found")
+        agent = self._manager.get_agent(job["agent_id"])
+        if agent is None or not self._agent_can_run(agent):
+            raise ValueError(f"Agent for job {job_id} cannot run")
+
+        run = self._manager.start_job_run(job_id, event=event or {})
+        task_id = None
+        try:
+            chief = self._manager.get_chief_agent()
+            assigned_by = chief["id"] if chief else None
+            task = self._manager.materialize_job_task(
+                job_id,
+                assigned_by_agent_id=assigned_by,
+            )
+            task_id = task["id"]
+            self._executor.execute_tick(job["agent_id"])
+            return self._manager.finish_job_run(
+                run["id"],
+                status="completed",
+                task_id=task_id,
+                summary="Job fired and agent execution was queued.",
+            )
+        except Exception as exc:
+            self._manager.finish_job_run(
+                run["id"],
+                status="failed",
+                task_id=task_id,
+                error=str(exc),
+            )
+            raise
 
     def _check_task_backlog(self) -> None:
         """Keep idle agents moving while due uncompleted linked work exists."""

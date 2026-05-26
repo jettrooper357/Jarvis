@@ -107,6 +107,53 @@ CREATE TABLE IF NOT EXISTS agent_config_versions (
 );
 """
 
+_CREATE_AGENT_JOBS = """\
+CREATE TABLE IF NOT EXISTS agent_jobs (
+    id              TEXT PRIMARY KEY,
+    agent_id        TEXT NOT NULL REFERENCES managed_agents(id),
+    name            TEXT NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    job_type        TEXT NOT NULL,
+    trigger_json    TEXT NOT NULL DEFAULT '{}',
+    prompt          TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active',
+    next_run_at     REAL,
+    last_run_at     REAL,
+    cooldown_seconds INTEGER NOT NULL DEFAULT 0,
+    required_capabilities_json TEXT NOT NULL DEFAULT '[]',
+    approval_required_capabilities_json TEXT NOT NULL DEFAULT '[]',
+    delegation_policy_json TEXT NOT NULL DEFAULT '{}',
+    task_overrides_json TEXT NOT NULL DEFAULT '{}',
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
+"""
+
+_CREATE_AGENT_JOB_RUNS = """\
+CREATE TABLE IF NOT EXISTS agent_job_runs (
+    id              TEXT PRIMARY KEY,
+    job_id          TEXT NOT NULL REFERENCES agent_jobs(id),
+    agent_id        TEXT NOT NULL REFERENCES managed_agents(id),
+    task_id         TEXT,
+    status          TEXT NOT NULL,
+    started_at      REAL NOT NULL,
+    finished_at     REAL,
+    summary         TEXT NOT NULL DEFAULT '',
+    error           TEXT NOT NULL DEFAULT '',
+    event_json      TEXT NOT NULL DEFAULT '{}'
+);
+"""
+
+_CREATE_APP_EVENTS = """\
+CREATE TABLE IF NOT EXISTS app_event_types (
+    name            TEXT PRIMARY KEY,
+    description     TEXT NOT NULL DEFAULT '',
+    source          TEXT NOT NULL DEFAULT 'user',
+    payload_schema_json TEXT NOT NULL DEFAULT '{}',
+    created_at      REAL NOT NULL
+);
+"""
+
 _SUMMARY_MAX = 2000
 
 # System project that holds agent work not yet tied to a real project task.
@@ -167,6 +214,9 @@ class AgentManager:
         self._conn.executescript(_CREATE_MESSAGES)
         self._conn.executescript(_CREATE_LEARNING_LOG)
         self._conn.executescript(_CREATE_CONFIG_VERSIONS)
+        self._conn.executescript(_CREATE_AGENT_JOBS)
+        self._conn.executescript(_CREATE_AGENT_JOB_RUNS)
+        self._conn.executescript(_CREATE_APP_EVENTS)
         self._conn.commit()
         # Schema migrations for runtime columns
         _MIGRATIONS = [
@@ -1229,6 +1279,305 @@ class AgentManager:
         ).fetchone()
         return self._row_to_task(row) if row else None
 
+    # Agent Jobs
+
+    @staticmethod
+    def _json_list(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [part.strip() for part in value.split(",")]
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        out: List[str] = []
+        for item in value:
+            if isinstance(item, str):
+                cleaned = item.strip()
+                if cleaned and cleaned not in out:
+                    out.append(cleaned)
+        return out
+
+    @staticmethod
+    def _compute_job_next_run(job_type: str, trigger: Dict[str, Any]) -> Optional[float]:
+        kind = str(job_type or "").strip()
+        now = time.time()
+        if kind == "manual":
+            return None
+        if kind == "interval":
+            seconds = float(trigger.get("seconds") or trigger.get("interval_seconds") or 0)
+            return now + seconds if seconds > 0 else None
+        if kind == "once":
+            raw = str(trigger.get("run_at") or trigger.get("at") or "").strip()
+            if not raw:
+                return None
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return dt.timestamp() if dt.tzinfo is None else dt.astimezone(timezone.utc).timestamp()
+        if kind == "cron":
+            expr = str(trigger.get("cron") or trigger.get("expression") or "").strip()
+            if not expr:
+                return None
+            try:
+                from croniter import croniter
+
+                return croniter(expr, datetime.fromtimestamp(now)).get_next(datetime).timestamp()
+            except Exception:
+                return now + 3600
+        if kind == "if_this_then_that":
+            if trigger.get("event") or trigger.get("event_name"):
+                return None
+            seconds = float(trigger.get("poll_seconds") or 300)
+            return now + max(seconds, 30)
+        return None
+
+    def create_job(
+        self,
+        agent_id: str,
+        *,
+        name: str,
+        job_type: str,
+        prompt: str,
+        description: str = "",
+        trigger: Optional[Dict[str, Any]] = None,
+        status: str = "active",
+        cooldown_seconds: int = 0,
+        required_capabilities: Optional[List[str]] = None,
+        approval_required_capabilities: Optional[List[str]] = None,
+        delegation_policy: Optional[Dict[str, Any]] = None,
+        task_overrides: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not self.get_agent(agent_id):
+            raise ValueError(f"Agent not found: {agent_id}")
+        kind = str(job_type or "").strip()
+        if kind not in {"cron", "interval", "once", "manual", "if_this_then_that"}:
+            raise ValueError(f"Unsupported job type: {kind}")
+        job_id = uuid.uuid4().hex[:12]
+        now = time.time()
+        clean_trigger = trigger or {}
+        self._conn.execute(
+            "INSERT INTO agent_jobs "
+            "(id, agent_id, name, description, job_type, trigger_json, prompt, "
+            "status, next_run_at, cooldown_seconds, required_capabilities_json, "
+            "approval_required_capabilities_json, delegation_policy_json, "
+            "task_overrides_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                job_id,
+                agent_id,
+                name.strip(),
+                description.strip(),
+                kind,
+                json.dumps(clean_trigger),
+                prompt.strip(),
+                status,
+                self._compute_job_next_run(kind, clean_trigger),
+                int(cooldown_seconds or 0),
+                json.dumps(self._json_list(required_capabilities)),
+                json.dumps(self._json_list(approval_required_capabilities)),
+                json.dumps(delegation_policy or {}),
+                json.dumps(task_overrides or {}),
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+        from openjarvis.core.events import EventType
+
+        self._emit_task_event(EventType.JOB_CREATED, {"job_id": job_id, "agent_id": agent_id, "job_type": kind})
+        return self.get_job(job_id)  # type: ignore[return-value]
+
+    def list_jobs(self, agent_id: Optional[str] = None, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM agent_jobs WHERE 1 = 1"
+        params: List[Any] = []
+        if agent_id:
+            query += " AND agent_id = ?"
+            params.append(agent_id)
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY updated_at DESC"
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._row_to_job(r) for r in rows]
+
+    def list_due_jobs(self, *, now: Optional[float] = None) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM agent_jobs WHERE status = 'active' AND next_run_at IS NOT NULL AND next_run_at <= ?",
+            (now or time.time(),),
+        ).fetchall()
+        return [self._row_to_job(r) for r in rows]
+
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute("SELECT * FROM agent_jobs WHERE id = ?", (job_id,)).fetchone()
+        return self._row_to_job(row) if row else None
+
+    def update_job(self, job_id: str, **kwargs: Any) -> Dict[str, Any]:
+        current = self.get_job(job_id)
+        if current is None:
+            raise ValueError(f"Job not found: {job_id}")
+        sets: List[str] = []
+        vals: List[Any] = []
+        for key in ("name", "description", "job_type", "prompt", "status", "cooldown_seconds"):
+            if key in kwargs:
+                sets.append(f"{key} = ?")
+                vals.append(kwargs[key])
+        for key, column in (
+            ("trigger", "trigger_json"),
+            ("required_capabilities", "required_capabilities_json"),
+            ("approval_required_capabilities", "approval_required_capabilities_json"),
+            ("delegation_policy", "delegation_policy_json"),
+            ("task_overrides", "task_overrides_json"),
+        ):
+            if key in kwargs:
+                value = kwargs[key]
+                if key in ("required_capabilities", "approval_required_capabilities"):
+                    value = self._json_list(value)
+                sets.append(f"{column} = ?")
+                vals.append(json.dumps(value or ([] if key.endswith("capabilities") else {})))
+        if any(key in kwargs for key in ("job_type", "trigger", "status")):
+            merged_type = str(kwargs.get("job_type") or current["job_type"])
+            merged_trigger = kwargs.get("trigger") or current.get("trigger") or {}
+            next_run = self._compute_job_next_run(merged_type, merged_trigger)
+            sets.append("next_run_at = ?")
+            vals.append(next_run if kwargs.get("status", current["status"]) == "active" else None)
+        if not sets:
+            return current
+        sets.append("updated_at = ?")
+        vals.append(time.time())
+        vals.append(job_id)
+        self._conn.execute(f"UPDATE agent_jobs SET {', '.join(sets)} WHERE id = ?", vals)
+        self._conn.commit()
+        from openjarvis.core.events import EventType
+
+        event_type = EventType.JOB_PAUSED if kwargs.get("status") == "paused" else EventType.JOB_UPDATED
+        self._emit_task_event(event_type, {"job_id": job_id, "changed_keys": list(kwargs.keys())})
+        return self.get_job(job_id)  # type: ignore[return-value]
+
+    def delete_job(self, job_id: str) -> None:
+        self._conn.execute("DELETE FROM agent_jobs WHERE id = ?", (job_id,))
+        self._conn.commit()
+
+    def start_job_run(self, job_id: str, event: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        job = self.get_job(job_id)
+        if job is None:
+            raise ValueError(f"Job not found: {job_id}")
+        run_id = uuid.uuid4().hex[:12]
+        now = time.time()
+        self._conn.execute(
+            "INSERT INTO agent_job_runs (id, job_id, agent_id, status, started_at, event_json) VALUES (?, ?, ?, 'running', ?, ?)",
+            (run_id, job_id, job["agent_id"], now, json.dumps(event or {})),
+        )
+        self._conn.commit()
+        from openjarvis.core.events import EventType
+
+        self._emit_task_event(EventType.JOB_RUN_STARTED, {"job_id": job_id, "run_id": run_id, "agent_id": job["agent_id"]})
+        return self.get_job_run(run_id)  # type: ignore[return-value]
+
+    def finish_job_run(self, run_id: str, *, status: str, task_id: Optional[str] = None, summary: str = "", error: str = "") -> Dict[str, Any]:
+        finished = time.time()
+        self._conn.execute(
+            "UPDATE agent_job_runs SET status = ?, task_id = ?, finished_at = ?, summary = ?, error = ? WHERE id = ?",
+            (status, task_id, finished, summary, error, run_id),
+        )
+        row = self._conn.execute("SELECT job_id FROM agent_job_runs WHERE id = ?", (run_id,)).fetchone()
+        if row is not None:
+            job = self.get_job(row["job_id"])
+            if job is not None:
+                if status == "completed" and job["job_type"] == "once":
+                    self._conn.execute(
+                        "UPDATE agent_jobs SET status = 'completed', last_run_at = ?, next_run_at = NULL, updated_at = ? WHERE id = ?",
+                        (finished, finished, job["id"]),
+                    )
+                else:
+                    next_run = self._compute_job_next_run(job["job_type"], job["trigger"]) if job["status"] == "active" else None
+                    self._conn.execute(
+                        "UPDATE agent_jobs SET last_run_at = ?, next_run_at = ?, updated_at = ? WHERE id = ?",
+                        (finished, next_run, finished, job["id"]),
+                    )
+        self._conn.commit()
+        from openjarvis.core.events import EventType
+
+        event_type = EventType.JOB_RUN_FINISHED if status == "completed" else EventType.JOB_FAILED
+        self._emit_task_event(event_type, {"run_id": run_id, "status": status, "task_id": task_id, "error": error})
+        return self.get_job_run(run_id)  # type: ignore[return-value]
+
+    def get_job_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute("SELECT * FROM agent_job_runs WHERE id = ?", (run_id,)).fetchone()
+        return self._row_to_job_run(row) if row else None
+
+    def list_job_runs(self, job_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM agent_job_runs WHERE job_id = ? ORDER BY started_at DESC LIMIT ?",
+            (job_id, limit),
+        ).fetchall()
+        return [self._row_to_job_run(r) for r in rows]
+
+    def materialize_job_task(self, job_id: str, *, assigned_by_agent_id: Optional[str] = None) -> Dict[str, Any]:
+        job = self.get_job(job_id)
+        if job is None:
+            raise ValueError(f"Job not found: {job_id}")
+        task = self.create_task(
+            job["agent_id"],
+            description=f"[Job: {job['name']}] {job['prompt']}",
+            status="active",
+            assigned_by_agent_id=assigned_by_agent_id,
+        )
+        self.update_task(
+            task["id"],
+            progress={
+                "job_id": job["id"],
+                "job_name": job["name"],
+                "job_type": job["job_type"],
+                "delegation_policy": job.get("delegation_policy") or {},
+                "required_capabilities": job.get("required_capabilities") or [],
+            },
+        )
+        from openjarvis.core.events import EventType
+
+        self._emit_task_event(EventType.JOB_TRIGGERED, {"job_id": job_id, "agent_id": job["agent_id"], "task_id": task["id"]})
+        return self._get_task(task["id"]) or task
+
+    def register_app_event_type(
+        self,
+        name: str,
+        *,
+        description: str = "",
+        source: str = "user",
+        payload_schema: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        clean = str(name or "").strip()
+        if not clean:
+            raise ValueError("Event name is required")
+        now = time.time()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO app_event_types "
+            "(name, description, source, payload_schema_json, created_at) "
+            "VALUES (?, ?, ?, ?, COALESCE((SELECT created_at FROM app_event_types WHERE name = ?), ?))",
+            (
+                clean,
+                description.strip(),
+                source.strip() or "user",
+                json.dumps(payload_schema or {}),
+                clean,
+                now,
+            ),
+        )
+        self._conn.commit()
+        return self.get_app_event_type(clean)  # type: ignore[return-value]
+
+    def get_app_event_type(self, name: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM app_event_types WHERE name = ?", (name,)
+        ).fetchone()
+        return self._row_to_app_event_type(row) if row else None
+
+    def list_app_event_types(self) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM app_event_types ORDER BY name"
+        ).fetchall()
+        return [self._row_to_app_event_type(r) for r in rows]
+
     # ── Channel bindings ──────────────────────────────────────────
 
     def bind_channel(
@@ -1680,6 +2029,74 @@ class AgentManager:
             "requires_user_input": bool(_opt("requires_user_input") or 0),
             "requires_approval": bool(_opt("requires_approval") or 0),
             "task_session_id": _opt("task_session_id"),
+        }
+
+    @staticmethod
+    def _row_to_job(row: sqlite3.Row) -> Dict[str, Any]:
+        def _loads(name: str, default: Any) -> Any:
+            raw = row[name]
+            if not raw:
+                return default
+            try:
+                return json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                return default
+
+        return {
+            "id": row["id"],
+            "agent_id": row["agent_id"],
+            "name": row["name"],
+            "description": row["description"] or "",
+            "job_type": row["job_type"],
+            "trigger": _loads("trigger_json", {}),
+            "prompt": row["prompt"],
+            "status": row["status"],
+            "next_run_at": row["next_run_at"],
+            "last_run_at": row["last_run_at"],
+            "cooldown_seconds": row["cooldown_seconds"] or 0,
+            "required_capabilities": _loads("required_capabilities_json", []),
+            "approval_required_capabilities": _loads(
+                "approval_required_capabilities_json", []
+            ),
+            "delegation_policy": _loads("delegation_policy_json", {}),
+            "task_overrides": _loads("task_overrides_json", {}),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _row_to_job_run(row: sqlite3.Row) -> Dict[str, Any]:
+        raw_event = row["event_json"]
+        try:
+            event = json.loads(raw_event) if raw_event else {}
+        except (json.JSONDecodeError, TypeError):
+            event = {}
+        return {
+            "id": row["id"],
+            "job_id": row["job_id"],
+            "agent_id": row["agent_id"],
+            "task_id": row["task_id"],
+            "status": row["status"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "summary": row["summary"] or "",
+            "error": row["error"] or "",
+            "event": event,
+        }
+
+    @staticmethod
+    def _row_to_app_event_type(row: sqlite3.Row) -> Dict[str, Any]:
+        raw_schema = row["payload_schema_json"]
+        try:
+            payload_schema = json.loads(raw_schema) if raw_schema else {}
+        except (json.JSONDecodeError, TypeError):
+            payload_schema = {}
+        return {
+            "name": row["name"],
+            "description": row["description"] or "",
+            "source": row["source"] or "user",
+            "payload_schema": payload_schema,
+            "created_at": row["created_at"],
         }
 
     @staticmethod

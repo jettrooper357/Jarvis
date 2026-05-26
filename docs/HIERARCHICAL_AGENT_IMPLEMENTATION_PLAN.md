@@ -84,3 +84,18 @@ Create `docs/CHANGE_IMPACT_NOTICES/<slug>.md` and stop before any step that:
 - changes a user workflow without fallback,
 - replaces a subsystem,
 - makes subordinate agents directly user-facing for final completion.
+# Addendum: Agent Assigned Jobs
+
+Approved implementation added an additive Agent Jobs layer:
+- `agent_jobs` stores durable per-agent job definitions.
+- `agent_job_runs` stores append-only run history.
+- Job firing materializes tracked agent work and attributes it through the Chief when designated.
+- Jobs carry required capabilities and delegation policy so scheduled work can participate in the same capability/delegation model as agent tasks.
+- IFTTT jobs subscribe to app events, including login/logoff, task start/completion, project start/completion, and custom events registered through the app-event API.
+- Agent Overview includes a Jobs tab for creation and operations.
+- Existing agent schedule config remains intact for backward compatibility.
+
+Next hardening steps:
+- Broaden `if_this_then_that` predicates with explicit allowlisted payload condition evaluators.
+- Add approval gates for destructive job actions and high-risk delegated capabilities.
+- Add richer UI editing for existing job definitions and job run history drill-down.

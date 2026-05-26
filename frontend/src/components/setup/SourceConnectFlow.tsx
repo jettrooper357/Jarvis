@@ -296,8 +296,14 @@ function StepByStepPanel({
     for (const field of fields) {
       if (field.name === 'email') req.email = inputs.email;
       else if (field.name === 'password') req.password = inputs.password;
+      else if (field.name === 'client_id') req.client_id = inputs.client_id;
+      else if (field.name === 'client_secret') req.client_secret = inputs.client_secret;
       else if (field.name === 'token') req.token = inputs.token;
       else if (field.name === 'path') req.path = inputs.path;
+    }
+    if (req.client_id && req.client_secret) {
+      req.token = `${req.client_id}:${req.client_secret}`;
+      req.code = req.token;
     }
     // For email+password connectors, also set token as email:password
     if (req.email && req.password) {
@@ -384,6 +390,8 @@ function StepByStepPanel({
               onChange={(e) => updateInput(field.name, e.target.value)}
               placeholder={field.placeholder}
               type={field.type || 'text'}
+              autoComplete={field.autoComplete || (field.type === 'password' ? 'new-password' : 'off')}
+              name={field.name}
               style={{
                 width: '100%',
                 padding: '8px 10px',

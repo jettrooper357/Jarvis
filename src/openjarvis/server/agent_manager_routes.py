@@ -76,6 +76,46 @@ class UpdateTaskRequest(BaseModel):
     findings: Optional[List[Any]] = None
 
 
+class CreateJobRequest(BaseModel):
+    name: str
+    job_type: str
+    prompt: str
+    description: Optional[str] = ""
+    trigger: Optional[Dict[str, Any]] = None
+    status: str = "active"
+    cooldown_seconds: int = 0
+    required_capabilities: Optional[List[str]] = None
+    approval_required_capabilities: Optional[List[str]] = None
+    delegation_policy: Optional[Dict[str, Any]] = None
+    task_overrides: Optional[Dict[str, Any]] = None
+
+
+class UpdateJobRequest(BaseModel):
+    name: Optional[str] = None
+    job_type: Optional[str] = None
+    prompt: Optional[str] = None
+    description: Optional[str] = None
+    trigger: Optional[Dict[str, Any]] = None
+    status: Optional[str] = None
+    cooldown_seconds: Optional[int] = None
+    required_capabilities: Optional[List[str]] = None
+    approval_required_capabilities: Optional[List[str]] = None
+    delegation_policy: Optional[Dict[str, Any]] = None
+    task_overrides: Optional[Dict[str, Any]] = None
+
+
+class RegisterAppEventRequest(BaseModel):
+    name: str
+    description: Optional[str] = ""
+    source: str = "user"
+    payload_schema: Optional[Dict[str, Any]] = None
+
+
+class EmitAppEventRequest(BaseModel):
+    name: str
+    payload: Optional[Dict[str, Any]] = None
+
+
 class BindChannelRequest(BaseModel):
     channel_type: str
     config: Optional[Dict[str, Any]] = None
@@ -2268,6 +2308,86 @@ def create_agent_manager_router(
         manager.delete_task(task_id)
         return {"status": "deleted"}
 
+    @agents_router.get("/{agent_id}/jobs")
+    async def list_jobs(agent_id: str, status: Optional[str] = None):
+        if not manager.get_agent(agent_id):
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return {"jobs": manager.list_jobs(agent_id, status=status)}
+
+    @agents_router.post("/{agent_id}/jobs")
+    async def create_job(agent_id: str, req: CreateJobRequest):
+        try:
+            return manager.create_job(
+                agent_id,
+                name=req.name,
+                job_type=req.job_type,
+                prompt=req.prompt,
+                description=req.description or "",
+                trigger=req.trigger or {},
+                status=req.status,
+                cooldown_seconds=req.cooldown_seconds,
+                required_capabilities=req.required_capabilities,
+                approval_required_capabilities=req.approval_required_capabilities,
+                delegation_policy=req.delegation_policy,
+                task_overrides=req.task_overrides,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @agents_router.get("/{agent_id}/jobs/{job_id}")
+    async def get_job(agent_id: str, job_id: str):
+        job = manager.get_job(job_id)
+        if not job or job["agent_id"] != agent_id:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return job
+
+    @agents_router.patch("/{agent_id}/jobs/{job_id}")
+    async def update_job(agent_id: str, job_id: str, req: UpdateJobRequest):
+        job = manager.get_job(job_id)
+        if not job or job["agent_id"] != agent_id:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if hasattr(req, "model_fields_set"):
+            fields_set = req.model_fields_set
+        else:
+            fields_set = getattr(req, "__fields_set__", set())
+        updates = {
+            key: getattr(req, key)
+            for key in fields_set
+            if getattr(req, key) is not None
+        }
+        try:
+            return manager.update_job(job_id, **updates)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @agents_router.delete("/{agent_id}/jobs/{job_id}")
+    async def delete_job(agent_id: str, job_id: str):
+        job = manager.get_job(job_id)
+        if not job or job["agent_id"] != agent_id:
+            raise HTTPException(status_code=404, detail="Job not found")
+        manager.delete_job(job_id)
+        return {"status": "deleted"}
+
+    @agents_router.post("/{agent_id}/jobs/{job_id}/run")
+    async def run_job(agent_id: str, job_id: str, request: Request):
+        job = manager.get_job(job_id)
+        if not job or job["agent_id"] != agent_id:
+            raise HTTPException(status_code=404, detail="Job not found")
+        scheduler = getattr(request.app.state, "agent_scheduler", None)
+        if not scheduler or not hasattr(scheduler, "run_job_now"):
+            raise HTTPException(status_code=503, detail="Agent scheduler not available")
+        try:
+            return scheduler.run_job_now(job_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @agents_router.get("/{agent_id}/jobs/{job_id}/runs")
+    async def list_job_runs(agent_id: str, job_id: str, limit: int = 20):
+        job = manager.get_job(job_id)
+        if not job or job["agent_id"] != agent_id:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return {"runs": manager.list_job_runs(job_id, limit=limit)}
+
     # ── Channel bindings ─────────────────────────────────────
 
     @agents_router.get("/{agent_id}/channels")
@@ -2836,6 +2956,47 @@ def create_agent_manager_router(
             "total": len(all_agents),
             "by_status": dict(counts),
         }
+
+    @global_router.get("/v1/app-events")
+    def list_app_events():
+        builtins = [
+            {"name": "app.login", "description": "User logged in", "source": "builtin", "payload_schema": {}, "created_at": 0},
+            {"name": "app.logoff", "description": "User logged off", "source": "builtin", "payload_schema": {}, "created_at": 0},
+            {"name": "task.created", "description": "Task started or was created", "source": "builtin", "payload_schema": {}, "created_at": 0},
+            {"name": "task.completed", "description": "Task completed", "source": "builtin", "payload_schema": {}, "created_at": 0},
+            {"name": "project.started", "description": "Project started", "source": "builtin", "payload_schema": {}, "created_at": 0},
+            {"name": "project.completed", "description": "Project completed", "source": "builtin", "payload_schema": {}, "created_at": 0},
+        ]
+        custom = manager.list_app_event_types()
+        seen = {event["name"] for event in builtins}
+        return {"events": builtins + [event for event in custom if event["name"] not in seen]}
+
+    @global_router.post("/v1/app-events")
+    def register_app_event(req: RegisterAppEventRequest):
+        try:
+            return manager.register_app_event_type(
+                req.name,
+                description=req.description or "",
+                source=req.source,
+                payload_schema=req.payload_schema,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @global_router.post("/v1/app-events/emit")
+    def emit_app_event(req: EmitAppEventRequest, request: Request):
+        scheduler = getattr(request.app.state, "agent_scheduler", None)
+        if scheduler and hasattr(scheduler, "handle_app_event"):
+            fired = scheduler.handle_app_event(req.name, req.payload or {})
+        else:
+            fired = []
+        bus = getattr(request.app.state, "bus", None)
+        if bus:
+            try:
+                bus.publish(req.name, req.payload or {})
+            except Exception:
+                pass
+        return {"event": req.name, "fired_jobs": fired}
 
     @global_router.get("/v1/recommended-model")
     def recommended_model(request: Request):
