@@ -454,12 +454,20 @@ if you'd prefer different choices, picking them now avoids rework.
 | Phase | Status | Needs approval before code? |
 |---|---|---|
 | 2A — Foundational additions | **Shipped 2026-05-22** | No (purely additive) |
-| 2B — Capability Inspector + UI | **Shipped 2026-05-22** | No (purely additive) |
+| 2B — Capability Inspector + UI | **Shipped 2026-05-22** (backend); frontend not independently regression-tested in a browser | No (purely additive) |
 | 2C — Task lifecycle event emission | **Shipped 2026-05-22** | No (purely additive) |
-| 2D — Approval flow (data plane) | **Shipped 2026-05-22** — tool-dispatch enforcement still pending a CIN | No (purely additive) |
-| 2E — Chief as canonical ingress | **Shipped 2026-05-22** (CIN approved; flag live) | Yes — done |
-| 2F — Background delegation | Stop → CIN | **Yes** |
-| 2G — Worker session isolation | Stop → CIN, depends on 2F | **Yes** |
+| 2D — Approval flow (data plane + tool-dispatch enforcement) | **Shipped 2026-05-22** (data plane); **tool-dispatch enforcement shipped 2026-05-22** in `2f2d0c75` under CIN `approval-enforcement-at-tool-dispatch.md` | No (data plane); Yes — done (enforcement) |
+| 2E — Chief as canonical ingress | **Shipped 2026-05-22** under CIN `chief-as-canonical-ingress.md` (flag live) | Yes — done |
+| 2F — Background delegation | **Shipped 2026-05-22** in `2f2d0c75` (+`d69e6f1e` test hooks) under CIN `background-delegation-execution.md` | Yes — done |
+| 2G — Worker session isolation | **Shipped 2026-05-23** in `1d13e8a2` (+`d69e6f1e` test hooks) under CIN `worker-session-isolation.md` | Yes — done |
+
+### Post-Phase-2 follow-ups
+
+- **Addendum (Agent Assigned Jobs)** — CIN `agent-assigned-jobs.md` approved 2026-05-23; implementation landed in `db412a93` (2026-05-26). See the addendum in `docs/HIERARCHICAL_AGENT_IMPLEMENTATION_PLAN.md`.
+- **Known test issues at the time of this update:**
+  - One flake under random pytest order: `tests/server/test_phase2g_worker_session_isolation.py::test_two_concurrent_background_delegations_do_not_interleave`. Passes deterministically; flakes when preceded by `test_agent_manager_routes.py::TestResolveToolSpecs._registered_tools` fixture (importlib.reload chain corrupts mid-test module state). Functional behavior is sound — see end-to-end smoke. Root cause not yet pinned.
+  - `tests/security/test_capabilities.py` + `test_guardrails.py` fail on hosts where the `openjarvis_rust` extension is not built (mandatory per `_rust_bridge.py`). Build with `uv pip install -e rust/crates/openjarvis-python` after installing a Rust toolchain.
+  - 2 pre-existing `:memory:` SQLite path failures in `test_channel_bridge_deep_research.py`.
 
 ## Estimated sequencing (calendar-loose)
 
