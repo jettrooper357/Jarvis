@@ -299,6 +299,42 @@ class ChannelBridge:
             )
         return "Your sessions:\n" + "\n".join(lines)
 
+    def _resolve_default_chat_agent_id(self) -> Optional[str]:
+        """Pick the default managed chat agent, mirroring routes._resolve_managed_chat_agent.
+
+        Ranking: My Assistant > top-level Chief Orchestrator > any Chief
+        Orchestrator > sole top-level agent.
+        """
+        if self._agent_manager is None:
+            return None
+        try:
+            agents = self._agent_manager.list_agents()
+        except Exception:
+            logger.debug("list_agents failed during default resolution", exc_info=True)
+            return None
+        if not agents:
+            return None
+
+        def _rank(agent: dict) -> tuple[int, int]:
+            name = str(agent.get("name") or "").casefold()
+            role = str(agent.get("org_role") or "").casefold()
+            parent = str(agent.get("manager_agent_id") or "").strip()
+            text = f"{name} {role}"
+            if name == "my assistant":
+                return (0, 0)
+            if "chief orchestrator" in text and not parent:
+                return (1, 0)
+            if "chief orchestrator" in text:
+                return (2, 0)
+            if not parent:
+                return (3, 0)
+            return (9, 0)
+
+        ranked = sorted(agents, key=_rank)
+        if _rank(ranked[0])[0] >= 9:
+            return None
+        return str(ranked[0].get("id") or "") or None
+
     def _handle_chat(
         self,
         sender_id: str,
@@ -382,7 +418,9 @@ class ChannelBridge:
 
         # Per-agent binding: if this channel/chat_id has a bound agent,
         # route the message to that agent's runtime instead of the global
-        # default. Unmatched chats fall through to the existing path.
+        # default. Unmatched chats fall through to the managed-agent
+        # default resolution below (Chief Orchestrator), so channels behave
+        # the same as the chat page.
         if self._agent_runtime is not None and self._agent_manager is not None:
             try:
                 bindings = self._agent_manager.find_bindings_for_channel(
@@ -425,6 +463,32 @@ class ChannelBridge:
                             "Bound agent %s failed; falling back to default",
                             agent_id,
                         )
+
+        # No explicit binding — mirror the chat page (/v1/chat/completions)
+        # and route through the default managed chat agent (Chief
+        # Orchestrator) so channel users get the same tool access and
+        # delegation as the web chat. Required by the JARVIS Foundation
+        # Guide: the Chief is the only human-facing ingress.
+        if self._agent_runtime is not None and self._agent_manager is not None:
+            default_agent_id = self._resolve_default_chat_agent_id()
+            if default_agent_id:
+                try:
+                    response_text = self._agent_runtime.run(
+                        default_agent_id, content
+                    )
+                    formatted = self._format_response(
+                        sender_id, channel_type, response_text, max_length
+                    )
+                    self._session_store.append_message(
+                        sender_id, channel_type, "assistant", response_text
+                    )
+                    return formatted
+                except Exception:
+                    logger.exception(
+                        "Default managed chat agent %s failed; "
+                        "falling back to system.ask",
+                        default_agent_id,
+                    )
 
         # Try DeepResearchAgent first
         if self._deep_research_agent is not None:

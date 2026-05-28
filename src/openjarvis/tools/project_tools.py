@@ -32,6 +32,53 @@ def _default_task_dates() -> Dict[str, str]:
     }
 
 
+def _parse_iso_date(value: Any):
+    """Return a date from an ISO-ish string, or None if unparseable."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    # Accept date or datetime ISO strings.
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except ValueError:
+        try:
+            return datetime.strptime(text, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+
+def _sanitize_task_dates(
+    fields: Dict[str, Any],
+    *,
+    start_key: str = "start_date",
+    end_key: str = "due_date",
+) -> None:
+    """Replace LLM-supplied dates that are before today with the real date.
+
+    Older model snapshots (2024-cutoff) frequently emit dates from the
+    prior year even with a "today is ..." system-prompt anchor. Clamping
+    any past start/end to today / today+1 keeps Mission Control project
+    tasks anchored to the wall clock. When both start and end were
+    supplied and end >= start, the duration is preserved.
+    """
+    today = datetime.now().date()
+    start = _parse_iso_date(fields.get(start_key))
+    end = _parse_iso_date(fields.get(end_key))
+
+    if start and start < today:
+        if end and end >= start:
+            duration = end - start
+            fields[start_key] = today.isoformat()
+            fields[end_key] = (today + duration).isoformat()
+            return
+        fields[start_key] = today.isoformat()
+
+    if end:
+        new_start = _parse_iso_date(fields.get(start_key)) or today
+        if end < new_start:
+            fields[end_key] = (new_start + timedelta(days=1)).isoformat()
+
+
 def _clean_task_title(title: str) -> str:
     text = str(title or "").strip()
     # Strip delegation-prompt artifacts. The chief's delegation message has
@@ -206,6 +253,7 @@ class ProjectCreateTool(BaseTool):
             )
             if params.get(key) is not None
         }
+        _sanitize_task_dates(fields, start_key="start_date", end_key="target_date")
         project = _project_store().create_project(**fields)
         return ToolResult(
             tool_name=self.spec.name,
@@ -302,6 +350,7 @@ class ProjectCreateTaskTool(BaseTool):
         defaults = _default_task_dates()
         fields.setdefault("start_date", defaults["start_date"])
         fields.setdefault("due_date", defaults["due_date"])
+        _sanitize_task_dates(fields)
         try:
             task = _project_store().create_task(project_id, **fields)
         except KeyError:
@@ -479,6 +528,7 @@ class ProjectUpdateTaskTool(BaseTool):
                 success=False,
                 content="No fields to update were provided.",
             )
+        _sanitize_task_dates(fields)
         try:
             task = _project_store().update_task(task_id, **fields)
         except KeyError:
