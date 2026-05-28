@@ -33,6 +33,7 @@ import {
   type VoicesResponse,
 } from '../lib/api';
 import { VoiceCreator } from '../components/Settings/VoiceCreator';
+import { ShortcutsSettings } from '../components/Settings/ShortcutsSettings';
 
 function OllamaModelList() {
   const [models, setModels] = useState<Array<{ name: string; size: number }>>([]);
@@ -393,6 +394,14 @@ export function SettingsPage() {
             <SettingRow label="Web Search" description="SerpAPI or Tavily key for web search tool">
               <ApiKeyInput storageKey="openjarvis-search-key" placeholder="API key..." />
             </SettingRow>
+          </Section>
+
+          {/* Shortcuts */}
+          <Section title="Shortcuts">
+            <div className="text-xs mb-3" style={{ color: 'var(--color-text-tertiary)' }}>
+              Map phrases or regexes directly to a tool, skill, preset, or data source, then optionally rewrite the result through a post-processor prompt. Requires <code>shortcuts.enabled = true</code> in config to take effect at runtime.
+            </div>
+            <ShortcutsSettings />
           </Section>
 
           {/* Memory */}

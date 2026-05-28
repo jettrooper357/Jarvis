@@ -19,6 +19,7 @@ from openjarvis.server.connectors_router import (
 )
 from openjarvis.server.dashboard import dashboard_router
 from openjarvis.server.digest_routes import create_digest_router
+from openjarvis.server.shortcuts_router import create_shortcuts_router
 from openjarvis.server.projects_router import create_projects_router
 from openjarvis.server.routes import router
 from openjarvis.server.upload_router import router as upload_router
@@ -395,6 +396,7 @@ def create_app(
     app.include_router(create_connectors_router())
     app.include_router(create_projects_router())
     app.include_router(create_digest_router())
+    app.include_router(create_shortcuts_router())
     app.include_router(upload_router)
     uploads_dir = DEFAULT_CONFIG_DIR / "data" / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)

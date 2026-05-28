@@ -228,6 +228,40 @@ def _make_lightweight_system(
             cfg = load_config()
         host = cfg.engine.ollama.host if cfg else ""
         plain_engine = OllamaEngine(host=host) if host else OllamaEngine()
+
+        # Hydrate cloud keys and wrap with MultiEngine so cloud models
+        # (gpt-4o-mini, claude-*, gemini-*, etc.) reach the right
+        # provider instead of being pulled by Ollama. Without this,
+        # every chief or subordinate using a cloud model errors with
+        # "cloud model and cannot be pulled by Ollama".
+        try:
+            from openjarvis.security.cloud_keys import (
+                hydrate_env_from_cloud_keys,
+            )
+
+            hydrate_env_from_cloud_keys()
+        except Exception:
+            pass
+        import os as _os
+
+        _has_cloud = (
+            _os.environ.get("OPENAI_API_KEY")
+            or _os.environ.get("ANTHROPIC_API_KEY")
+            or _os.environ.get("GEMINI_API_KEY")
+            or _os.environ.get("GOOGLE_API_KEY")
+            or _os.environ.get("OPENROUTER_API_KEY")
+        )
+        if _has_cloud:
+            try:
+                from openjarvis.engine.cloud import CloudEngine
+                from openjarvis.engine.multi import MultiEngine
+
+                plain_engine = MultiEngine(
+                    [("ollama", plain_engine), ("cloud", CloudEngine())]
+                )
+            except Exception:
+                pass  # fall back to plain Ollama if cloud init fails
+
         # Wrap with InstrumentedEngine so agent ticks are recorded
         # in telemetry (FLOPs, energy, cost savings).
         try:

@@ -219,7 +219,17 @@ class GetTodaysNewsTool(BaseTool):
             category="search",
             timeout_seconds=8.0,
             required_capabilities=["network:fetch"],
-            metadata={"source": "news_rss"},
+            metadata={
+                "source": "news_rss",
+                "default_post_prompt": (
+                    "You are a concise news-caster. Rewrite the headlines "
+                    "below as a neutral, professional spoken briefing for "
+                    "the user. Keep proper names, organizations, and dates "
+                    "accurate. Group related items, drop duplicates, and "
+                    "skip filler. Target 4–6 sentences total. Do not add "
+                    "facts that are not present in the source items."
+                ),
+            },
         )
 
     def execute(self, **params: Any) -> ToolResult:

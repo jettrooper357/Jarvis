@@ -1306,6 +1306,48 @@ class ApprovalGatingConfig:
 
 
 @dataclass(slots=True)
+class ShortcutsConfig:
+    """Deterministic phrase → tool/skill/preset/datasource routing.
+
+    When ``enabled`` is True, the Chief Orchestrator consults the
+    shortcut registry before its first LLM round-trip on each turn. A
+    matching rule short-circuits the "decide what to do" call, runs the
+    target resolver, optionally rewrites the raw result through a
+    post-processor LLM, and feeds the result back to the Chief as a
+    synthesized ``execute_direct`` action. The Chief still owns task
+    lifecycle, events, and final delivery.
+
+    See ``docs/CHANGE_IMPACT_NOTICES/chat-shortcut-routing.md`` and
+    ``docs/superpowers/specs/2026-05-27-chat-shortcut-routing-design.md``.
+    """
+
+    enabled: bool = False
+    default_post_processor_model: str = ""
+    seed_builtin_rules_on_first_run: bool = True
+
+
+@dataclass(slots=True)
+class ChiefFunctionCallingConfig:
+    """Second chief mode using native OpenAI function-calling.
+
+    When ``enabled`` is True AND an agent's ``config.orchestrator_mode``
+    is ``"function_calling"``, ``_run_chief_turn`` dispatches to the
+    existing ``_run_function_calling`` loop instead of the hand-rolled
+    structured-JSON ``_run_chief`` parser. Tools are passed natively as
+    OpenAI function specs; the model's ``tool_calls`` are dispatched
+    directly. The pause path ("ask_user") is preserved via the
+    ``chief_ask_user`` meta-tool, which writes a checkpoint payload
+    byte-identical to the legacy chief mode so the existing
+    ``/chief-pending`` and ``/chief-resume`` routes continue to work.
+
+    Default off; opt-in per-agent via ``orchestrator_mode``. See
+    ``docs/CHANGE_IMPACT_NOTICES/chief-function-calling-mode.md``.
+    """
+
+    enabled: bool = False
+
+
+@dataclass(slots=True)
 class BackgroundDelegationConfig:
     """Phase 2F — background execution for immediate-kickoff delegation.
 
@@ -1481,6 +1523,10 @@ class JarvisConfig:
     background_delegation: BackgroundDelegationConfig = field(
         default_factory=BackgroundDelegationConfig
     )
+    chief_function_calling: ChiefFunctionCallingConfig = field(
+        default_factory=ChiefFunctionCallingConfig
+    )
+    shortcuts: ShortcutsConfig = field(default_factory=ShortcutsConfig)
     worker_session_isolation: WorkerSessionIsolationConfig = field(
         default_factory=WorkerSessionIsolationConfig
     )
@@ -1746,6 +1792,7 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
             "chief_ingress",
             "approval_gating",
             "background_delegation",
+            "chief_function_calling",
             "worker_session_isolation",
             "digest",
         )
@@ -2080,6 +2127,7 @@ __all__ = [
     "SecurityConfig",
     "ServerConfig",
     "SessionConfig",
+    "ShortcutsConfig",
     "SignalChannelConfig",
     "SlackChannelConfig",
     "SpeechConfig",

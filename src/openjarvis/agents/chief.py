@@ -310,6 +310,61 @@ def _parse_final_report(raw: Any) -> FinalReport:
     )
 
 
+def _repair_openai_tool_call_shape(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """Detect an OpenAI-shaped tool call and rewrite it as execute_direct.
+
+    Models trained on the OpenAI function-calling protocol (gpt-4o-mini,
+    most cloud-via-OpenAI shims) systematically emit one of these shapes
+    instead of the chief's bespoke action envelope:
+
+        {"name": "X", "arguments": {...}}
+        {"function": {"name": "X", "arguments": "..."}}
+        {"tool_calls": [{"function": {"name": "X", "arguments": "..."}}, ...]}
+        {"tool_calls": [{"name": "X", "arguments": {...}}, ...]}
+
+    Repairing on parse rather than retrying lets the chief act on the
+    first turn instead of looping until max_turns, which today produces
+    a 100+ second "No response was generated" failure. This is a narrow
+    backstop; the full fix is the function_calling orchestrator mode
+    proposed in docs/CHANGE_IMPACT_NOTICES/chief-function-calling-mode.md.
+    """
+    if obj.get("action"):
+        return obj
+    tool_calls: List[Dict[str, Any]] = []
+    raw_tool_calls = obj.get("tool_calls")
+    if isinstance(raw_tool_calls, list) and raw_tool_calls:
+        for tc in raw_tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+            name = str(fn.get("name", "")).strip()
+            args = fn.get("arguments")
+            if name:
+                tool_calls.append({
+                    "name": name,
+                    "arguments": args if args is not None else {},
+                })
+    elif isinstance(obj.get("function"), dict):
+        fn = obj["function"]
+        name = str(fn.get("name", "")).strip()
+        if name:
+            tool_calls.append({"name": name, "arguments": fn.get("arguments", {})})
+    elif obj.get("name") and "arguments" in obj:
+        name = str(obj["name"]).strip()
+        if name:
+            tool_calls.append({"name": name, "arguments": obj.get("arguments", {})})
+    if not tool_calls:
+        return obj
+    return {
+        "action": "execute_direct",
+        "reason": (
+            "repaired from OpenAI tool-call shape: "
+            + ", ".join(tc["name"] for tc in tool_calls)
+        ),
+        "tool_calls": tool_calls,
+    }
+
+
 def parse_action(text: str) -> OrchestratorAction:
     """Parse a model response into an :class:`OrchestratorAction`.
 
@@ -317,6 +372,7 @@ def parse_action(text: str) -> OrchestratorAction:
     or carries an unknown action value.
     """
     obj = _extract_json_object(text)
+    obj = _repair_openai_tool_call_shape(obj)
 
     action_raw = str(obj.get("action", "")).strip().lower()
     if not action_raw:

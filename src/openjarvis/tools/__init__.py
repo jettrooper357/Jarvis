@@ -152,7 +152,17 @@ except ImportError:
     pass
 
 try:
+    import openjarvis.tools.chief_ask_user  # noqa: F401
+except ImportError:
+    pass
+
+try:
     import openjarvis.tools.project_tools  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.project_import_outline  # noqa: F401
 except ImportError:
     pass
 

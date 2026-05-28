@@ -29,6 +29,7 @@ AUTO_COLLABORATION_TOOLS = (
     "managed_agent_list_tasks",
     "managed_agent_update_task",
     "managed_agent_inspect",
+    "chief_ask_user",
 )
 AUTO_INFORMATION_TOOLS = (
     "get_news",
@@ -37,6 +38,7 @@ AUTO_INFORMATION_TOOLS = (
 AUTO_PROJECT_TOOLS = (
     "project_create",
     "project_create_task",
+    "project_import_outline",
     "project_list",
     "project_update_task",
     "project_delete_task",

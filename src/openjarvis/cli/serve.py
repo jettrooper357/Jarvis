@@ -228,6 +228,19 @@ def serve(
     # and cloud models appear in the model list and can be used.
     import os
 
+    # Hydrate cloud keys from ~/.openjarvis/cloud-keys.env BEFORE the env
+    # check below. Otherwise users who only saved keys via the UI (never
+    # exported them in the launching shell) get a bare local engine, and
+    # cloud-model requests hit Ollama with "cannot be pulled" errors.
+    try:
+        from openjarvis.security.cloud_keys import (
+            hydrate_env_from_cloud_keys,
+        )
+
+        hydrate_env_from_cloud_keys()
+    except Exception as exc:
+        logger.debug("Cloud keys hydration failed: %s", exc)
+
     _has_cloud = (
         os.environ.get("OPENAI_API_KEY")
         or os.environ.get("ANTHROPIC_API_KEY")

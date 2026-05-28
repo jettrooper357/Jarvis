@@ -67,6 +67,7 @@ class OrchestratorAgent(ToolUsingAgent):
         confirm_callback=None,
         delegate_fn: Optional[Callable[[str, str], str]] = None,
         chief_registry: Optional[Mapping[str, Mapping[str, object]]] = None,
+        pre_turn_hook: Optional[Callable[[str], Any]] = None,
     ) -> None:
         super().__init__(
             engine,
@@ -85,6 +86,7 @@ class OrchestratorAgent(ToolUsingAgent):
         self._delegate_fn = delegate_fn
         self._chief_registry = chief_registry
         self._chief_call_counter = itertools.count(1)
+        self._pre_turn_hook = pre_turn_hook
 
     def run(
         self,
@@ -97,6 +99,56 @@ class OrchestratorAgent(ToolUsingAgent):
         if self._mode == "chief":
             return self._run_chief(input, context, **kwargs)
         return self._run_function_calling(input, context, **kwargs)
+
+    def _try_pre_turn_hook(self, user_input: str) -> Optional[AgentResult]:
+        """Consult ``pre_turn_hook`` (typically the shortcut router).
+
+        The hook returns one of:
+
+        - ``None`` — no shortcut handled this turn; run the normal Chief
+          path.
+        - An object with ``handled=True`` (a ``ShortcutOutcome``) — wrap
+          its ``content`` as an :class:`AgentResult` and return.
+        - An :class:`AgentResult` directly — pass through.
+
+        Errors in the hook are logged and swallowed so a bug in the
+        shortcut subsystem cannot break Chief inference.
+        """
+        if self._pre_turn_hook is None:
+            return None
+        try:
+            outcome = self._pre_turn_hook(user_input)
+        except Exception:
+            _chief_logger.exception("pre_turn_hook raised; falling back to Chief")
+            return None
+        if outcome is None:
+            return None
+        if isinstance(outcome, AgentResult):
+            return outcome
+        handled = bool(getattr(outcome, "handled", False))
+        fallback = bool(getattr(outcome, "fallback_to_chief", False))
+        if not handled or fallback:
+            return None
+        content = str(getattr(outcome, "content", "") or "")
+        metadata: dict[str, Any] = {
+            "shortcut": {
+                "rule_id": getattr(outcome, "rule_id", None),
+                "rule_name": getattr(outcome, "rule_name", None),
+                "target_kind": getattr(outcome, "target_kind", None),
+                "target_id": getattr(outcome, "target_id", None),
+                "success": bool(getattr(outcome, "success", False)),
+                "used_post_prompt": getattr(outcome, "used_post_prompt", None),
+                "used_post_model": getattr(outcome, "used_post_model", None),
+                "error": getattr(outcome, "error", None),
+            }
+        }
+        self._emit_turn_end(turns=0, content_length=len(content))
+        return AgentResult(
+            content=content,
+            tool_results=[],
+            turns=0,
+            metadata=metadata,
+        )
 
     # ------------------------------------------------------------------
     # Structured mode (THOUGHT/TOOL/INPUT/FINAL_ANSWER)
@@ -224,6 +276,15 @@ class OrchestratorAgent(ToolUsingAgent):
         **kwargs: Any,
     ) -> AgentResult:
         self._emit_turn_start(input)
+
+        # Shortcut routing: if a registered phrase/regex matches the
+        # incoming user message, skip the "decide what to do" LLM call
+        # and synthesize the final answer directly. The hook may return
+        # ``None`` to indicate fallback (no match, or rule policy says
+        # let the Chief run normally on resolver failure).
+        shortcut_result = self._try_pre_turn_hook(input)
+        if shortcut_result is not None:
+            return shortcut_result
 
         # Build initial messages
         messages = self._build_messages(input, context)
@@ -359,6 +420,65 @@ class OrchestratorAgent(ToolUsingAgent):
                     tool_result = self._executor.execute(tc)
                     all_tool_results.append(tool_result)
 
+                    # Chief function-calling mode: detect a pause signal from
+                    # the ``chief_ask_user`` meta-tool. Build a checkpoint
+                    # payload byte-identical to the legacy chief mode so
+                    # the existing ``/chief-pending`` and ``/chief-resume``
+                    # routes continue to work unchanged.
+                    meta = tool_result.metadata or {}
+                    if meta.get("chief_pause") is True:
+                        from openjarvis.core.types import _message_to_dict
+
+                        question = meta.get("question") or {}
+                        rendered = (
+                            tool_result.content
+                            or str(question.get("question", "") or "")
+                        )
+                        checkpoint = {
+                            "messages": [
+                                _message_to_dict(m) for m in messages
+                            ],
+                            "tool_results": [
+                                {
+                                    "tool_name": tr.tool_name,
+                                    "content": tr.content,
+                                    "success": tr.success,
+                                }
+                                for tr in all_tool_results
+                            ],
+                            "already_delegated": False,
+                            "turns": turns,
+                            "question": {
+                                "question": question.get("question", ""),
+                                "reason": question.get("reason", ""),
+                                "expected_response_type": question.get(
+                                    "expected_response_type", "free_text"
+                                ),
+                                "options": question.get("options") or [],
+                            },
+                        }
+                        self._emit_turn_end(
+                            turns=turns, chief_action="ask_user"
+                        )
+                        return AgentResult(
+                            content=rendered,
+                            tool_results=all_tool_results,
+                            turns=turns,
+                            metadata={
+                                "chief": {
+                                    "action": "ask_user",
+                                    "reason": question.get("reason", ""),
+                                    "expected_response_type": question.get(
+                                        "expected_response_type",
+                                        "free_text",
+                                    ),
+                                    "options": question.get("options")
+                                    or [],
+                                    "checkpoint": checkpoint,
+                                },
+                            },
+                        )
+
                     # Append tool response message
                     messages.append(
                         Message(
@@ -410,6 +530,172 @@ class OrchestratorAgent(ToolUsingAgent):
             all_tool_results=[],
             already_delegated=False,
             turns_so_far=0,
+        )
+
+    def resume_function_calling(
+        self,
+        *,
+        messages: List[Message],
+        tool_results: List[ToolResult],
+        turns_so_far: int,
+        user_answer: str,
+    ) -> AgentResult:
+        """Resume a function-calling chief that previously paused via
+        ``chief_ask_user``.
+
+        Appends ``user_answer`` as a new user message on top of the
+        restored conversation, then re-enters the function-calling loop
+        starting from ``turns_so_far``. Mirrors :meth:`resume_chief`.
+        """
+        self._emit_turn_start(f"[resume-fc] {str(user_answer)[:120]}")
+        new_messages = list(messages)
+        new_messages.append(Message(role=Role.USER, content=str(user_answer)))
+        return self._continue_function_calling(
+            messages=new_messages,
+            all_tool_results=list(tool_results),
+            turns_so_far=int(turns_so_far),
+        )
+
+    def _continue_function_calling(
+        self,
+        *,
+        messages: List[Message],
+        all_tool_results: List[ToolResult],
+        turns_so_far: int,
+    ) -> AgentResult:
+        """Run the function-calling loop with a pre-built message list.
+
+        Used by :meth:`resume_function_calling` to skip
+        :meth:`_build_messages` and start from a restored conversation.
+        """
+        openai_tools = (
+            self._executor.get_openai_tools() if self._tools else []
+        )
+        turns = turns_so_far
+        remaining = max(1, self._max_turns - turns_so_far)
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        content = ""
+        for _turn in range(remaining):
+            turns += 1
+            if self._loop_guard:
+                messages = self._loop_guard.compress_context(messages)
+            gen_kwargs: dict[str, Any] = {}
+            if openai_tools:
+                gen_kwargs["tools"] = openai_tools
+            result = self._generate(messages, **gen_kwargs)
+            usage = result.get("usage", {})
+            total_prompt_tokens += usage.get("prompt_tokens", 0)
+            total_completion_tokens += usage.get("completion_tokens", 0)
+            content = result.get("content", "")
+            raw_tool_calls = result.get("tool_calls", [])
+            if not raw_tool_calls:
+                content = self._check_continuation(result, messages)
+                content = self._strip_think_tags(content)
+                self._emit_turn_end(
+                    turns=turns, content_length=len(content)
+                )
+                return AgentResult(
+                    content=content,
+                    tool_results=all_tool_results,
+                    turns=turns,
+                    metadata={
+                        "prompt_tokens": total_prompt_tokens,
+                        "completion_tokens": total_completion_tokens,
+                        "total_tokens": total_prompt_tokens
+                        + total_completion_tokens,
+                    },
+                )
+            tool_calls = [
+                ToolCall(
+                    id=tc.get("id", f"call_{i}"),
+                    name=tc.get("name", ""),
+                    arguments=tc.get("arguments", "{}"),
+                )
+                for i, tc in enumerate(raw_tool_calls)
+            ]
+            messages.append(
+                Message(
+                    role=Role.ASSISTANT,
+                    content=content,
+                    tool_calls=tool_calls,
+                )
+            )
+            for tc in tool_calls:
+                tool_result = self._executor.execute(tc)
+                all_tool_results.append(tool_result)
+                meta = tool_result.metadata or {}
+                if meta.get("chief_pause") is True:
+                    from openjarvis.core.types import _message_to_dict
+
+                    question = meta.get("question") or {}
+                    rendered = (
+                        tool_result.content
+                        or str(question.get("question", "") or "")
+                    )
+                    checkpoint = {
+                        "messages": [
+                            _message_to_dict(m) for m in messages
+                        ],
+                        "tool_results": [
+                            {
+                                "tool_name": tr.tool_name,
+                                "content": tr.content,
+                                "success": tr.success,
+                            }
+                            for tr in all_tool_results
+                        ],
+                        "already_delegated": False,
+                        "turns": turns,
+                        "question": {
+                            "question": question.get("question", ""),
+                            "reason": question.get("reason", ""),
+                            "expected_response_type": question.get(
+                                "expected_response_type", "free_text"
+                            ),
+                            "options": question.get("options") or [],
+                        },
+                    }
+                    self._emit_turn_end(
+                        turns=turns, chief_action="ask_user"
+                    )
+                    return AgentResult(
+                        content=rendered,
+                        tool_results=all_tool_results,
+                        turns=turns,
+                        metadata={
+                            "chief": {
+                                "action": "ask_user",
+                                "reason": question.get("reason", ""),
+                                "expected_response_type": question.get(
+                                    "expected_response_type", "free_text"
+                                ),
+                                "options": question.get("options") or [],
+                                "checkpoint": checkpoint,
+                            },
+                        },
+                    )
+                messages.append(
+                    Message(
+                        role=Role.TOOL,
+                        content=tool_result.content,
+                        tool_call_id=tc.id,
+                        name=tc.name,
+                    )
+                )
+        final_content = self._strip_think_tags(content) if content else ""
+        self._emit_turn_end(turns=turns, max_turns_exceeded=True)
+        return AgentResult(
+            content=final_content
+            or "Maximum turns reached without a final answer.",
+            tool_results=all_tool_results,
+            turns=turns,
+            metadata={
+                "max_turns_exceeded": True,
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens,
+            },
         )
 
     def resume_chief(

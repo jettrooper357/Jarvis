@@ -227,6 +227,19 @@ class CloudEngine(InferenceEngine):
         self._init_clients()
 
     def _init_clients(self) -> None:
+        # Hydrate the process env from ~/.openjarvis/cloud-keys.env so a
+        # key the user saved through the Cloud Models tab is visible to
+        # us here. Does not overwrite an env value set at launch time.
+        try:
+            from openjarvis.security.cloud_keys import (
+                hydrate_env_from_cloud_keys,
+            )
+
+            hydrate_env_from_cloud_keys()
+        except Exception:
+            # Never let key hydration prevent engine init.
+            pass
+
         if os.environ.get("OPENAI_API_KEY"):
             try:
                 import openai

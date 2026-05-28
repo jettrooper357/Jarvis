@@ -38,28 +38,14 @@ _LOCAL_HF_ORGS = (
 
 
 def _load_keys() -> dict[str, str]:
-    """Read cloud-keys.env from disk every call so live updates are picked up."""
-    keys: dict[str, str] = {}
-    # File first, then fall back to process environment
-    if _CLOUD_ENV_FILE.exists():
-        for raw in _CLOUD_ENV_FILE.read_text().splitlines():
-            line = raw.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                keys[k.strip()] = v.strip()
-    # Process env can override (e.g. during testing)
-    for name in (
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "OPENROUTER_API_KEY",
-        "MINIMAX_API_KEY",
-    ):
-        val = os.environ.get(name)
-        if val:
-            keys[name] = val
-    return keys
+    """Read cloud-keys.env from disk every call so live updates are picked up.
+
+    Thin wrapper over :func:`openjarvis.security.cloud_keys.load_cloud_keys`
+    so this route and ``CloudEngine`` resolve keys identically.
+    """
+    from openjarvis.security.cloud_keys import load_cloud_keys
+
+    return load_cloud_keys(_CLOUD_ENV_FILE)
 
 
 def get_provider(model: str) -> str | None:

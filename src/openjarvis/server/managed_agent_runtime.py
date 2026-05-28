@@ -75,6 +75,99 @@ def _worker_session_isolation_enabled() -> bool:
         return False
 
 
+_SHORTCUT_REGISTRY_SINGLETON: Any = None
+_SHORTCUT_SEEDED: bool = False
+
+
+def _get_shortcut_registry(bus: Any) -> Any:
+    """Return a process-wide :class:`ShortcutRegistry`, seeding it once.
+
+    Returns ``None`` when shortcuts are disabled or the subsystem cannot
+    be imported. The registry is shared across chief construction calls
+    so cache invalidation works across both run paths.
+    """
+    global _SHORTCUT_REGISTRY_SINGLETON, _SHORTCUT_SEEDED
+    try:
+        from openjarvis.core.config import load_config
+
+        cfg = load_config()
+        if not getattr(cfg, "shortcuts", None) or not cfg.shortcuts.enabled:
+            return None
+    except Exception:
+        return None
+
+    if _SHORTCUT_REGISTRY_SINGLETON is None:
+        try:
+            from openjarvis.shortcuts.registry import ShortcutRegistry
+
+            _SHORTCUT_REGISTRY_SINGLETON = ShortcutRegistry(bus=bus)
+        except Exception:
+            return None
+
+    if not _SHORTCUT_SEEDED:
+        try:
+            if cfg.shortcuts.seed_builtin_rules_on_first_run:
+                from openjarvis.shortcuts.seed import ensure_seeded
+
+                ensure_seeded(_SHORTCUT_REGISTRY_SINGLETON)
+        except Exception:
+            pass
+        _SHORTCUT_SEEDED = True
+
+    return _SHORTCUT_REGISTRY_SINGLETON
+
+
+def _build_shortcut_hook(engine: Any, model: str, bus: Any) -> Any:
+    """Return a ``pre_turn_hook`` callable, or ``None`` when disabled."""
+    registry = _get_shortcut_registry(bus)
+    if registry is None:
+        return None
+    try:
+        from openjarvis.core.config import load_config
+        from openjarvis.shortcuts import try_shortcut
+
+        cfg = load_config()
+        global_post_model = (cfg.shortcuts.default_post_processor_model or "").strip()
+    except Exception:
+        return None
+
+    post_model = global_post_model or model
+
+    def _hook(user_message: str) -> Any:
+        return try_shortcut(
+            user_message,
+            registry=registry,
+            post_engine=engine,
+            post_model=post_model,
+            bus=bus,
+        )
+
+    return _hook
+
+
+def _chief_function_calling_enabled_for(agent_record: Dict[str, Any]) -> bool:
+    """True when this chief should run in OpenAI function-calling mode.
+
+    Requires BOTH the global ``[chief_function_calling].enabled`` flag
+    AND the per-agent ``config.orchestrator_mode == "function_calling"``
+    opt-in. Either missing falls back to the legacy structured-JSON
+    chief mode. See
+    ``docs/CHANGE_IMPACT_NOTICES/chief-function-calling-mode.md``.
+    """
+    config = agent_record.get("config", {}) or {}
+    if (
+        str(config.get("orchestrator_mode", "") or "").strip().lower()
+        != "function_calling"
+    ):
+        return False
+    try:
+        from openjarvis.core.config import load_config
+
+        return bool(load_config().chief_function_calling.enabled)
+    except Exception:
+        return False
+
+
 def get_managed_agent_context() -> ManagedAgentExecutionContext | None:
     """Return the current managed-agent tool execution context, if any."""
     return _execution_context.get()
@@ -1471,6 +1564,7 @@ class ManagedAgentRuntime:
 
         collected_tool_calls: List[Dict[str, Any]] = []
 
+        use_function_calling = _chief_function_calling_enabled_for(agent_record)
         chief = OrchestratorAgent(
             engine=self._engine,
             model=model,
@@ -1479,10 +1573,11 @@ class ManagedAgentRuntime:
             max_turns=int(config.get("max_turns", 6)),
             temperature=float(config.get("temperature", 0.2)),
             max_tokens=int(config.get("max_tokens", 1024)),
-            mode="chief",
+            mode="function_calling" if use_function_calling else "chief",
             chief_registry=registry,
             interactive=True,
             confirm_callback=lambda _prompt: True,
+            pre_turn_hook=_build_shortcut_hook(self._engine, model, self._bus),
         )
 
         original_execute = chief._executor.execute
@@ -1770,6 +1865,9 @@ class ManagedAgentRuntime:
             )
 
             with use_managed_agent_context(execution_context):
+                use_function_calling = _chief_function_calling_enabled_for(
+                    agent_record
+                )
                 chief = OrchestratorAgent(
                     engine=self._engine,
                     model=model,
@@ -1778,10 +1876,15 @@ class ManagedAgentRuntime:
                     max_turns=int(config.get("max_turns", 6)),
                     temperature=float(config.get("temperature", 0.2)),
                     max_tokens=int(config.get("max_tokens", 1024)),
-                    mode="chief",
+                    mode="function_calling"
+                    if use_function_calling
+                    else "chief",
                     chief_registry=registry,
                     interactive=True,
                     confirm_callback=lambda _prompt: True,
+                    pre_turn_hook=_build_shortcut_hook(
+                        self._engine, model, self._bus
+                    ),
                 )
 
                 # Wrap the chief's executor: dereference vault tokens
@@ -1839,13 +1942,21 @@ class ManagedAgentRuntime:
 
                 chief._executor.execute = _dereferencing_execute
 
-                result = chief.resume_chief(
-                    messages=messages,
-                    tool_results=tool_results,
-                    already_delegated=already_delegated,
-                    turns_so_far=turns_so_far,
-                    user_answer=chief_user_answer,
-                )
+                if use_function_calling:
+                    result = chief.resume_function_calling(
+                        messages=messages,
+                        tool_results=tool_results,
+                        turns_so_far=turns_so_far,
+                        user_answer=chief_user_answer,
+                    )
+                else:
+                    result = chief.resume_chief(
+                        messages=messages,
+                        tool_results=tool_results,
+                        already_delegated=already_delegated,
+                        turns_so_far=turns_so_far,
+                        user_answer=chief_user_answer,
+                    )
 
             response_text = result.content or ""
             # Scrub before persistence: the chief may have summarized
