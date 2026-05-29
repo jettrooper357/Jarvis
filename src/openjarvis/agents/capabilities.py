@@ -37,6 +37,7 @@ AUTO_INFORMATION_TOOLS = (
 )
 AUTO_PROJECT_TOOLS = (
     "project_create",
+    "project_update",
     "project_create_task",
     "project_import_outline",
     "project_list",

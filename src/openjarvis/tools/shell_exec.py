@@ -93,10 +93,22 @@ class ShellExecTool(BaseTool):
         if timeout > _MAX_TIMEOUT:
             timeout = _MAX_TIMEOUT
 
-        # Validate working_dir
+        # Validate working_dir. When a project workspace is active, the
+        # workspace root is the default cwd and any caller-supplied path
+        # must live inside it (or the call is rejected).
+        from openjarvis.projects.workspace import (
+            active_workspace_root,
+            is_within_workspace,
+        )
+
         working_dir = params.get("working_dir")
+        _ws_root = active_workspace_root()
+        if working_dir is None and _ws_root:
+            working_dir = _ws_root
         if working_dir is not None:
-            wd_path = Path(working_dir)
+            wd_path = Path(working_dir).expanduser()
+            if _ws_root and not wd_path.is_absolute():
+                wd_path = Path(_ws_root) / wd_path
             if not wd_path.exists():
                 return ToolResult(
                     tool_name="shell_exec",
@@ -109,6 +121,16 @@ class ShellExecTool(BaseTool):
                     content=f"Working directory is not a directory: {working_dir}",
                     success=False,
                 )
+            if not is_within_workspace(wd_path):
+                return ToolResult(
+                    tool_name="shell_exec",
+                    content=(
+                        f"Working directory {working_dir} is outside the "
+                        f"active project workspace ({_ws_root})."
+                    ),
+                    success=False,
+                )
+            working_dir = str(wd_path)
 
         # Build sanitised environment
         env: dict[str, str] = {}

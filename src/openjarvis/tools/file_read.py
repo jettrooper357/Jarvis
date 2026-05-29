@@ -48,7 +48,11 @@ class FileReadTool(BaseTool):
         )
 
     def _is_path_allowed(self, path: Path) -> bool:
-        """Check if path is within allowed directories."""
+        """Check if path is within allowed directories AND the active workspace."""
+        from openjarvis.projects.workspace import is_within_workspace
+
+        if not is_within_workspace(path):
+            return False
         if not self._allowed_dirs:
             return True
         resolved = path.resolve()
@@ -64,7 +68,12 @@ class FileReadTool(BaseTool):
                 content="No path provided.",
                 success=False,
             )
-        path = Path(file_path)
+        from openjarvis.projects.workspace import active_workspace_root
+
+        path = Path(file_path).expanduser()
+        _ws_root = active_workspace_root()
+        if _ws_root and not path.is_absolute():
+            path = Path(_ws_root) / path
         # Block sensitive files (secrets, credentials, keys)
         from openjarvis.security.file_policy import is_sensitive_file
 

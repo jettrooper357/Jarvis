@@ -78,6 +78,12 @@ type GanttItem = {
   milestone?: number;
   // Optional grouping label for tasks/subtasks. null/undefined = uncategorized.
   category?: string;
+  // Raw ISO date strings from the store so the edit dialog shows real
+  // values instead of hard-coded placeholders and round-trips them on save.
+  startDate?: string | null;
+  dueDate?: string | null;
+  // Project-only: filesystem path where agents do work for this project.
+  workingFolder?: string;
 };
 
 const weeks = [
@@ -233,6 +239,9 @@ function buildGanttData(
       accent: STATUS_ACCENT[pStatus],
       level: 0,
       type: 'project',
+      startDate: p.start_date,
+      dueDate: p.target_date,
+      workingFolder: p.working_folder ?? '',
     });
     const tasks = tasksByProject[p.id] ?? [];
     const byId = new Map(tasks.map((t) => [t.id, t]));
@@ -265,6 +274,8 @@ function buildGanttData(
         parentId: t.parent_task_id || p.id,
         blocker: t.status === 'Blocked',
         category: (t.category || '').trim() || undefined,
+        startDate: t.start_date,
+        dueDate: t.due_date,
       });
     }
     milestonesByProject[p.id] = (p.milestones ?? []).map(
@@ -608,7 +619,10 @@ function EditItemModal({
             </span>
             <input
               type="date"
-              defaultValue="2025-04-22"
+              value={(draft.startDate ?? '').slice(0, 10)}
+              onChange={(event) =>
+                set('startDate', event.target.value || null)
+              }
               className="w-full rounded-md px-3 py-2 text-sm text-slate-100"
               style={{
                 background: 'rgba(0,0,0,.34)',
@@ -620,7 +634,10 @@ function EditItemModal({
             <span className="mb-1 block text-xs text-slate-500">End date</span>
             <input
               type="date"
-              defaultValue="2025-05-23"
+              value={(draft.dueDate ?? '').slice(0, 10)}
+              onChange={(event) =>
+                set('dueDate', event.target.value || null)
+              }
               className="w-full rounded-md px-3 py-2 text-sm text-slate-100"
               style={{
                 background: 'rgba(0,0,0,.34)',
@@ -628,6 +645,31 @@ function EditItemModal({
               }}
             />
           </label>
+          {item.type === 'project' && (
+            <label className="md:col-span-2">
+              <span className="mb-1 block text-xs text-slate-500">
+                Working folder
+              </span>
+              <input
+                type="text"
+                value={draft.workingFolder ?? ''}
+                onChange={(event) =>
+                  set('workingFolder', event.target.value)
+                }
+                placeholder="e.g. F:\\Work\\my-project"
+                className="w-full rounded-md px-3 py-2 text-sm text-slate-100"
+                style={{
+                  background: 'rgba(0,0,0,.34)',
+                  border: '1px solid rgba(74,210,255,.18)',
+                }}
+              />
+              <span className="mt-1 block text-[10px] text-slate-500">
+                Agents working on this project are sandboxed to this
+                folder for file, shell, and patch tools. Auto-created
+                if missing.
+              </span>
+            </label>
+          )}
           <label className="md:col-span-2">
             <span className="mb-1 block text-xs text-slate-500">Notes</span>
             <textarea
@@ -2496,6 +2538,9 @@ export function ProjectsPage() {
             owner: next.agent === 'Unassigned' ? '' : next.agent,
             progress: next.progress,
             status: STATUS_TO_PROJECT[next.status],
+            start_date: next.startDate ?? null,
+            target_date: next.dueDate ?? null,
+            working_folder: next.workingFolder ?? '',
           }),
         next.id,
       );
@@ -2509,6 +2554,8 @@ export function ProjectsPage() {
           assigned_to: next.agent === 'Unassigned' ? '' : next.agent,
           percent_complete: next.progress,
           category: next.category ?? '',
+          start_date: next.startDate ?? null,
+          due_date: next.dueDate ?? null,
         }),
       next.id,
     );

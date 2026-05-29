@@ -705,3 +705,122 @@ def test_runtime_publishes_agent_events_for_external_turns():
             assert all(event.data.get("agent_id") == agent["id"] for event in relevant)
         finally:
             manager.close()
+
+
+# A representative paste: the intro line names the target project, then a
+# multi-level Category / Task / SubTask breakdown (including the common
+# "Catgory:" typo and a colon inside a subtask value).
+_VERIDEX_OUTLINE = """add this to the Veridex Project - Lowest level is a \
+Category, Second level is a Task (Task:), the third level is a subtask (like \
+SubTask:)
+Category: Project Initiation and Planning
+
+Task: Define Product Foundation
+
+SubTask: Confirm final product name: Veridex
+SubTask: Confirm app purpose and target users
+SubTask: Confirm MVP scope
+
+Task: Define User Personas
+
+SubTask: Create persona for debate user
+SubTask: Create persona for researcher
+
+Category: Requirements and Documentation
+
+Task: Finalize PRD
+
+SubTask: Review full PRD
+SubTask: Validate feature list
+
+Catgory: Testing and Quality Assurance
+
+Task: Unit Testing
+
+SubTask: Test claim services
+SubTask: Test evidence services
+"""
+
+
+def _assert_veridex_imported(project_store) -> dict:
+    project = next(
+        (p for p in project_store.list_projects() if p["name"] == "Veridex"),
+        None,
+    )
+    assert project is not None, "expected a 'Veridex' project to be created"
+    categories = set(project_store.list_categories(project["id"]))
+    assert {
+        "Project Initiation and Planning",
+        "Requirements and Documentation",
+        "Testing and Quality Assurance",
+    } <= categories
+    tasks = project_store.list_tasks(project["id"])
+    top_level = [t for t in tasks if not t["parent_task_id"]]
+    subtasks = [t for t in tasks if t["parent_task_id"]]
+    # Exactly the four Task: rows — no extra task materialized on top.
+    assert len(top_level) == 4
+    assert len(subtasks) == 9
+    return project
+
+
+def test_chief_bulk_outline_imports_without_model_round_trip(tmp_path):
+    project_store = ProjectStore(tmp_path / "projects.db")
+    manager = AgentManager(
+        db_path=str(tmp_path / "agents.db"),
+        project_store=project_store,
+    )
+    try:
+        chief = manager.create_agent(
+            name="Chief Orchestrator",
+            agent_type="simple",
+            org_role="Chief Orchestrator",
+            config={"orchestrator_mode": "chief", "max_turns": 4},
+        )
+        # If the model is ever consulted the test should fail loudly; the
+        # outline is far too large to echo back as a tool argument.
+        engine = FakeEngine([{"content": "MODEL SHOULD NOT BE CALLED"}])
+        runtime = ManagedAgentRuntime(manager, engine, default_model="fake-model")
+
+        response = runtime.run(chief["id"], _VERIDEX_OUTLINE)
+
+        _assert_veridex_imported(project_store)
+        assert engine.call_count == 0
+        assert "Imported" in response
+        assert "Veridex" in response
+    finally:
+        manager.close()
+        project_store.close()
+
+
+def test_standard_agent_bulk_outline_imports_and_records_tool_call(tmp_path):
+    project_store = ProjectStore(tmp_path / "projects.db")
+    manager = AgentManager(
+        db_path=str(tmp_path / "agents.db"),
+        project_store=project_store,
+    )
+    try:
+        workflow_manager = manager.create_agent(
+            name="Workflow Manager",
+            agent_type="monitor_operative",
+            org_role="Workflow Manager",
+            config={"max_turns": 4},
+        )
+        engine = FakeEngine([{"content": "MODEL SHOULD NOT BE CALLED"}])
+        runtime = ManagedAgentRuntime(manager, engine, default_model="fake-model")
+
+        response = runtime.run(workflow_manager["id"], _VERIDEX_OUTLINE)
+
+        _assert_veridex_imported(project_store)
+        assert engine.call_count == 0
+        assert "Imported" in response
+
+        replies = [
+            msg
+            for msg in manager.list_messages(workflow_manager["id"])
+            if msg["direction"] == "agent_to_user"
+        ]
+        assert replies[0]["tool_calls"][0]["tool"] == "project_import_outline"
+        assert replies[0]["tool_calls"][0]["success"] is True
+    finally:
+        manager.close()
+        project_store.close()

@@ -145,6 +145,9 @@ def _format_project(project: Dict[str, Any]) -> str:
     description = str(project.get("description", "") or "").strip()
     if description:
         parts.append(f"description={_truncate(description)}")
+    working_folder = str(project.get("working_folder", "") or "").strip()
+    if working_folder:
+        parts.append(f"working_folder={working_folder}")
     return " | ".join(parts)
 
 
@@ -225,6 +228,15 @@ class ProjectCreateTool(BaseTool):
                         "type": "string",
                         "description": "Optional ISO target date.",
                     },
+                    "working_folder": {
+                        "type": "string",
+                        "description": (
+                            "Filesystem path where agents do work for "
+                            "this project. Auto-created if missing. "
+                            "All file/shell/git tool calls for this "
+                            "project are sandboxed to this directory."
+                        ),
+                    },
                 },
                 "required": ["name"],
             },
@@ -250,6 +262,7 @@ class ProjectCreateTool(BaseTool):
                 "team",
                 "start_date",
                 "target_date",
+                "working_folder",
             )
             if params.get(key) is not None
         }
@@ -368,6 +381,113 @@ class ProjectCreateTaskTool(BaseTool):
                 "project_task_id": task["id"],
                 "task": task,
             },
+        )
+
+
+@ToolRegistry.register("project_update")
+class ProjectUpdateTool(BaseTool):
+    """Update fields on an existing project (incl. working folder)."""
+
+    tool_id = "project_update"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="project_update",
+            description=(
+                "Update fields on an existing project. Use this to set "
+                "or change the working_folder where agents do work for "
+                "the project, or to update name/description/status/etc."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project ID to update.",
+                    },
+                    "name": {"type": "string", "description": "New name."},
+                    "description": {
+                        "type": "string",
+                        "description": "New description.",
+                    },
+                    "owner": {"type": "string", "description": "Owner."},
+                    "status": {"type": "string", "description": "Status."},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Tags.",
+                    },
+                    "team": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Team members.",
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "ISO start date.",
+                    },
+                    "target_date": {
+                        "type": "string",
+                        "description": "ISO target date.",
+                    },
+                    "working_folder": {
+                        "type": "string",
+                        "description": (
+                            "Filesystem path where agents do work for "
+                            "this project. Auto-created if missing. "
+                            "Empty string clears it."
+                        ),
+                    },
+                },
+                "required": ["project_id"],
+            },
+            category="project",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        project_id = str(params.get("project_id", "") or "").strip()
+        if not project_id:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content="project_id is required.",
+            )
+        fields = {
+            key: params.get(key)
+            for key in (
+                "name",
+                "description",
+                "owner",
+                "status",
+                "tags",
+                "team",
+                "start_date",
+                "target_date",
+                "working_folder",
+            )
+            if params.get(key) is not None
+        }
+        if not fields:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content="No fields to update were provided.",
+            )
+        _sanitize_task_dates(fields, start_key="start_date", end_key="target_date")
+        try:
+            project = _project_store().update_project(project_id, **fields)
+        except KeyError:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content=f"Project not found: {project_id}",
+            )
+        return ToolResult(
+            tool_name=self.spec.name,
+            success=True,
+            content=f"Updated project: {_format_project(project)}",
+            metadata={"project_id": project["id"], "project": project},
         )
 
 

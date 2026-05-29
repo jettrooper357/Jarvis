@@ -127,9 +127,32 @@ instead of only answering from knowledge:
 - `project_add_category`, `project_rename_category` (propagates to every
   task using the old name), `project_delete_category` (tasks become
   uncategorized; the tasks are kept)
+- `project_import_outline` — bulk-import a whole multi-level work breakdown
+  (Categories, Tasks, Subtasks) in **one** call instead of looping
+  `project_create_task`
 
 These act on the same SQLite `ProjectStore` as the UI and REST API, so
 changes show up everywhere.
+
+### Pasting a big outline into chat
+
+You can paste a whole project breakdown into the chat and have it imported
+in one shot. Two grammars are accepted:
+
+- **Prefixed labels** — `Category: <name>`, `Task: <name>`,
+  `SubTask: <name>` (case-insensitive; the common `Catgory:` typo is
+  tolerated). Name the destination project in your intro line, e.g.
+  *"add this to the Veridex project"*.
+- **Numbered Markdown** — `N.` is a Category, `N.M` is a Task, and `*`/`-`
+  bullets are Subtasks.
+
+When the runtime sees a multi-level outline, it imports it **deterministically
+server-side** — the model is not asked to echo the (potentially huge) outline
+back as a tool argument, which previously overflowed the token budget and left
+the chat with no reply. The Chief still delivers the import summary, and the
+`project_import_outline` call shows up in the conversation/event log. If no
+target project name can be found in the message, the request falls back to the
+normal model turn.
 
 ### `project-status-report` skill
 

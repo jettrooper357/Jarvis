@@ -1524,6 +1524,51 @@ async def _stream_managed_agent(
         except Exception as _qs_exc:
             logger.warning("Log query_start failed: %s", _qs_exc)
 
+        # Deterministic fast path: a pasted multi-level outline is imported
+        # server-side. A large outline cannot be echoed back by the model as
+        # a project_import_outline argument within max_tokens, so the chat
+        # would otherwise burn its whole turn budget and stream no reply
+        # (the "No response was generated" symptom). Reuses the runtime's
+        # shared detector + importer so channel/delegation and chat agree.
+        outline_summary = managed_runtime._maybe_import_bulk_outline(
+            agent_record=agent_record,
+            user_content=user_content,
+            collected_tool_calls=collected_tool_calls,
+        )
+        if outline_summary is not None:
+            for _call in collected_tool_calls:
+                _start = json.dumps(
+                    {"tool": _call["tool"], "arguments": _call["arguments"]}
+                )
+                yield f"event: tool_call_start\ndata: {_start}\n\n"
+                _end = json.dumps(
+                    {
+                        "tool": _call["tool"],
+                        "success": _call["success"],
+                        "latency": _call["latency"],
+                        "result": _call["result"],
+                    }
+                )
+                yield f"event: tool_call_end\ndata: {_end}\n\n"
+            for _i, _word in enumerate(outline_summary.split(" ")):
+                yield _sse_chunk(
+                    chunk_id, model, _word if _i == 0 else " " + _word
+                )
+            collected_content = outline_summary
+            persist_state["content"] = collected_content
+            persist_state["tool_calls"] = list(collected_tool_calls)
+            final_data = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "model": model,
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": "stop"}
+                ],
+            }
+            yield f"data: {json.dumps(final_data)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
         while turns < max_turns:
             turns += 1
             turn_content = ""

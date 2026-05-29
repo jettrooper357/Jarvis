@@ -462,6 +462,94 @@ def _default_chat_project_task_dates() -> Dict[str, str]:
     }
 
 
+_OUTLINE_TASK_RE = re.compile(
+    r"^\s*(?:task|sub[\s\-_]?task)\s*:",
+    re.IGNORECASE | re.MULTILINE,
+)
+_OUTLINE_CATEGORY_RE = re.compile(
+    r"^\s*cat[ea]?gor(?:y|ies)\s*:",
+    re.IGNORECASE | re.MULTILINE,
+)
+_OUTLINE_NUMBERED_RE = re.compile(r"^\s*\d+\.\d+\s+\S", re.MULTILINE)
+
+
+def _looks_like_bulk_outline(text: str) -> bool:
+    """True when the user's message is a multi-level project outline.
+
+    Triggers when there are at least 3 ``Task:`` / ``SubTask:`` lines, or
+    at least 3 numbered ``N.M`` task lines. Either grammar is what
+    ``project_import_outline`` accepts.
+    """
+    if not text:
+        return False
+    label_hits = len(_OUTLINE_TASK_RE.findall(text))
+    if label_hits >= 3 and _OUTLINE_CATEGORY_RE.search(text):
+        return True
+    if label_hits >= 5:
+        return True
+    if len(_OUTLINE_NUMBERED_RE.findall(text)) >= 3:
+        return True
+    return False
+
+
+def _prepend_outline_routing_hint(text: str) -> str:
+    """Steer the chief toward project_import_outline for bulk outlines.
+
+    gpt-4o-mini and similar small models ignore tool-description hints
+    when the user payload is huge. A short, explicit instruction at the
+    top of the user content reliably wins.
+    """
+    if not _looks_like_bulk_outline(text):
+        return text
+    hint = (
+        "[ROUTING HINT — system-injected]\n"
+        "The message below is a multi-level project outline with many "
+        "Category / Task / SubTask items. You MUST handle it with a "
+        "single project_import_outline tool call that passes the FULL "
+        "outline verbatim in the `outline` parameter, plus `project_name` "
+        "(extracted from the user's intro line) and `create_if_missing=true`. "
+        "Do NOT call project_create_task in a loop for each subtask — "
+        "that exhausts the turn budget and produces no reply.\n"
+        "---\n"
+    )
+    return hint + text
+
+
+_OUTLINE_PROJECT_NAME_RES = (
+    # "...add this to the Veridex Project ..." / "in the Iron Saints project"
+    re.compile(
+        r"\b(?:to|into|in|on|under|for)\s+(?:the\s+)?"
+        r"(?P<name>[A-Za-z0-9][A-Za-z0-9 &'._-]*?)\s+projects?\b",
+        re.IGNORECASE,
+    ),
+    # "...project called Veridex" / "project named Veridex"
+    re.compile(
+        r"\bprojects?\s+(?:called|named|titled)\s+"
+        r"(?P<name>[A-Za-z0-9][A-Za-z0-9 &'._-]*)",
+        re.IGNORECASE,
+    ),
+)
+_OUTLINE_NAME_STOPWORDS = {"this", "the", "a", "an", "new", "that", "it"}
+
+
+def _extract_outline_project_name(text: str) -> str:
+    """Pull the target project name from a bulk-outline intro line.
+
+    Only the head of the message is scanned: users name the destination
+    project in the intro ("add this to the Veridex Project ..."), so this
+    avoids false matches against Category/Task lines deeper in the body.
+    Returns "" when no clear project name is present.
+    """
+    head = str(text or "")[:400]
+    for pattern in _OUTLINE_PROJECT_NAME_RES:
+        match = pattern.search(head)
+        if match:
+            name = match.group("name").strip(" .,:;-\"'")
+            if name and name.casefold() not in _OUTLINE_NAME_STOPWORDS:
+                return name
+    return ""
+
+
 _MULTI_TASK_RE = re.compile(
     r"\b("
     r"(?:create|add|make|open)\s+(?:two|three|four|five|\d+)\s+tasks?"
@@ -721,6 +809,39 @@ class ManagedAgentRuntime:
         tools_allowed: Optional[Sequence[str]] = None,
         task_session_id: Optional[str] = None,
     ) -> str:
+        """Run the agent inside its project workspace sandbox, if any.
+
+        When the agent has a linked project task whose project has a
+        ``working_folder`` configured, filesystem and shell tools called
+        during this run are sandboxed to that folder.
+        """
+        from openjarvis.projects.workspace import use_workspace
+
+        workspace = self._active_project_workspace(agent_id)
+        with use_workspace(workspace):
+            return self._run_locked(
+                agent_id,
+                user_content,
+                parent_agent_id=parent_agent_id,
+                visited_agent_ids=visited_agent_ids,
+                parent_trace_id=parent_trace_id,
+                run_id=run_id,
+                tools_allowed=tools_allowed,
+                task_session_id=task_session_id,
+            )
+
+    def _run_locked(
+        self,
+        agent_id: str,
+        user_content: str,
+        *,
+        parent_agent_id: str = "",
+        visited_agent_ids: Optional[Sequence[str]] = None,
+        parent_trace_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        tools_allowed: Optional[Sequence[str]] = None,
+        task_session_id: Optional[str] = None,
+    ) -> str:
         # Phase 2G — scope the active per-task session id for this call.
         # Only takes effect when worker_session_isolation is enabled AND a
         # non-empty session id is supplied; otherwise the contextvar is
@@ -942,6 +1063,31 @@ class ManagedAgentRuntime:
 
     # ── Project-task writeback (Mission Control) ──────────────────
 
+    def _active_project_workspace(self, agent_id: str) -> str:
+        """Return the working folder of the agent's active project, or ''.
+
+        Looks up the agent's most relevant linked project task, follows
+        the project reference, and returns its ``working_folder``. Used
+        to scope filesystem/shell tools to a per-project sandbox.
+        """
+        try:
+            link = self._linked_project_task(agent_id)
+        except Exception:
+            return ""
+        if not link or not link.get("project_task_id"):
+            return ""
+        try:
+            ps = self._manager._project_store()
+            ptask = ps.get_task(str(link["project_task_id"]))
+            if not ptask:
+                return ""
+            project = ps.get_project(str(ptask.get("project_id") or ""))
+            if not project:
+                return ""
+            return str(project.get("working_folder") or "")
+        except Exception:
+            return ""
+
     def _linked_project_task(self, agent_id: str) -> Optional[Dict[str, Any]]:
         """The agent's most relevant linked agent-task (active > recent)."""
         try:
@@ -1063,6 +1209,78 @@ class ManagedAgentRuntime:
                 agent_record.get("id"),
             )
 
+    def _maybe_import_bulk_outline(
+        self,
+        *,
+        agent_record: Dict[str, Any],
+        user_content: str,
+        collected_tool_calls: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Deterministically import a pasted multi-level outline.
+
+        A large Category/Task/SubTask paste cannot be echoed back by the
+        model as a ``project_import_outline`` argument within the output
+        token budget, so the chat would burn its turns and return no reply
+        (the "No response was generated" symptom). When the inbound message
+        is a bulk outline AND the agent may use ``project_import_outline``,
+        import it server-side with no model round-trip, record a synthetic
+        tool call for the audit log / live event sidebar, and return the
+        summary so the Chief delivers the result to the user.
+
+        Returns ``None`` to fall through to the normal model turn (message
+        is not an outline, the agent lacks the capability, the target
+        project name is unclear, or the import itself failed).
+        """
+        if not _looks_like_bulk_outline(user_content):
+            return None
+        if "project_import_outline" not in _effective_tool_names(agent_record):
+            return None
+        project_name = _extract_outline_project_name(user_content)
+        if not project_name:
+            return None
+        try:
+            from openjarvis.tools.project_import_outline import import_outline
+
+            store = self._manager._project_store()
+            outcome = import_outline(
+                store,
+                outline=user_content,
+                project_name=project_name,
+                create_if_missing=True,
+            )
+        except Exception:
+            logger.exception(
+                "Deterministic bulk-outline import failed for agent %s",
+                agent_record.get("id"),
+            )
+            return None
+
+        if not outcome.get("success"):
+            logger.warning(
+                "Bulk-outline import did not succeed for agent %s: %s",
+                agent_record.get("id"),
+                outcome.get("content"),
+            )
+            return None
+
+        collected_tool_calls.append(
+            {
+                "tool": "project_import_outline",
+                "arguments": json.dumps(
+                    {
+                        "project_name": project_name,
+                        "create_if_missing": True,
+                        "outline": user_content,
+                    }
+                ),
+                "result": outcome["content"],
+                "success": True,
+                "latency": 0.0,
+                "metadata": outcome.get("metadata") or {},
+            }
+        )
+        return outcome["content"]
+
     def _maybe_materialize_project_task_request(
         self,
         *,
@@ -1077,6 +1295,11 @@ class ManagedAgentRuntime:
         to add/create a task in a named project, and only for agents that are
         already allowed to use ``project_create_task``.
         """
+        # A bulk outline is handled by the deterministic import fast path,
+        # never as a single materialized task -- bail so we don't create a
+        # stray top-level task alongside the imported breakdown.
+        if _looks_like_bulk_outline(user_content):
+            return None
         if "project_create_task" not in _effective_tool_names(agent_record):
             return None
         if any(
@@ -1549,6 +1772,19 @@ class ManagedAgentRuntime:
         from openjarvis.agents.orchestrator import OrchestratorAgent
 
         config = agent_record.get("config", {}) or {}
+
+        # Deterministic fast path: a pasted multi-level outline is imported
+        # server-side rather than round-tripped through the model (which
+        # cannot echo a large outline back within the token budget).
+        early_tool_calls: List[Dict[str, Any]] = []
+        outline_summary = self._maybe_import_bulk_outline(
+            agent_record=agent_record,
+            user_content=user_content,
+            collected_tool_calls=early_tool_calls,
+        )
+        if outline_summary is not None:
+            return outline_summary, early_tool_calls
+
         tool_instances = build_agent_tool_instances(
             agent_record,
             engine=self._engine,
@@ -1636,7 +1872,7 @@ class ManagedAgentRuntime:
             return result
 
         chief._executor.execute = _tracked_execute
-        result = chief.run(user_content)
+        result = chief.run(_prepend_outline_routing_hint(user_content))
         self._maybe_checkpoint_chief(
             agent_record=agent_record,
             execution_context=execution_context,
@@ -2054,6 +2290,19 @@ class ManagedAgentRuntime:
         tools_allowed: Optional[Sequence[str]] = None,
     ) -> tuple[str, List[Dict[str, Any]]]:
         config = agent_record.get("config", {}) or {}
+
+        # Deterministic fast path: import a pasted multi-level outline
+        # server-side instead of asking the model to echo it back as a
+        # project_import_outline argument (which overflows the token budget).
+        early_tool_calls: List[Dict[str, Any]] = []
+        outline_summary = self._maybe_import_bulk_outline(
+            agent_record=agent_record,
+            user_content=user_content,
+            collected_tool_calls=early_tool_calls,
+        )
+        if outline_summary is not None:
+            return outline_summary, early_tool_calls
+
         tool_instances = build_agent_tool_instances(
             agent_record,
             engine=self._engine,
@@ -2087,7 +2336,9 @@ class ManagedAgentRuntime:
                 messages.append(Message(role=Role.USER, content=item["content"]))
             elif item["direction"] == "agent_to_user":
                 messages.append(Message(role=Role.ASSISTANT, content=item["content"]))
-        messages.append(Message(role=Role.USER, content=user_content))
+        messages.append(
+            Message(role=Role.USER, content=_prepend_outline_routing_hint(user_content))
+        )
 
         temperature = float(config.get("temperature", 0.7))
         max_tokens = int(config.get("max_tokens", 1024))

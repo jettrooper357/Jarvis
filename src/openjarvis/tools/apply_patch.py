@@ -250,7 +250,24 @@ class ApplyPatchTool(BaseTool):
                 success=False,
             )
 
-        path = Path(target)
+        from openjarvis.projects.workspace import (
+            active_workspace_root,
+            is_within_workspace,
+        )
+
+        path = Path(target).expanduser()
+        _ws_root = active_workspace_root()
+        if _ws_root and not path.is_absolute():
+            path = Path(_ws_root) / path
+        if not is_within_workspace(path):
+            return ToolResult(
+                tool_name="apply_patch",
+                content=(
+                    f"Access denied: {target} is outside the active "
+                    f"project workspace ({_ws_root})."
+                ),
+                success=False,
+            )
 
         # Block sensitive files
         from openjarvis.security.file_policy import is_sensitive_file

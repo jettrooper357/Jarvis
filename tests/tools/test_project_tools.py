@@ -208,6 +208,56 @@ def test_project_timeline_skill_grants_full_toolset():
         assert name in collected
 
 
+def test_project_import_outline_tool_creates_full_breakdown(monkeypatch, tmp_path):
+    from openjarvis.tools.project_import_outline import ProjectImportOutlineTool
+
+    store = ProjectStore(tmp_path / "projects.db")
+    monkeypatch.setattr(
+        "openjarvis.tools.project_import_outline._project_store",
+        lambda: store,
+    )
+    outline = (
+        "Category: Project Initiation and Planning\n"
+        "Task: Define Product Foundation\n"
+        "SubTask: Confirm final product name: Veridex\n"
+        "SubTask: Confirm MVP scope\n"
+        "Catgory: Testing\n"  # tolerated typo
+        "Task: Unit Testing\n"
+        "SubTask: Test claim services\n"
+    )
+
+    result = ProjectImportOutlineTool().execute(
+        outline=outline, project_name="Veridex", create_if_missing=True
+    )
+
+    assert result.success is True
+    assert result.metadata["categories_created"] == 2
+    assert result.metadata["tasks_created"] == 2
+    assert result.metadata["subtasks_created"] == 3
+    project = store.get_project(result.metadata["project_id"])
+    assert project["name"] == "Veridex"
+    tasks = store.list_tasks(project["id"])
+    assert [t for t in tasks if t["type"] == "Task"]
+    assert [t for t in tasks if t["type"] == "Subtask" and t["parent_task_id"]]
+
+
+def test_project_import_outline_tool_rejects_empty(monkeypatch, tmp_path):
+    from openjarvis.tools.project_import_outline import ProjectImportOutlineTool
+
+    store = ProjectStore(tmp_path / "projects.db")
+    monkeypatch.setattr(
+        "openjarvis.tools.project_import_outline._project_store",
+        lambda: store,
+    )
+
+    result = ProjectImportOutlineTool().execute(
+        outline="   ", project_name="Veridex"
+    )
+
+    assert result.success is False
+    assert "outline is required" in result.content
+
+
 def test_chief_gets_full_project_toolset():
     from openjarvis.agents.capabilities import effective_agent_tool_names
 

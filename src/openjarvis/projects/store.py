@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS projects (
     tags        TEXT NOT NULL DEFAULT '[]',
     milestones  TEXT NOT NULL DEFAULT '[]',
     categories  TEXT NOT NULL DEFAULT '[]',
+    working_folder TEXT NOT NULL DEFAULT '',
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL
 );
@@ -85,7 +86,10 @@ _JSON_TASK_FIELDS = ("dependencies",)
 # via a lightweight idempotent migration (CREATE TABLE IF NOT EXISTS will
 # not add columns to a table that already exists).
 _ADDED_COLUMNS = {
-    "projects": (("categories", "TEXT NOT NULL DEFAULT '[]'"),),
+    "projects": (
+        ("categories", "TEXT NOT NULL DEFAULT '[]'"),
+        ("working_folder", "TEXT NOT NULL DEFAULT ''"),
+    ),
     "tasks": (("category", "TEXT NOT NULL DEFAULT ''"),),
 }
 
@@ -146,6 +150,27 @@ def _clean_task_title(title: Any) -> str:
 
 def default_db_path() -> Path:
     return DEFAULT_CONFIG_DIR / "projects.db"
+
+
+def _normalize_working_folder(value: Any) -> str:
+    """Expand, resolve, and auto-create a project working folder.
+
+    Empty/None → empty string (no folder configured). Otherwise the path
+    is expanded (``~`` → home), resolved to an absolute path, and the
+    directory is created if it doesn't exist. Returns the canonical
+    string form so downstream sandbox checks have a stable root.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        path = Path(text).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path.resolve())
+    except OSError:
+        # Surface what the user typed so they can fix it; the sandbox
+        # layer rejects access when the path is non-existent.
+        return text
 
 
 class ProjectStore:
@@ -239,10 +264,12 @@ class ProjectStore:
     def create_project(self, **fields: Any) -> Dict[str, Any]:
         pid = _gen_id()
         now = _now()
+        working_folder = _normalize_working_folder(fields.get("working_folder"))
         self._conn.execute(
             "INSERT INTO projects (id, name, description, owner, team, "
             "start_date, target_date, status, progress, tags, milestones, "
-            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "working_folder, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 pid,
                 str(fields.get("name") or "Untitled Project"),
@@ -255,6 +282,7 @@ class ProjectStore:
                 int(fields.get("progress") or 0),
                 json.dumps(fields.get("tags") or []),
                 json.dumps(fields.get("milestones") or []),
+                working_folder,
                 now,
                 now,
             ),
@@ -281,6 +309,9 @@ class ProjectStore:
             ):
                 cols.append(f"{key} = ?")
                 params.append(val)
+            elif key == "working_folder":
+                cols.append("working_folder = ?")
+                params.append(_normalize_working_folder(val))
         if cols:
             cols.append("updated_at = ?")
             params.append(_now())

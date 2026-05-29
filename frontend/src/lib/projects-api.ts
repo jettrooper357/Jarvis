@@ -38,6 +38,7 @@ export interface Project {
   tags: string[];
   milestones: Milestone[];
   categories: string[];
+  working_folder: string;
   created_at: number;
   updated_at: number;
 }

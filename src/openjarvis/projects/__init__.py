@@ -7,5 +7,17 @@ single source of truth instead of a browser-local silo.
 """
 
 from openjarvis.projects.store import ProjectStore
+from openjarvis.projects.workspace import (
+    active_workspace_root,
+    is_within_workspace,
+    resolve_within_workspace,
+    use_workspace,
+)
 
-__all__ = ["ProjectStore"]
+__all__ = [
+    "ProjectStore",
+    "active_workspace_root",
+    "is_within_workspace",
+    "resolve_within_workspace",
+    "use_workspace",
+]
