@@ -32,6 +32,26 @@ class TestResearchMonitorE2E:
         config = agent["config"]
         assert "web_search" in config.get("tools", [])
 
+    def test_personal_life_manager_templates_available(self, manager):
+        templates = {t["id"]: t for t in manager.list_templates()}
+        expected = {
+            "life_manager",
+            "sermon_study",
+            "health_routine",
+            "finance_reminder",
+            "learning_coach",
+        }
+        assert expected.issubset(templates)
+
+        for template_id in expected:
+            agent = manager.create_from_template(
+                template_id,
+                name=f"Personal {template_id}",
+            )
+            assert agent["status"] == "idle"
+            assert agent["config"]["schedule_type"] == "manual"
+            assert agent["config"]["system_prompt"]
+
     def test_full_lifecycle(self, manager):
         # Create
         agent = manager.create_agent(name="lifecycle_test", agent_type="simple")

@@ -253,3 +253,42 @@ Protected behavior:
 - job capabilities are exposed through the Capability Inspector axes,
 - IFTTT jobs trigger from built-in or registered app events without polling,
 - existing per-agent `schedule_type` / `schedule_value` config remains supported.
+
+# Personal Life Manager Agent Templates
+
+Status: Protected augmented feature
+
+Jarvis includes built-in Personal Life Manager templates that can be instantiated
+from the agent template catalog without changing the Chief Orchestrator ingress
+or protected task/job ledgers.
+
+Protected templates:
+- `life_manager`
+- `sermon_study`
+- `health_routine`
+- `finance_reminder`
+- `learning_coach`
+
+Protected behavior:
+- templates stay additive to the existing template library,
+- instantiated agents remain governed by Chief routing and capability policy,
+- routines and reminders use protected Agent Jobs and task ledgers rather than
+  mutable UI-only state,
+- health and finance templates do not provide professional medical, legal, tax,
+  investment, or financial advice,
+- templates do not instruct agents to expose hidden chain-of-thought.
+
+# Personal Planning Dashboard
+
+Status: Protected augmented feature
+
+Jarvis includes an additive Personal Planning Dashboard at `/life-planner`.
+It derives personal planning views from existing Mission Control project tasks,
+managed agents, and per-agent jobs.
+
+Protected behavior:
+- the dashboard remains a derived view over durable tasks and jobs,
+- life-domain and horizon filters do not replace canonical project/task/job
+  persistence,
+- existing Mission Control, Agents, Projects, and Jobs routes remain unchanged,
+- no hidden chain-of-thought is displayed in dashboard rows or summaries.

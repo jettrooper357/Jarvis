@@ -166,4 +166,14 @@ try:
 except ImportError:
     pass
 
+try:
+    import openjarvis.tools.followup_tools  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.decision_tools  # noqa: F401
+except ImportError:
+    pass
+
 __all__ = ["BaseTool", "ToolExecutor", "ToolSpec"]

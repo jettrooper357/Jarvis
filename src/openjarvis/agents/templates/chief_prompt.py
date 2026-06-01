@@ -10,7 +10,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Iterable, Mapping, Optional
 
-
 CHIEF_SYSTEM_PROMPT = """\
 You are CHIEF_ORCHESTRATOR for the OpenJarvis application.
 
@@ -175,6 +174,27 @@ _REGISTRY_HEADER = (
 )
 _PRIOR_RESULTS_HEADER = "DELEGATED RESULTS SO FAR\n"
 
+_EA_BLOCK = """\
+EXECUTIVE ASSISTANT MODE
+You are also the user's Executive Assistant. Beyond orchestration, you
+proactively manage their day. Use these capabilities (delegate to the
+matching subordinate when one is registered; otherwise execute_direct):
+
+- Daily briefing -> delegate to the "briefing officer" subordinate
+  (morning_digest) when registered.
+- Inbox triage -> delegate to the "inbox analyst" subordinate
+  (inbox_triager) when registered.
+- Follow-ups -> use followup_add / followup_list / followup_resolve /
+  followup_sweep_stale to track and surface "waiting on X" and "owe a
+  reply to Y" items. Surface stale items in briefings.
+- Decisions -> use decision_record / decision_list to log decisions and
+  approvals with who approved them and when; link to the project/task.
+
+Keep the user's priorities front and center; never expose hidden
+reasoning -- record only user-safe rationale.
+
+"""
+
 
 def _format_registry(registry: Mapping[str, Mapping[str, object]]) -> str:
     """Render the subordinate registry block.
@@ -223,19 +243,26 @@ def build_chief_system_prompt(
     *,
     registry: Optional[Mapping[str, Mapping[str, object]]] = None,
     prior_results: Optional[Iterable[Mapping[str, str]]] = None,
+    assistant_mode: bool = False,
 ) -> str:
-    """Render the Chief system prompt with optional registry and prior results."""
+    """Render the Chief system prompt with optional registry and prior results.
+
+    When ``assistant_mode`` is True, an Executive Assistant capability block
+    is appended after the registry/prior-results blocks. Default False keeps
+    the prompt byte-for-byte identical to the pre-EA behavior.
+    """
     registry_block = _format_registry(registry) if registry else ""
     prior_results_block = (
         _format_prior_results(prior_results) if prior_results else ""
     )
+    ea_block = _EA_BLOCK if assistant_mode else ""
     today_iso = datetime.now(timezone.utc).date().isoformat()
     return CHIEF_SYSTEM_PROMPT.replace(
         "__TODAY_ISO__", today_iso
     ).replace(
         "__REGISTRY_BLOCK__", registry_block
     ).replace(
-        "__PRIOR_RESULTS_BLOCK__", prior_results_block
+        "__PRIOR_RESULTS_BLOCK__", prior_results_block + ea_block
     )
 
 

@@ -12,6 +12,7 @@ import { ProjectsPage } from './pages/ProjectsPage';
 import { ProjectDetailPage } from './pages/ProjectDetailPage';
 import { ProjectTimelinePage } from './pages/ProjectTimelinePage';
 import { ProjectDashboardPage } from './pages/ProjectDashboardPage';
+import { PersonalPlanningPage } from './pages/PersonalPlanningPage';
 import { LogsPage } from './pages/LogsPage';
 import { CommandPalette } from './components/CommandPalette';
 import { SetupScreen } from './components/SetupScreen';
@@ -195,6 +196,7 @@ export default function App() {
           <Route path="library" element={<LibraryPage />} />
           <Route path="projects" element={<ProjectsPage />} />
           <Route path="projects/dashboard" element={<ProjectDashboardPage />} />
+          <Route path="life-planner" element={<PersonalPlanningPage />} />
           <Route path="projects/:projectId" element={<ProjectDetailPage />} />
           <Route
             path="projects/:projectId/timeline"

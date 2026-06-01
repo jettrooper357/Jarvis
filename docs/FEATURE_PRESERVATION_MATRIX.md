@@ -206,3 +206,12 @@ protocol".
 | Chief/delegation path | Fired jobs materialize tracked agent work and attribute assignment to the designated Chief when available. | Do not execute scheduled jobs as direct human-facing subordinate ingress. | Scheduler regression test |
 | Job capabilities | Job permissions appear in capability axes and include create/update/run/delegate semantics. | Do not hard-code job permission state only in the UI. | Frontend build/typecheck |
 | App-event IFTTT jobs | Conditional jobs fire from app events such as login, logoff, task/project start, and task/project completion, plus registered custom events. | Do not turn IFTTT jobs into UI-only polling or hard-coded event lists. | `tests/agents/test_scheduler.py::TestSchedulerBasic::test_ifttt_job_fires_from_app_event` |
+
+# Personal Life Manager Agent Templates
+
+| Feature | Protected behavior | Preservation rule | Validation |
+| --- | --- | --- | --- |
+| Personal Life Manager templates | Built-in templates for `life_manager`, `sermon_study`, `health_routine`, `finance_reminder`, and `learning_coach` are available from the template catalog. | Do not remove or rename these templates without an approved Change Impact Notice. | `tests/integration/test_agent_manager_e2e.py::TestResearchMonitorE2E::test_personal_life_manager_templates_available` |
+| Personal agent governance | Instantiated personal agents remain subordinate to Chief routing and capability policy. | Do not make these agents direct final human-facing ingress paths. | Template prompt review plus Chief ingress regression tests for touched routing surfaces. |
+| Personal routines/reminders | Personal reminders and routines use durable Agent Jobs and task ledgers. | Do not replace them with mutable UI-only reminder state. | Scheduler/job regression tests for any preset implementation. |
+| Personal Planning Dashboard | `/life-planner` derives Today, week, month, long-term, domain, routine, reminder, and notebook views from existing durable project/task/job sources. | Do not introduce a UI-only canonical reminder/habit store or bypass existing task/job ledgers. | `frontend/src/pages/personalPlanningUtils.test.ts` plus frontend build/typecheck. |

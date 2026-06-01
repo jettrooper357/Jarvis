@@ -104,6 +104,12 @@ class EventType(str, Enum):
     # ended and its summary was rolled up to the parent (MERGED).
     AGENT_SESSION_FORKED = "agent.session.forked"
     AGENT_SESSION_MERGED = "agent.session.merged"
+    # Executive Assistant — follow-up tracker + decision log.
+    FOLLOWUP_CREATED = "followup.created"
+    FOLLOWUP_UPDATED = "followup.updated"
+    FOLLOWUP_RESOLVED = "followup.resolved"
+    DECISION_RECORDED = "decision.recorded"
+    DECISION_SUPERSEDED = "decision.superseded"
 
 
 @dataclass(slots=True)
