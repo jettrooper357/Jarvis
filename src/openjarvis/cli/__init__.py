@@ -30,6 +30,7 @@ from openjarvis.cli.mine_cmd import mine
 from openjarvis.cli.model import model
 from openjarvis.cli.operators_cmd import operators
 from openjarvis.cli.optimize_cmd import optimize_group
+from openjarvis.cli.org_cmd import org
 from openjarvis.cli.pearl_cmd import pearl
 from openjarvis.cli.quickstart_cmd import quickstart
 from openjarvis.cli.registry_cmd import registry
@@ -89,6 +90,7 @@ cli.add_command(channels, "channels")
 cli.add_command(scheduler, "scheduler")
 cli.add_command(doctor, "doctor")
 cli.add_command(agent, "agents")
+cli.add_command(org, "org")
 cli.add_command(workflow, "workflow")
 cli.add_command(skill, "skill")
 cli.add_command(start, "start")

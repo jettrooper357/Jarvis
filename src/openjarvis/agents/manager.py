@@ -1677,6 +1677,13 @@ class AgentManager:
             config.update(overrides)
         config.setdefault("template_id", template_id)
         agent_type = config.pop("agent_type", "monitor_operative")
+        # Org placement: the template may declare a default org_role /
+        # manager_role. An explicit caller argument always wins. Pop them
+        # off config so they never leak into the agent's runtime config_json.
+        template_org_role = str(config.pop("org_role", "") or "").strip()
+        config.pop("manager_role", None)
+        if not org_role:
+            org_role = template_org_role
 
         # Expand system_prompt_template with instruction
         prompt_tpl = config.pop("system_prompt_template", "")

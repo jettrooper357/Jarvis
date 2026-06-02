@@ -6,6 +6,7 @@ icon = "LC"
 agent_type = "monitor_operative"
 schedule_type = "manual"
 schedule_value = ""
+org_role = "personal_goals"
 tools = ["project_create", "project_create_task", "managed_agent_list_tasks", "managed_agent_update_task", "knowledge_search", "knowledge_sql", "memory_store", "memory_retrieve", "think", "web_search"]
 max_turns = 16
 temperature = 0.3

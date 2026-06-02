@@ -6,6 +6,7 @@ icon = "🔬"
 agent_type = "monitor_operative"
 schedule_type = "cron"
 schedule_value = "0 9 * * *"
+org_role = "research"
 tools = ["web_search", "http_request", "file_read", "file_write", "memory_store", "memory_retrieve", "think"]
 max_turns = 25
 temperature = 0.3

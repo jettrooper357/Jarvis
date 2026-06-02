@@ -6,6 +6,7 @@ icon = "LM"
 agent_type = "monitor_operative"
 schedule_type = "manual"
 schedule_value = ""
+org_role = "life_manager"
 tools = ["project_create", "project_create_task", "managed_agent_directory", "managed_agent_assign_task", "managed_agent_list_tasks", "managed_agent_update_task", "memory_store", "memory_retrieve", "knowledge_search", "think"]
 max_turns = 20
 temperature = 0.3

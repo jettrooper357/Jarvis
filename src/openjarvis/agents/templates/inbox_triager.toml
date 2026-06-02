@@ -6,6 +6,7 @@ icon = "📥"
 agent_type = "monitor_operative"
 schedule_type = "interval"
 schedule_value = "1800"
+org_role = "inbox_analyst"
 tools = ["channel_send", "channel_list", "memory_store", "memory_retrieve", "think", "web_search", "file_write"]
 max_turns = 20
 temperature = 0.3

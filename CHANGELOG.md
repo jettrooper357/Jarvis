@@ -10,6 +10,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Agent Org Expansion** — a default agent hierarchy (Chief Orchestrator →
+  Executive Assistant / Workflow Manager / CTO / Knowledge Manager / Life
+  Manager → specialists) via 15 new role templates, an optional `org_role`
+  field on templates (used as the default org placement at create time), and
+  an idempotent `bootstrap_default_org` exposed as `POST /v1/org/bootstrap` +
+  `GET /v1/org` and a `jarvis org` CLI (`bootstrap` / `show`). Additive and
+  opt-in; reuses the existing org model; the Chief remains the sole
+  human-facing ingress.
 - **Life Manager** — a durable backend for life domains and recurring routines
   with due-tracking (daily/weekly/monthly/custom cadence advancing from
   completion time, streaks, a "what's due today" query), agent tools

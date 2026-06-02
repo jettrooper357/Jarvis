@@ -6,6 +6,7 @@ icon = "SS"
 agent_type = "deep_research"
 schedule_type = "manual"
 schedule_value = ""
+org_role = "church"
 tools = ["knowledge_search", "knowledge_sql", "scan_chunks", "web_search", "http_request", "file_read", "file_write", "memory_store", "memory_retrieve", "think"]
 max_turns = 12
 temperature = 0.3

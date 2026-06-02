@@ -6,6 +6,7 @@ icon = "FR"
 agent_type = "monitor_operative"
 schedule_type = "manual"
 schedule_value = ""
+org_role = "finance"
 tools = ["project_create_task", "managed_agent_list_tasks", "managed_agent_update_task", "memory_store", "memory_retrieve", "knowledge_search", "think"]
 max_turns = 12
 temperature = 0.2

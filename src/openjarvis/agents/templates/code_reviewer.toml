@@ -6,6 +6,7 @@ icon = "🔍"
 agent_type = "monitor_operative"
 schedule_type = "interval"
 schedule_value = "3600"
+org_role = "code_reviewer"
 tools = ["file_read", "file_write", "shell_exec", "git_status", "git_diff", "git_commit", "git_log", "apply_patch", "code_interpreter", "memory_store", "memory_retrieve", "think"]
 max_turns = 15
 temperature = 0.1
