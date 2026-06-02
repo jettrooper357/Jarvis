@@ -6,6 +6,7 @@ import {
   CalendarClock,
   CalendarDays,
   CheckCircle2,
+  ChevronDown,
   Church,
   CircleAlert,
   GraduationCap,
@@ -22,10 +23,12 @@ import {
   fetchAgentJobs,
   fetchManagedAgents,
   fetchMissionControl,
+  updateAgentJob,
   type AgentJob,
   type ManagedAgent,
   type MissionControlData,
 } from '../lib/api';
+import { updateTask } from '../lib/projects-api';
 import { HudFrame } from '../components/Jarvis/HudFrame';
 import { priorityColor, statusColor } from '../components/MissionControl/missionControlUtils';
 import {
@@ -80,6 +83,10 @@ function domainLabel(domain: LifeDomain): string {
   return LIFE_DOMAINS.find((entry) => entry.id === domain)?.label || domain;
 }
 
+function planningItemKey(item: PlanningItem): string {
+  return `${item.source}:${item.id}`;
+}
+
 function Metric({
   label,
   value,
@@ -112,31 +119,57 @@ function Metric({
   );
 }
 
-function FilterButton({
-  active,
-  onClick,
+function FilterSelect<T extends string>({
+  label,
+  value,
+  onChange,
   children,
 }: {
-  active: boolean;
-  onClick: () => void;
+  label: string;
+  value: T;
+  onChange: (value: T) => void;
   children: React.ReactNode;
 }) {
   return (
-    <button
-      onClick={onClick}
-      className="px-3 py-2 rounded-md text-sm transition-colors"
-      style={{
-        background: active ? 'var(--color-accent-subtle)' : 'transparent',
-        color: active ? 'var(--color-text)' : 'var(--color-text-secondary)',
-        border: `1px solid ${active ? 'color-mix(in srgb, var(--color-accent) 38%, transparent)' : 'var(--color-border)'}`,
-      }}
-    >
-      {children}
-    </button>
+    <label className="min-w-0">
+      <span className="hud-label block mb-2" style={{ color: 'var(--color-text-tertiary)' }}>
+        {label}
+      </span>
+      <span className="relative block">
+        <select
+          value={value}
+          onChange={(event) => onChange(event.target.value as T)}
+          className="w-full appearance-none rounded-md px-3 py-2 pr-9 text-sm outline-none"
+          style={{
+            background: 'color-mix(in srgb, var(--color-bg-secondary) 88%, transparent)',
+            border: '1px solid color-mix(in srgb, var(--color-accent) 34%, var(--color-border))',
+            color: 'var(--color-text)',
+          }}
+        >
+          {children}
+        </select>
+        <ChevronDown
+          size={15}
+          aria-hidden="true"
+          className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2"
+          style={{ color: 'var(--color-text-tertiary)' }}
+        />
+      </span>
+    </label>
   );
 }
 
-function ItemRow({ item, now }: { item: PlanningItem; now: Date }) {
+function ItemRow({
+  item,
+  now,
+  completing,
+  onComplete,
+}: {
+  item: PlanningItem;
+  now: Date;
+  completing: boolean;
+  onComplete: (item: PlanningItem) => void;
+}) {
   const domain = domainLabel(item.domain);
   const DomainIcon = DOMAIN_ICONS[item.domain];
   const horizon = itemHorizon(item, now);
@@ -185,6 +218,21 @@ function ItemRow({ item, now }: { item: PlanningItem; now: Date }) {
       </div>
 
       <div className="flex items-center gap-2 xl:justify-end">
+        <button
+          type="button"
+          onClick={() => onComplete(item)}
+          disabled={completing}
+          aria-label={`Mark ${item.title} complete`}
+          title="Mark complete"
+          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md disabled:opacity-60"
+          style={{
+            color: 'var(--color-success)',
+            background: 'color-mix(in srgb, var(--color-success) 8%, transparent)',
+            border: '1px solid color-mix(in srgb, var(--color-success) 28%, var(--color-border))',
+          }}
+        >
+          {completing ? <Loader2 size={15} className="animate-spin" /> : <CheckCircle2 size={15} />}
+        </button>
         {item.source === 'task' && item.priority && (
           <span
             className="text-xs px-2 py-1 rounded"
@@ -227,6 +275,9 @@ export function PersonalPlanningPage() {
   const [jobsByAgent, setJobsByAgent] = useState<Record<string, AgentJob[]>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [completionError, setCompletionError] = useState<string | null>(null);
+  const [completingItemKey, setCompletingItemKey] = useState<string | null>(null);
+  const [completedItemKeys, setCompletedItemKeys] = useState<Set<string>>(() => new Set());
   const [horizon, setHorizon] = useState<PlanningHorizon | 'all'>('today');
   const [domain, setDomain] = useState<LifeDomain | 'all'>('all');
   const now = useMemo(() => new Date(), [missionControl, jobsByAgent]);
@@ -279,16 +330,43 @@ export function PersonalPlanningPage() {
   const filteredItems = useMemo(
     () =>
       allItems.filter((item) => {
+        if (completedItemKeys.has(planningItemKey(item))) return false;
         const horizonMatch = horizon === 'all' || itemHorizon(item, now) === horizon;
         const domainMatch = domain === 'all' || item.domain === domain;
         return horizonMatch && domainMatch;
       }),
-    [allItems, horizon, domain, now],
+    [allItems, completedItemKeys, horizon, domain, now],
   );
   const routines = useMemo(
     () => sortPlanningItems(allItems.filter(isHabitOrRoutine)).slice(0, 8),
     [allItems],
   );
+
+  const completeItem = async (item: PlanningItem) => {
+    const key = planningItemKey(item);
+    setCompletingItemKey(key);
+    setCompletionError(null);
+    try {
+      if (item.source === 'task') {
+        await updateTask(item.id, { status: 'Done', percent_complete: 100 });
+      } else {
+        await updateAgentJob(item.agentId, item.id, {
+          status: 'completed',
+          next_run_at: null,
+        });
+      }
+      setCompletedItemKeys((previous) => {
+        const next = new Set(previous);
+        next.add(key);
+        return next;
+      });
+      await load();
+    } catch (err) {
+      setCompletionError(err instanceof Error ? err.message : 'Failed to mark item complete');
+    } finally {
+      setCompletingItemKey(null);
+    }
+  };
 
   return (
     <div className="flex-1 overflow-y-auto px-6 py-8">
@@ -332,6 +410,20 @@ export function PersonalPlanningPage() {
             </div>
           )}
 
+          {completionError && (
+            <div
+              className="mt-5 flex items-center gap-2 rounded-lg px-4 py-3 text-sm"
+              style={{
+                color: 'var(--color-error)',
+                background: 'color-mix(in srgb, var(--color-error) 8%, transparent)',
+                border: '1px solid color-mix(in srgb, var(--color-error) 22%, transparent)',
+              }}
+            >
+              <CircleAlert size={16} />
+              {completionError}
+            </div>
+          )}
+
           <section className="mt-6 grid grid-cols-2 lg:grid-cols-6 gap-3">
             <Metric label="Open tasks" value={summary.totalOpenTasks} icon={CheckCircle2} accent="var(--color-accent)" />
             <Metric label="Today" value={summary.dueToday} icon={CalendarDays} accent="var(--color-warning)" />
@@ -341,51 +433,35 @@ export function PersonalPlanningPage() {
             <Metric label="Active jobs" value={summary.activeJobs} icon={RefreshCw} accent="var(--color-accent)" />
           </section>
 
-          <section className="mt-6 grid grid-cols-1 xl:grid-cols-[280px_minmax(0,1fr)] gap-5">
-            <aside className="space-y-5">
-              <div>
-                <div className="hud-label mb-2" style={{ color: 'var(--color-text-tertiary)' }}>
-                  HORIZON
-                </div>
-                <div className="grid grid-cols-1 gap-2">
-                  {HORIZONS.map((entry) => (
-                    <FilterButton
-                      key={entry.id}
-                      active={horizon === entry.id}
-                      onClick={() => setHorizon(entry.id)}
-                    >
-                      {entry.label}
-                    </FilterButton>
-                  ))}
-                </div>
-              </div>
+          <section className="mt-6">
+            <div
+              className="mb-4 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-[220px_260px_minmax(0,1fr)] gap-3 items-end"
+            >
+              <FilterSelect<PlanningHorizon | 'all'>
+                label="Horizon"
+                value={horizon}
+                onChange={setHorizon}
+              >
+                {HORIZONS.map((entry) => (
+                  <option key={entry.id} value={entry.id}>
+                    {entry.label}
+                  </option>
+                ))}
+              </FilterSelect>
 
-              <div>
-                <div className="hud-label mb-2" style={{ color: 'var(--color-text-tertiary)' }}>
-                  LIFE DOMAINS
-                </div>
-                <div className="grid grid-cols-1 gap-2">
-                  <FilterButton active={domain === 'all'} onClick={() => setDomain('all')}>
-                    All domains
-                  </FilterButton>
-                  {LIFE_DOMAINS.map((entry) => {
-                    const Icon = DOMAIN_ICONS[entry.id];
-                    return (
-                      <FilterButton
-                        key={entry.id}
-                        active={domain === entry.id}
-                        onClick={() => setDomain(entry.id)}
-                      >
-                        <span className="inline-flex items-center gap-2">
-                          <Icon size={14} />
-                          {entry.label}
-                        </span>
-                      </FilterButton>
-                    );
-                  })}
-                </div>
-              </div>
-            </aside>
+              <FilterSelect<LifeDomain | 'all'>
+                label="Life Domain"
+                value={domain}
+                onChange={setDomain}
+              >
+                <option value="all">All domains</option>
+                {LIFE_DOMAINS.map((entry) => (
+                  <option key={entry.id} value={entry.id}>
+                    {entry.label}
+                  </option>
+                ))}
+              </FilterSelect>
+            </div>
 
             <div
               className="rounded-lg overflow-hidden"
@@ -419,7 +495,18 @@ export function PersonalPlanningPage() {
               ) : filteredItems.length === 0 ? (
                 <EmptyState />
               ) : (
-                filteredItems.map((item) => <ItemRow key={`${item.source}:${item.id}`} item={item} now={now} />)
+                filteredItems.map((item) => {
+                  const key = planningItemKey(item);
+                  return (
+                    <ItemRow
+                      key={key}
+                      item={item}
+                      now={now}
+                      completing={completingItemKey === key}
+                      onComplete={completeItem}
+                    />
+                  );
+                })
               )}
             </div>
           </section>

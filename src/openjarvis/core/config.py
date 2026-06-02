@@ -890,6 +890,40 @@ class TracesConfig:
 
 
 @dataclass(slots=True)
+class EventLogConfig:
+    """Persisted event-log settings."""
+
+    enabled: bool = True
+    db_path: str = str(DEFAULT_CONFIG_DIR / "eventlog.db")
+    denylist: List[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ActionApprovalsConfig:
+    """Generalized action-approval queue settings."""
+
+    enabled: bool = True
+    db_path: str = str(DEFAULT_CONFIG_DIR / "action_approvals.db")
+
+
+@dataclass(slots=True)
+class CodeLinkConfig:
+    """Task–Code Linkage settings."""
+
+    enabled: bool = True
+    db_path: str = str(DEFAULT_CONFIG_DIR / "codelink.db")
+    watch_enabled: bool = False
+
+
+@dataclass(slots=True)
+class LifeManagerConfig:
+    """Life Manager (domains + routines) settings."""
+
+    enabled: bool = True
+    db_path: str = str(DEFAULT_CONFIG_DIR / "lifemanager.db")
+
+
+@dataclass(slots=True)
 class TelegramChannelConfig:
     """Per-channel config for Telegram."""
 
@@ -1505,6 +1539,12 @@ class JarvisConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     traces: TracesConfig = field(default_factory=TracesConfig)
+    eventlog: EventLogConfig = field(default_factory=EventLogConfig)
+    action_approvals: ActionApprovalsConfig = field(
+        default_factory=ActionApprovalsConfig
+    )
+    codelink: CodeLinkConfig = field(default_factory=CodeLinkConfig)
+    lifemanager: LifeManagerConfig = field(default_factory=LifeManagerConfig)
     channel: ChannelConfig = field(default_factory=ChannelConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
@@ -1517,9 +1557,7 @@ class JarvisConfig:
     optimize: OptimizeConfig = field(default_factory=OptimizeConfig)
     agent_manager: AgentManagerConfig = field(default_factory=AgentManagerConfig)
     chief_ingress: ChiefIngressConfig = field(default_factory=ChiefIngressConfig)
-    approval_gating: ApprovalGatingConfig = field(
-        default_factory=ApprovalGatingConfig
-    )
+    approval_gating: ApprovalGatingConfig = field(default_factory=ApprovalGatingConfig)
     background_delegation: BackgroundDelegationConfig = field(
         default_factory=BackgroundDelegationConfig
     )
@@ -1723,7 +1761,7 @@ def _parse_mining_section(data: dict) -> Optional["MiningConfig"]:
             pearld_rpc_url=extra.get("pearld_rpc_url", "http://localhost:44107")
         )
     elif isinstance(target_str, str) and target_str.startswith("pool:"):
-        submit_target = PoolTarget(url=target_str[len("pool:"):])
+        submit_target = PoolTarget(url=target_str[len("pool:") :])
     else:
         raise ValueError(
             f"[mining].submit_target must be 'solo' or 'pool:<url>', got {target_str!r}"
@@ -1777,6 +1815,10 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
             "server",
             "telemetry",
             "traces",
+            "eventlog",
+            "action_approvals",
+            "codelink",
+            "lifemanager",
             "security",
             "channel",
             "tools",
@@ -2137,6 +2179,10 @@ __all__ = [
     "TelemetryConfig",
     "ToolsConfig",
     "TracesConfig",
+    "EventLogConfig",
+    "ActionApprovalsConfig",
+    "CodeLinkConfig",
+    "LifeManagerConfig",
     "VLLMEngineConfig",
     "WebChatChannelConfig",
     "WebhookChannelConfig",

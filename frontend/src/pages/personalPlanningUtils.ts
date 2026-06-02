@@ -85,6 +85,7 @@ export interface PlanningTaskItem {
 
 export interface PlanningJobItem {
   id: string;
+  agentId: string;
   title: string;
   status: string;
   jobType: AgentJob['job_type'];
@@ -207,8 +208,9 @@ export function buildPlanningJobs(
   const agentById = new Map(agents.map((agent) => [agent.id, agent.name]));
   return Object.entries(jobsByAgent).flatMap(([agentId, jobs]) => {
     const agentName = agentById.get(agentId) || 'Unassigned agent';
-    return jobs.map((job) => ({
+    return jobs.filter((job) => job.status !== 'completed').map((job) => ({
       id: job.id,
+      agentId,
       title: job.name,
       status: job.status,
       jobType: job.job_type,

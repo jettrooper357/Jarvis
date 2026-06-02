@@ -19,9 +19,9 @@ from openjarvis.server.connectors_router import (
 )
 from openjarvis.server.dashboard import dashboard_router
 from openjarvis.server.digest_routes import create_digest_router
-from openjarvis.server.shortcuts_router import create_shortcuts_router
 from openjarvis.server.projects_router import create_projects_router
 from openjarvis.server.routes import router
+from openjarvis.server.shortcuts_router import create_shortcuts_router
 from openjarvis.server.upload_router import router as upload_router
 
 logger = logging.getLogger(__name__)
@@ -336,6 +336,72 @@ def create_app(
                 _trace_store.subscribe_to_bus(_bus)
     except Exception:
         pass  # traces are optional; don't block server startup
+
+    # Wire up the persisted event log if enabled
+    app.state.event_log_store = None
+    try:
+        from openjarvis.core.config import load_config
+        from openjarvis.eventlog.store import EventLogStore
+
+        cfg = config if config is not None else load_config()
+        if cfg.eventlog.enabled:
+            _event_log_store = EventLogStore(db_path=cfg.eventlog.db_path)
+            app.state.event_log_store = _event_log_store
+            _bus = getattr(app.state, "bus", None)
+            if _bus is not None:
+                _event_log_store.subscribe_to_bus(
+                    _bus, denylist=cfg.eventlog.denylist
+                )
+    except Exception:
+        pass  # event log is optional; don't block server startup
+
+    # Wire up the generalized action-approval store if enabled
+    app.state.action_approval_store = None
+    try:
+        from openjarvis.approvals_center.store import ActionApprovalStore
+        from openjarvis.core.config import load_config
+
+        cfg = config if config is not None else load_config()
+        if cfg.action_approvals.enabled:
+            app.state.action_approval_store = ActionApprovalStore(
+                db_path=cfg.action_approvals.db_path
+            )
+    except Exception:
+        pass  # action approvals are optional; don't block server startup
+
+    # Wire up Task–Code Linkage if enabled
+    app.state.codelink_store = None
+    app.state.codelink_watchers = None
+    try:
+        from openjarvis.codelink.store import CodeLinkStore
+        from openjarvis.codelink.watcher import start_watchers
+        from openjarvis.core.config import load_config
+
+        cfg = config if config is not None else load_config()
+        if cfg.codelink.enabled:
+            _codelink_store = CodeLinkStore(db_path=cfg.codelink.db_path)
+            app.state.codelink_store = _codelink_store
+            if cfg.codelink.watch_enabled:
+                from openjarvis.projects.store import ProjectStore
+
+                projects = ProjectStore().list_projects()
+                app.state.codelink_watchers = start_watchers(
+                    _codelink_store, projects, enabled=True
+                )
+    except Exception:
+        pass  # code linkage is optional; don't block server startup
+
+    # Wire up the Life Manager store if enabled
+    app.state.life_store = None
+    try:
+        from openjarvis.core.config import load_config
+        from openjarvis.lifemanager.store import LifeStore
+
+        cfg = config if config is not None else load_config()
+        if cfg.lifemanager.enabled:
+            app.state.life_store = LifeStore(db_path=cfg.lifemanager.db_path)
+    except Exception:
+        pass  # life manager is optional; don't block server startup
 
     @app.on_event("startup")
     async def _warm_up_models() -> None:

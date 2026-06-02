@@ -176,4 +176,14 @@ try:
 except ImportError:
     pass
 
+try:
+    import openjarvis.tools.codelink_tools  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.lifemanager_tools  # noqa: F401
+except ImportError:
+    pass
+
 __all__ = ["BaseTool", "ToolExecutor", "ToolSpec"]

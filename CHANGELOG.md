@@ -10,6 +10,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Life Manager** — a durable backend for life domains and recurring routines
+  with due-tracking (daily/weekly/monthly/custom cadence advancing from
+  completion time, streaks, a "what's due today" query), agent tools
+  (`life_add_domain`, `life_add_routine`, `life_complete_routine`, `life_due`,
+  `life_list`), and read/write `/v1/life` REST endpoints. Additive; opt-out via
+  `[lifemanager].enabled = false`. Existing life agent templates are unchanged.
+- **Task–Code Linkage** — records file changes (FileEvent) and commits
+  (CodeChangeLink) linked to tasks/agents/projects via an active-task
+  `WorkContext`, with agent tools (`codelink_*`), a Git→task recorder, an
+  optional `watchdog`-based file-watcher (off by default), and read-only
+  `/v1/codelink` endpoints. Additive; opt-out via `[codelink].enabled=false`;
+  watcher opt-in via `[codelink].watch_enabled=true`.
+- **Approval Center** — a generalized action-approval queue
+  (`ActionApprovalStore`) for arbitrary action types (code/file/email/plan/
+  deploy) with an Approve/Reject/Modify/Defer/Ask/Reopen lifecycle, an
+  append-only transition trail, a `[action_approvals]` config section, and
+  read/write `/v1/action-approvals` REST endpoints. Distinct from and additive
+  to the existing tool-gating approvals; opt-out via
+  `[action_approvals].enabled = false`.
+- **Persisted Event Log** — a durable, queryable SQLite store behind the
+  in-memory `EventBus` that persists every event (minus a configurable
+  denylist) with indexed correlation IDs (`agent_id`, `task_id`,
+  `project_id`, `run_id`) and the full JSON payload. New `[eventlog]` config
+  section and read-only `GET /v1/events` + `GET /v1/events/feed` endpoints.
+  Foundation for the Autonomous Workflow Engine (Approval Center, Task–Code
+  Linkage, audit, activity feed). Additive; opt-out via
+  `[eventlog].enabled = false`.
 - **Chief Orchestrator as canonical ingress** — chat-page and
   agent-interact traffic now routes through the designated Chief
   Orchestrator, which decides whether to answer directly, delegate to a

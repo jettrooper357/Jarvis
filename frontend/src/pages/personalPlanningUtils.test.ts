@@ -103,16 +103,20 @@ describe('personal planning utils', () => {
     expect(tasks[0].domain).toBe('church');
   });
 
-  it('builds jobs, detects routines, and summarizes durable items', () => {
+  it('builds jobs, excludes completed jobs, detects routines, and summarizes durable items', () => {
     vi.setSystemTime(now);
     const agents = [
       { id: 'agent-1', name: 'Sermon / Study Agent' } as ManagedAgent,
     ];
     const jobs = buildPlanningJobs(agents, {
-      'agent-1': [job({ id: 'job-1' })],
+      'agent-1': [
+        job({ id: 'job-1' }),
+        job({ id: 'job-2', status: 'completed' }),
+      ],
     });
 
     expect(jobs).toHaveLength(1);
+    expect(jobs[0].agentId).toBe('agent-1');
     expect(jobs[0].domain).toBe('church');
     expect(isHabitOrRoutine(jobs[0])).toBe(true);
     expect(summarizePlanning([], jobs, now).activeJobs).toBe(1);

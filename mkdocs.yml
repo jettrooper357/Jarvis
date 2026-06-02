@@ -185,6 +185,10 @@ nav:
       - External MCP Servers: user-guide/mcp-external-servers.md
       - Scheduler: user-guide/scheduler.md
       - Telemetry: user-guide/telemetry.md
+      - Event Log: user-guide/event-log.md
+      - Approval Center: user-guide/approval-center.md
+      - Task–Code Linkage: user-guide/task-code-linkage.md
+      - Life Manager: user-guide/life-manager.md
       - Security: user-guide/security.md
       - Approvals: user-guide/approvals.md
       - Learning & Distillation: user-guide/learning-distillation.md

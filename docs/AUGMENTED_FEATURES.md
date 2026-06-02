@@ -290,5 +290,7 @@ Protected behavior:
 - the dashboard remains a derived view over durable tasks and jobs,
 - life-domain and horizon filters do not replace canonical project/task/job
   persistence,
+- completing a planning item updates the durable project task or agent job
+  status and then removes completed work from the derived planning queue,
 - existing Mission Control, Agents, Projects, and Jobs routes remain unchanged,
 - no hidden chain-of-thought is displayed in dashboard rows or summaries.
