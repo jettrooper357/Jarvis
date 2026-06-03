@@ -4355,6 +4355,7 @@ type InterAgentActivityItem = {
   title: string;
   body: string;
   timestamp: number;
+  labels?: string[];
 };
 
 function activityTypeStyle(type: InterAgentActivityItem['type']): { color: string; label: string } {
@@ -4402,6 +4403,12 @@ function InterAgentActivityPanel({
             .map((message): InterAgentActivityItem => {
             const isResponse = message.direction === 'agent_to_user';
             const body = message.content.replace(/\s+/g, ' ').trim();
+            const lowerBody = body.toLowerCase();
+            const labels: string[] = [];
+            if (lowerBody.includes('watchtower-triggered')) labels.push('Watchtower-triggered');
+            if (lowerBody.includes('chief')) labels.push('Chief-requested');
+            if (lowerBody.includes('workflow manager')) labels.push('Workflow Manager update');
+            if (isResponse && lowerBody.includes('watchtower')) labels.push('Sub-agent response');
             return {
               id: `msg-${message.id}`,
               agentId: agent.id,
@@ -4409,6 +4416,7 @@ function InterAgentActivityPanel({
               title: agent.name,
               body: body || (isResponse ? 'Response recorded.' : 'Request received.'),
               timestamp: message.created_at,
+              labels,
             };
           });
         }),
@@ -4627,6 +4635,22 @@ function InterAgentActivityPanel({
                     >
                       {style.label}
                     </span>
+                    {!!item.labels?.length && (
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {item.labels.map((label) => (
+                          <span
+                            key={label}
+                            className="inline-flex rounded-md px-2 py-0.5 text-[10px] font-medium"
+                            style={{
+                              background: 'color-mix(in srgb, var(--color-accent) 14%, transparent)',
+                              color: 'var(--color-accent)',
+                            }}
+                          >
+                            {label}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               </button>

@@ -23,6 +23,7 @@ from openjarvis.server.projects_router import create_projects_router
 from openjarvis.server.routes import router
 from openjarvis.server.shortcuts_router import create_shortcuts_router
 from openjarvis.server.upload_router import router as upload_router
+from openjarvis.server.watchtower_routes import create_watchtower_router
 
 logger = logging.getLogger(__name__)
 
@@ -417,6 +418,48 @@ def create_app(
     except Exception:
         pass  # autonomy is optional; don't block server startup
 
+    # Wire up Jarvis Watchtower. It owns separate additive tables and must
+    # never block the existing server if unavailable.
+    app.state.watchtower_store = None
+    app.state.watchtower_service = None
+    try:
+        from openjarvis.channels.telegram import TelegramChannel
+        from openjarvis.projects.store import ProjectStore
+        from openjarvis.watchtower.service import WatchtowerService
+        from openjarvis.watchtower.store import WatchtowerStore
+        from openjarvis.watchtower.types import WatchtowerSettings
+
+        wt_store = WatchtowerStore()
+        wt_settings = WatchtowerSettings.from_dict(wt_store.get_settings())
+        app.state.watchtower_store = wt_store
+        telegram_channel = None
+        telegram_chat_id = ""
+        if wt_settings.telegram_enabled:
+            try:
+                telegram_channel = TelegramChannel(
+                    bus=getattr(app.state, "bus", None)
+                )
+                allowed = getattr(telegram_channel, "_allowed_chat_ids", "") or ""
+                telegram_chat_id = str(allowed).split(",", 1)[0].strip()
+            except Exception:
+                telegram_channel = None
+        app.state.watchtower_service = WatchtowerService(
+            store=wt_store,
+            settings=wt_settings,
+            project_store=ProjectStore(),
+            agent_manager=agent_manager,
+            approval_store=getattr(app.state, "approval_store", None),
+            event_bus=getattr(app.state, "bus", None),
+            telegram_channel=telegram_channel,
+            telegram_chat_id=telegram_chat_id,
+            provider_config={"engine": getattr(app.state, "engine_name", "")},
+            engine=getattr(app.state, "engine", None),
+        )
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Failed to initialise Watchtower"
+        )
+
     @app.on_event("startup")
     async def _warm_up_models() -> None:
         """Preload STT/TTS/LLM weights off the request path so the *first*
@@ -470,6 +513,22 @@ def create_app(
 
         threading.Thread(target=_warm, name="jarvis-warmup", daemon=True).start()
 
+        wt_service = getattr(app.state, "watchtower_service", None)
+        try:
+            if wt_service is not None:
+                wt_service.start()
+        except Exception:
+            logger.exception("Watchtower startup failed")
+
+    @app.on_event("shutdown")
+    async def _stop_watchtower() -> None:
+        wt_service = getattr(app.state, "watchtower_service", None)
+        try:
+            if wt_service is not None:
+                wt_service.stop()
+        except Exception:
+            logger.exception("Watchtower shutdown failed")
+
     app.include_router(router)
     app.include_router(dashboard_router)
     app.include_router(comparison_router)
@@ -477,6 +536,7 @@ def create_app(
     app.include_router(create_projects_router())
     app.include_router(create_digest_router())
     app.include_router(create_shortcuts_router())
+    app.include_router(create_watchtower_router())
     app.include_router(upload_router)
     uploads_dir = DEFAULT_CONFIG_DIR / "data" / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)

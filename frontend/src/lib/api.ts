@@ -255,6 +255,170 @@ export async function fetchTraces(limit: number = 50): Promise<unknown> {
 }
 
 // ---------------------------------------------------------------------------
+// Watchtower
+// ---------------------------------------------------------------------------
+
+export type WatchtowerPriority = 'info' | 'low' | 'normal' | 'high' | 'urgent' | 'emergency';
+
+export interface WatchtowerStatus {
+  enabled: boolean;
+  running: boolean;
+  last_scan_at: number | null;
+  local_ai_status: string;
+  local_ai_only: boolean;
+  local_ai_provider: string;
+  rules_fallback_active: boolean;
+  dnd_active: boolean;
+  telegram_enabled: boolean;
+  active_findings: number;
+  pending_internal_routes: number;
+}
+
+export interface WatchtowerFinding {
+  finding_id: string;
+  finding_type: string;
+  entity_type: string;
+  entity_id: string;
+  project_id?: string | null;
+  task_id?: string | null;
+  agent_id?: string | null;
+  priority: WatchtowerPriority;
+  status: string;
+  reason: string;
+  recommended_action: string;
+  created_at: number;
+  updated_at: number;
+  resolved_at?: number | null;
+  last_notified_at?: number | null;
+  notification_count: number;
+  dedupe_key: string;
+  metadata_json: Record<string, unknown>;
+}
+
+export interface WatchtowerInternalRoute {
+  route_id: string;
+  finding_id: string;
+  source: string;
+  from_agent_id: string;
+  to_agent_id: string;
+  route_type: string;
+  priority: WatchtowerPriority;
+  message_type: string;
+  requires_response: boolean;
+  response_due_at?: number | null;
+  status: string;
+  created_at: number;
+  responded_at?: number | null;
+  escalated_at?: number | null;
+  metadata_json: Record<string, unknown>;
+}
+
+export interface WatchtowerSettings {
+  enabled: boolean;
+  loop_interval_seconds: number;
+  local_ai_only: boolean;
+  local_model_required: boolean;
+  fallback_to_rules_if_local_ai_unavailable: boolean;
+  dnd_enabled: boolean;
+  quiet_hours_start: string;
+  quiet_hours_end: string;
+  dnd_timezone: string;
+  allow_emergency_bypass: boolean;
+  allow_urgent_bypass: boolean;
+  defer_low_priority: boolean;
+  defer_normal_priority: boolean;
+  defer_high_priority: boolean;
+  in_app_enabled: boolean;
+  telegram_enabled: boolean;
+  in_app_min_priority: WatchtowerPriority;
+  telegram_min_priority: WatchtowerPriority;
+  both_min_priority: WatchtowerPriority;
+  default_cooldown_minutes: number;
+  emergency_cooldown_minutes: number;
+  digest_interval_minutes: number;
+  internal_route_timeout_minutes: number;
+  local_ai_provider: string;
+}
+
+async function watchtowerJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${getBase()}${path}`, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(init?.headers || {}),
+    },
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => res.statusText);
+    throw new Error(`Watchtower request failed: ${detail || res.status}`);
+  }
+  return res.json();
+}
+
+export async function fetchWatchtowerStatus(): Promise<WatchtowerStatus> {
+  return watchtowerJson<WatchtowerStatus>('/v1/watchtower/status');
+}
+
+export async function fetchWatchtowerFindings(
+  status = 'active',
+): Promise<WatchtowerFinding[]> {
+  const qs = status ? `?status=${encodeURIComponent(status)}` : '';
+  const data = await watchtowerJson<{ findings: WatchtowerFinding[] }>(
+    `/v1/watchtower/findings${qs}`,
+  );
+  return data.findings || [];
+}
+
+export async function fetchWatchtowerInternalRoutes(
+  status = 'sent',
+): Promise<WatchtowerInternalRoute[]> {
+  const qs = status ? `?status=${encodeURIComponent(status)}` : '';
+  const data = await watchtowerJson<{ routes: WatchtowerInternalRoute[] }>(
+    `/v1/watchtower/internal-routes${qs}`,
+  );
+  return data.routes || [];
+}
+
+export async function resolveWatchtowerFinding(findingId: string): Promise<void> {
+  await watchtowerJson(`/v1/watchtower/findings/${encodeURIComponent(findingId)}/resolve`, {
+    method: 'POST',
+  });
+}
+
+export async function snoozeWatchtowerFinding(
+  findingId: string,
+  minutes = 60,
+): Promise<void> {
+  await watchtowerJson(`/v1/watchtower/findings/${encodeURIComponent(findingId)}/snooze`, {
+    method: 'POST',
+    body: JSON.stringify({ minutes }),
+  });
+}
+
+export async function escalateWatchtowerFinding(findingId: string): Promise<void> {
+  await watchtowerJson(`/v1/watchtower/findings/${encodeURIComponent(findingId)}/escalate`, {
+    method: 'POST',
+  });
+}
+
+export async function scanWatchtowerNow(): Promise<{ findings: WatchtowerFinding[] }> {
+  return watchtowerJson('/v1/watchtower/scan-now', { method: 'POST' });
+}
+
+export async function fetchWatchtowerSettings(): Promise<WatchtowerSettings> {
+  return watchtowerJson<WatchtowerSettings>('/v1/watchtower/settings');
+}
+
+export async function patchWatchtowerSettings(
+  settings: Partial<WatchtowerSettings>,
+): Promise<WatchtowerSettings> {
+  return watchtowerJson<WatchtowerSettings>('/v1/watchtower/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(settings),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Speech
 // ---------------------------------------------------------------------------
 

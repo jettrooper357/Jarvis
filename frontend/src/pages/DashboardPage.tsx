@@ -8,6 +8,7 @@ import { JarvisCore } from '../components/Jarvis/JarvisCore';
 import { JarvisStatusPanel } from '../components/Jarvis/JarvisStatusPanel';
 import { HudFrame } from '../components/Jarvis/HudFrame';
 import { MissionControlPanel } from '../components/MissionControl/MissionControlPanel';
+import { WatchtowerPanel } from '../components/Watchtower/WatchtowerPanel';
 import { useJarvisState } from '../hooks/useJarvisState';
 
 const STATUS_META: Record<string, { word: string; color: string }> = {
@@ -98,6 +99,7 @@ export function DashboardPage() {
 
           {/* Primary operational focus: projects, tasks, agents */}
           <MissionControlPanel />
+          <WatchtowerPanel />
 
           {/* Secondary, collapsed by default: engine telemetry */}
           <div

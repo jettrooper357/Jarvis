@@ -34,6 +34,7 @@ import {
 } from '../lib/api';
 import { VoiceCreator } from '../components/Settings/VoiceCreator';
 import { ShortcutsSettings } from '../components/Settings/ShortcutsSettings';
+import { WatchtowerSettingsSection } from '../components/Watchtower/WatchtowerSettingsSection';
 
 function OllamaModelList() {
   const [models, setModels] = useState<Array<{ name: string; size: number }>>([]);
@@ -394,6 +395,11 @@ export function SettingsPage() {
             <SettingRow label="Web Search" description="SerpAPI or Tavily key for web search tool">
               <ApiKeyInput storageKey="openjarvis-search-key" placeholder="API key..." />
             </SettingRow>
+          </Section>
+
+          {/* Watchtower */}
+          <Section title="Watchtower">
+            <WatchtowerSettingsSection />
           </Section>
 
           {/* Shortcuts */}
