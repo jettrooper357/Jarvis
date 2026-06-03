@@ -1501,6 +1501,10 @@ def include_all_routes(app) -> None:
 
     app.include_router(org_router)
 
+    from openjarvis.server.autonomy_routes import autonomy_router
+
+    app.include_router(autonomy_router)
+
     # Agent Manager routes (if available)
     try:
         if hasattr(app.state, "agent_manager") and app.state.agent_manager:

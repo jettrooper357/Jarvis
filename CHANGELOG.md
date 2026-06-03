@@ -10,6 +10,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Controlled Autonomy (Rollback + Audit)** — a `RollbackStore` that records
+  reversible autonomous actions with an undo payload and reverts them via a
+  handler registry (built-in `file_write` restores prior bytes / deletes
+  newly-created files; irreversible types like email/deploy get a
+  compensating-note and are never auto-undone; handler failure is captured),
+  plus an Event-Log audit-report builder, agent tools (`rollback_record`,
+  `rollback_list`, `rollback_revert`, `audit_report`), and `/v1/rollback*` +
+  `/v1/audit/report` REST endpoints. Additive; opt-out via
+  `[autonomy].enabled=false`. Does not change the scheduler or approval-gating
+  paths.
 - **Agent Org Expansion** — a default agent hierarchy (Chief Orchestrator →
   Executive Assistant / Workflow Manager / CTO / Knowledge Manager / Life
   Manager → specialists) via 15 new role templates, an optional `org_role`

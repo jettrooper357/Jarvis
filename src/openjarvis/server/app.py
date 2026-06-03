@@ -403,6 +403,20 @@ def create_app(
     except Exception:
         pass  # life manager is optional; don't block server startup
 
+    # Wire up the Controlled Autonomy rollback store if enabled
+    app.state.rollback_store = None
+    try:
+        from openjarvis.autonomy.rollback_store import RollbackStore
+        from openjarvis.core.config import load_config
+
+        cfg = config if config is not None else load_config()
+        if cfg.autonomy.enabled:
+            app.state.rollback_store = RollbackStore(
+                db_path=cfg.autonomy.db_path
+            )
+    except Exception:
+        pass  # autonomy is optional; don't block server startup
+
     @app.on_event("startup")
     async def _warm_up_models() -> None:
         """Preload STT/TTS/LLM weights off the request path so the *first*

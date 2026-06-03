@@ -924,6 +924,14 @@ class LifeManagerConfig:
 
 
 @dataclass(slots=True)
+class AutonomyConfig:
+    """Controlled Autonomy (rollback + audit) settings."""
+
+    enabled: bool = True
+    db_path: str = str(DEFAULT_CONFIG_DIR / "autonomy.db")
+
+
+@dataclass(slots=True)
 class TelegramChannelConfig:
     """Per-channel config for Telegram."""
 
@@ -1545,6 +1553,7 @@ class JarvisConfig:
     )
     codelink: CodeLinkConfig = field(default_factory=CodeLinkConfig)
     lifemanager: LifeManagerConfig = field(default_factory=LifeManagerConfig)
+    autonomy: AutonomyConfig = field(default_factory=AutonomyConfig)
     channel: ChannelConfig = field(default_factory=ChannelConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
@@ -1819,6 +1828,7 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
             "action_approvals",
             "codelink",
             "lifemanager",
+            "autonomy",
             "security",
             "channel",
             "tools",
@@ -2183,6 +2193,7 @@ __all__ = [
     "ActionApprovalsConfig",
     "CodeLinkConfig",
     "LifeManagerConfig",
+    "AutonomyConfig",
     "VLLMEngineConfig",
     "WebChatChannelConfig",
     "WebhookChannelConfig",
