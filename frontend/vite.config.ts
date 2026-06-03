@@ -4,6 +4,8 @@ import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { VitePWA } from 'vite-plugin-pwa';
 
+const apiTarget = process.env.VITE_API_URL || 'http://127.0.0.1:8000';
+
 export default defineConfig({
   resolve: {
     alias: {
@@ -56,11 +58,11 @@ export default defineConfig({
       // ws:true, so this must be the object form. Without it, text chat (HTTP
       // SSE) works but voice silently fails to connect.
       '/v1': {
-        target: process.env.VITE_API_URL || 'http://localhost:8000',
+        target: apiTarget,
         changeOrigin: true,
         ws: true,
       },
-      '/health': process.env.VITE_API_URL || 'http://localhost:8000',
+      '/health': apiTarget,
     },
   },
 });
