@@ -452,7 +452,10 @@ def create_app(
             event_bus=getattr(app.state, "bus", None),
             telegram_channel=telegram_channel,
             telegram_chat_id=telegram_chat_id,
-            provider_config={"engine": getattr(app.state, "engine_name", "")},
+            provider_config={
+                "engine": wt_settings.local_ai_provider
+                or getattr(app.state, "engine_name", "")
+            },
             engine=getattr(app.state, "engine", None),
         )
     except Exception:

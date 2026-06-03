@@ -128,6 +128,7 @@ class WatchtowerSettings:
     enabled: bool = True
     loop_interval_seconds: int = 60
     local_ai_only: bool = True
+    local_ai_provider: str = "ollama"
     local_model_required: bool = True
     fallback_to_rules_if_local_ai_unavailable: bool = True
     dnd_enabled: bool = True

@@ -30,12 +30,17 @@ def test_watchtower_status_and_settings_routes(tmp_path) -> None:
     assert client.get("/v1/watchtower/status").status_code == 200
     response = client.patch(
         "/v1/watchtower/settings",
-        json={"telegram_min_priority": "urgent", "loop_interval_seconds": 120},
+        json={
+            "telegram_min_priority": "urgent",
+            "loop_interval_seconds": 120,
+            "local_ai_provider": "llamacpp",
+        },
     )
 
     assert response.status_code == 200
     assert response.json()["telegram_min_priority"] == "urgent"
     assert response.json()["loop_interval_seconds"] == 120
+    assert response.json()["local_ai_provider"] == "llamacpp"
     store.close()
 
 

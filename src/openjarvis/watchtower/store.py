@@ -352,6 +352,26 @@ class WatchtowerStore:
         self._conn.commit()
         return self.get_internal_route(route_id)  # type: ignore[return-value]
 
+    def get_recent_internal_route(
+        self,
+        *,
+        finding_id: str,
+        route_type: str,
+        to_agent_id: str,
+        cooldown_seconds: float,
+        statuses: tuple[str, ...] = ("pending", "sent"),
+    ) -> Optional[InternalRoute]:
+        placeholders = ", ".join("?" for _ in statuses)
+        cutoff = _now() - cooldown_seconds
+        row = self._conn.execute(
+            "SELECT * FROM watchtower_internal_routes"
+            " WHERE finding_id = ? AND route_type = ? AND to_agent_id = ?"
+            f" AND status IN ({placeholders}) AND created_at >= ?"
+            " ORDER BY created_at DESC LIMIT 1",
+            (finding_id, route_type, to_agent_id, *statuses, cutoff),
+        ).fetchone()
+        return self._row_to_route(row) if row else None
+
     def get_internal_route(self, route_id: str) -> Optional[InternalRoute]:
         row = self._conn.execute(
             "SELECT * FROM watchtower_internal_routes WHERE route_id = ?",
@@ -376,6 +396,45 @@ class WatchtowerStore:
             (*params, int(limit)),
         ).fetchall()
         return [self._row_to_route(row) for row in rows]
+
+    def list_notifications(
+        self,
+        *,
+        finding_id: str | None = None,
+        decision: str | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if finding_id:
+            clauses.append("finding_id = ?")
+            params.append(finding_id)
+        if decision:
+            clauses.append("decision = ?")
+            params.append(decision)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM watchtower_notifications{where}"
+            " ORDER BY COALESCE(sent_at, rowid) DESC LIMIT ?",
+            (*params, int(limit)),
+        ).fetchall()
+        return [
+            {
+                "notification_id": row["notification_id"],
+                "finding_id": row["finding_id"],
+                "priority": row["priority"],
+                "route": row["route"],
+                "title": row["title"],
+                "body": row["body"],
+                "decision": row["decision"],
+                "dnd_applied": bool(row["dnd_applied"]),
+                "bypassed_dnd": bool(row["bypassed_dnd"]),
+                "sent_at": row["sent_at"],
+                "error_message": row["error_message"],
+                "metadata": _parse_json(row["metadata_json"]),
+            }
+            for row in rows
+        ]
 
     def update_internal_route_status(self, route_id: str, status: str) -> InternalRoute:
         now = _now()

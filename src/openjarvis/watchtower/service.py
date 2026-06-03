@@ -5,12 +5,14 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime
 from typing import Any, Dict, List
 
 from openjarvis.core.events import EventType
 from openjarvis.watchtower.internal_router import InternalRouter
 from openjarvis.watchtower.local_reasoner import LocalReasoner
 from openjarvis.watchtower.notifier import WatchtowerNotifier
+from openjarvis.watchtower.priority import priority_at_least
 from openjarvis.watchtower.rules import WatchtowerRules
 from openjarvis.watchtower.store import WatchtowerStore
 from openjarvis.watchtower.types import Priority, WatchtowerFinding, WatchtowerSettings
@@ -78,13 +80,23 @@ class WatchtowerService:
     def status(self) -> Dict[str, Any]:
         active_findings = len(self.store.list_findings(status="active", limit=500))
         pending_routes = len(self.store.list_internal_routes(status="sent", limit=500))
+        now = datetime.now()
+        dnd_active = False
+        if self.settings.dnd_enabled:
+            from openjarvis.watchtower.dnd import DoNotDisturbPolicy
+
+            dnd_active = DoNotDisturbPolicy(self.settings).is_active(now)
         return {
             "enabled": self.settings.enabled,
             "running": self.is_running,
             "last_scan_at": self.last_scan_at,
             "last_error": self.last_error,
             "local_ai_status": self.local_ai_status,
+            "local_ai_only": self.settings.local_ai_only,
+            "local_ai_provider": self.settings.local_ai_provider,
+            "rules_fallback_active": self.local_ai_status == "rules_fallback",
             "dnd_enabled": self.settings.dnd_enabled,
+            "dnd_active": dnd_active,
             "telegram_enabled": self.settings.telegram_enabled,
             "active_findings": active_findings,
             "pending_internal_routes": pending_routes,
@@ -133,10 +145,21 @@ class WatchtowerService:
 
     def _route_finding(self, finding: WatchtowerFinding) -> None:
         self.internal_router.route_to_chief(finding)
-        if finding.priority in (Priority.URGENT, Priority.EMERGENCY):
+        if self._should_notify_user(finding):
             self.notifier.notify(finding)
-        elif finding.finding_type == "stale_approval":
-            self.notifier.notify(finding)
+
+    def _should_notify_user(self, finding: WatchtowerFinding) -> bool:
+        if finding.last_notified_at:
+            cooldown = (
+                self.settings.emergency_cooldown_minutes
+                if finding.priority is Priority.EMERGENCY
+                else self.settings.default_cooldown_minutes
+            )
+            if time.time() - finding.last_notified_at < cooldown * 60:
+                return False
+        if finding.finding_type in {"stale_approval", "task_waiting_user_input"}:
+            return True
+        return priority_at_least(finding.priority, Priority.HIGH)
 
     def _collect_rule_findings(self, *, now_ts: float) -> List[Dict[str, Any]]:
         findings: list[dict[str, Any]] = []

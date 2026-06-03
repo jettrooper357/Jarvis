@@ -42,6 +42,14 @@ class InternalRouter:
         chief = self.agent_manager.get_chief_agent()
         if not chief:
             return None
+        recent = self.store.get_recent_internal_route(
+            finding_id=finding.finding_id,
+            route_type="send_to_chief",
+            to_agent_id=chief["id"],
+            cooldown_seconds=self.settings.default_cooldown_minutes * 60,
+        )
+        if recent is not None:
+            return recent
         message_type = _MESSAGE_TYPE_BY_FINDING.get(
             finding.finding_type,
             "status_request",

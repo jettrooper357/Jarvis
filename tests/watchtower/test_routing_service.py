@@ -7,7 +7,7 @@ from openjarvis.watchtower.store import WatchtowerStore
 from openjarvis.watchtower.types import Priority, WatchtowerSettings
 
 
-def test_normal_overdue_task_routes_to_chief_not_direct_user(tmp_path) -> None:
+def test_high_overdue_task_routes_to_chief_and_notifies_user(tmp_path) -> None:
     project_store = ProjectStore(tmp_path / "projects.db")
     project = project_store.create_project(name="AutoFax", status="Active")
     project_store.create_task(
@@ -38,10 +38,47 @@ def test_normal_overdue_task_routes_to_chief_not_direct_user(tmp_path) -> None:
     assert len(routes) == 1
     assert routes[0].to_agent_id == chief["id"]
     assert routes[0].route_type == "send_to_chief"
-    assert store.list_findings()[0].notification_count == 0
+    assert store.list_findings()[0].notification_count == 1
+    notifications = store.list_notifications(finding_id=finding.finding_id)
+    assert notifications[0]["route"] == "in_app_user"
+    assert notifications[0]["decision"] == "sent"
     messages = manager.list_messages(chief["id"], include_all_sessions=True)
     assert "Watchtower-triggered internal route" in messages[0]["content"]
     assert service.local_ai_status == "rules_fallback"
+
+    store.close()
+    project_store.close()
+
+
+def test_scan_dedupes_internal_routes_and_notification_cooldown(tmp_path) -> None:
+    project_store = ProjectStore(tmp_path / "projects.db")
+    project = project_store.create_project(name="AutoFax", status="Active")
+    project_store.create_task(
+        project["id"],
+        title="Finish SQL migration",
+        status="In Progress",
+        due_date="2026-01-01",
+    )
+    manager = AgentManager(db_path=str(tmp_path / "agents.db"))
+    chief = manager.create_agent(name="Chief", org_role="chief")
+    manager.set_chief_agent(chief["id"])
+    store = WatchtowerStore(tmp_path / "watchtower.db")
+    service = WatchtowerService(
+        store=store,
+        settings=WatchtowerSettings(telegram_enabled=False),
+        project_store=project_store,
+        agent_manager=manager,
+        provider_config={"engine": "openai"},
+        engine=object(),
+    )
+
+    service.scan_once()
+    service.scan_once()
+
+    assert len(store.list_internal_routes()) == 1
+    finding = store.list_findings()[0]
+    assert finding.notification_count == 1
+    assert len(manager.list_messages(chief["id"], include_all_sessions=True)) == 1
 
     store.close()
     project_store.close()
