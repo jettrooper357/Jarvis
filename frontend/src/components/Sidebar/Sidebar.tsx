@@ -1,28 +1,19 @@
 import { useState } from 'react';
 import { useNavigate, useLocation } from 'react-router';
 import {
-  MessageSquare,
   Plus,
-  BarChart3,
-  Settings,
   Search,
   PanelLeftClose,
   PanelLeft,
   Cpu,
-  Rocket,
-  Bot,
   Sun,
   Moon,
   Monitor,
   Loader2,
-  ScrollText,
-  Database,
-  Library,
-  FolderKanban,
-  CalendarCheck,
 } from 'lucide-react';
 import { ConversationList } from './ConversationList';
 import { useAppStore } from '../../lib/store';
+import { workspaceNavItems } from '../../navigation/workspaces';
 
 export function Sidebar() {
   const navigate = useNavigate();
@@ -53,19 +44,6 @@ export function Sidebar() {
     createConversation(selectedModel);
     navigate('/');
   };
-
-  const navItems = [
-    { path: '/', icon: MessageSquare, label: 'Chat' },
-    { path: '/dashboard', icon: BarChart3, label: 'Mission Control' },
-    { path: '/data-sources', icon: Database, label: 'Data Sources' },
-    { path: '/agents', icon: Bot, label: 'Agents' },
-    { path: '/projects', icon: FolderKanban, label: 'Projects' },
-    { path: '/life-planner', icon: CalendarCheck, label: 'Personal Planning' },
-    { path: '/library', icon: Library, label: 'Library' },
-    { path: '/logs', icon: ScrollText, label: 'Logs' },
-    { path: '/settings', icon: Settings, label: 'Settings' },
-    { path: '/get-started', icon: Rocket, label: 'Get Started' },
-  ];
 
   return (
     <>
@@ -192,12 +170,16 @@ export function Sidebar() {
           </div>
 
           {/* Bottom nav */}
-          <nav className="px-2 pb-3 pt-2 flex flex-col gap-0.5" style={{ borderTop: '1px solid var(--color-border)' }}>
-            {navItems.map((item) => {
-              const isActive = location.pathname === item.path;
+          <nav
+            aria-label="Workspace navigation"
+            className="px-2 pb-3 pt-2 flex flex-col gap-0.5"
+            style={{ borderTop: '1px solid var(--color-border)' }}
+          >
+            {workspaceNavItems.map((item) => {
+              const isActive = item.match(location.pathname);
               return (
                 <button
-                  key={item.path}
+                  key={item.id}
                   onClick={() => navigate(item.path)}
                   className="relative flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors w-full text-left cursor-pointer"
                   style={{
