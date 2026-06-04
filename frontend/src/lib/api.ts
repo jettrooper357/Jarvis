@@ -270,6 +270,7 @@ export interface WatchtowerStatus {
   rules_fallback_active: boolean;
   dnd_active: boolean;
   telegram_enabled: boolean;
+  speech_enabled: boolean;
   active_findings: number;
   pending_internal_routes: number;
 }
@@ -313,6 +314,44 @@ export interface WatchtowerInternalRoute {
   metadata_json: Record<string, unknown>;
 }
 
+export interface WatchtowerNotification {
+  notification_id: string;
+  finding_id: string;
+  priority: WatchtowerPriority;
+  route: string;
+  title: string;
+  body: string;
+  decision: string;
+  dnd_applied: boolean;
+  bypassed_dnd: boolean;
+  sent_at?: number | null;
+  error_message?: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface WatchtowerSpeechEvent {
+  speech_event_id: string;
+  finding_id: string;
+  priority: WatchtowerPriority;
+  text_spoken: string;
+  dnd_applied: boolean;
+  bypassed_dnd: boolean;
+  spoken_at?: number | null;
+  success: boolean;
+  error_message?: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface WatchtowerBrief {
+  status: WatchtowerStatus;
+  active_count: number;
+  actionable_count: number;
+  items: WatchtowerFinding[];
+  recent_notifications: WatchtowerNotification[];
+  recent_speech: WatchtowerSpeechEvent[];
+  pending_routes: WatchtowerInternalRoute[];
+}
+
 export interface WatchtowerSettings {
   enabled: boolean;
   loop_interval_seconds: number;
@@ -330,13 +369,17 @@ export interface WatchtowerSettings {
   defer_high_priority: boolean;
   in_app_enabled: boolean;
   telegram_enabled: boolean;
+  speech_enabled: boolean;
   in_app_min_priority: WatchtowerPriority;
   telegram_min_priority: WatchtowerPriority;
+  speech_min_priority: WatchtowerPriority;
   both_min_priority: WatchtowerPriority;
+  speak_normal_priority: boolean;
+  speak_high_priority: boolean;
   default_cooldown_minutes: number;
   emergency_cooldown_minutes: number;
   digest_interval_minutes: number;
-  internal_route_timeout_minutes: number;
+  internal_response_minutes: number;
   local_ai_provider: string;
 }
 
@@ -357,6 +400,28 @@ async function watchtowerJson<T>(path: string, init?: RequestInit): Promise<T> {
 
 export async function fetchWatchtowerStatus(): Promise<WatchtowerStatus> {
   return watchtowerJson<WatchtowerStatus>('/v1/watchtower/status');
+}
+
+export async function fetchWatchtowerBrief(): Promise<WatchtowerBrief> {
+  return watchtowerJson<WatchtowerBrief>('/v1/watchtower/brief');
+}
+
+export async function fetchWatchtowerNotifications(
+  limit = 25,
+): Promise<WatchtowerNotification[]> {
+  const data = await watchtowerJson<{ notifications: WatchtowerNotification[] }>(
+    `/v1/watchtower/notifications?limit=${limit}`,
+  );
+  return data.notifications || [];
+}
+
+export async function fetchWatchtowerSpeechEvents(
+  limit = 25,
+): Promise<WatchtowerSpeechEvent[]> {
+  const data = await watchtowerJson<{ speech_events: WatchtowerSpeechEvent[] }>(
+    `/v1/watchtower/speech-events?limit=${limit}`,
+  );
+  return data.speech_events || [];
 }
 
 export async function fetchWatchtowerFindings(
@@ -398,6 +463,34 @@ export async function snoozeWatchtowerFinding(
 export async function escalateWatchtowerFinding(findingId: string): Promise<void> {
   await watchtowerJson(`/v1/watchtower/findings/${encodeURIComponent(findingId)}/escalate`, {
     method: 'POST',
+  });
+}
+
+export async function routeWatchtowerFindingToChief(findingId: string): Promise<void> {
+  await watchtowerJson('/v1/watchtower/route-to-chief', {
+    method: 'POST',
+    body: JSON.stringify({ finding_id: findingId }),
+  });
+}
+
+export async function speakWatchtowerFindingAgain(findingId: string): Promise<void> {
+  await watchtowerJson('/v1/watchtower/speak-again', {
+    method: 'POST',
+    body: JSON.stringify({ finding_id: findingId }),
+  });
+}
+
+export async function testWatchtowerTelegram(priority: WatchtowerPriority = 'high'): Promise<void> {
+  await watchtowerJson('/v1/watchtower/test-telegram', {
+    method: 'POST',
+    body: JSON.stringify({ priority }),
+  });
+}
+
+export async function testWatchtowerSpeech(priority: WatchtowerPriority = 'urgent'): Promise<void> {
+  await watchtowerJson('/v1/watchtower/test-speech', {
+    method: 'POST',
+    body: JSON.stringify({ priority }),
   });
 }
 

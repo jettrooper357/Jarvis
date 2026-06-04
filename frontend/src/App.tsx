@@ -23,6 +23,7 @@ import {
 import { CommandPalette } from './components/CommandPalette';
 import { SetupScreen } from './components/SetupScreen';
 import { Toaster } from './components/ui/sonner';
+import { WatchtowerNotifier } from './components/Watchtower/WatchtowerNotifier';
 import { useAppStore } from './lib/store';
 import { fetchModels, fetchServerInfo, fetchSavings, submitSavings, isTauri } from './lib/api';
 import { resolveModelSelection } from './lib/models';
@@ -284,6 +285,7 @@ export default function App() {
   return (
     <>
       <AppRoutes />
+      <WatchtowerNotifier />
       <Toaster position="bottom-right" />
       {commandPaletteOpen && <CommandPalette />}
       {optInModalOpen && (

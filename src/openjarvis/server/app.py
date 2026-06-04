@@ -452,6 +452,7 @@ def create_app(
             event_bus=getattr(app.state, "bus", None),
             telegram_channel=telegram_channel,
             telegram_chat_id=telegram_chat_id,
+            tts_backend=getattr(app.state, "tts_backend", None),
             provider_config={
                 "engine": wt_settings.local_ai_provider
                 or getattr(app.state, "engine_name", "")

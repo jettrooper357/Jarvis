@@ -179,10 +179,31 @@ export function WatchtowerSettingsSection() {
       <Row label="Telegram" description="Uses the existing Jarvis channel integration">
         <Toggle checked={settings.telegram_enabled} onChange={(telegram_enabled) => save({ telegram_enabled })} />
       </Row>
+      <Row label="Speech" description="Uses the existing Jarvis text-to-speech backend">
+        <Toggle checked={settings.speech_enabled} onChange={(speech_enabled) => save({ speech_enabled })} />
+      </Row>
       <Row label="Telegram minimum priority">
         <SelectPriority
           value={settings.telegram_min_priority}
           onChange={(telegram_min_priority) => save({ telegram_min_priority })}
+        />
+      </Row>
+      <Row label="Speech minimum priority">
+        <SelectPriority
+          value={settings.speech_min_priority}
+          onChange={(speech_min_priority) => save({ speech_min_priority })}
+        />
+      </Row>
+      <Row label="Speak high priority" description="Allow spoken alerts for high-priority items">
+        <Toggle
+          checked={settings.speak_high_priority}
+          onChange={(speak_high_priority) => save({ speak_high_priority })}
+        />
+      </Row>
+      <Row label="Speak normal priority" description="Usually leave off to avoid routine interruptions">
+        <Toggle
+          checked={settings.speak_normal_priority}
+          onChange={(speak_normal_priority) => save({ speak_normal_priority })}
         />
       </Row>
       <Row label="In-app minimum priority">

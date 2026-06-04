@@ -6,6 +6,7 @@ from openjarvis.watchtower.dnd import DoNotDisturbPolicy
 from openjarvis.watchtower.local_reasoner import is_local_provider
 from openjarvis.watchtower.notifier import WatchtowerNotifier
 from openjarvis.watchtower.rules import WatchtowerRules
+from openjarvis.watchtower.speech import WatchtowerSpeech
 from openjarvis.watchtower.store import WatchtowerStore
 from openjarvis.watchtower.types import DndDecision, Priority, WatchtowerSettings
 
@@ -130,4 +131,46 @@ def test_telegram_route_respects_min_priority(tmp_path) -> None:
 
     assert notifier.decide_route(normal).value == "none"
     assert notifier.decide_route(high).value == "telegram_user"
+    store.close()
+
+
+class _FakeTts:
+    backend_id = "fake"
+
+    def synthesize(self, text: str, **kwargs):
+        self.last_text = text
+        return object()
+
+
+def test_speech_only_triggers_at_configured_priority(tmp_path) -> None:
+    store = WatchtowerStore(tmp_path / "watchtower.db")
+    speech = WatchtowerSpeech(
+        store,
+        WatchtowerSettings(
+            speech_enabled=True,
+            speech_min_priority=Priority.URGENT,
+            # Isolate the priority threshold from DND quiet hours so this
+            # test is deterministic regardless of wall-clock time of day.
+            dnd_enabled=False,
+        ),
+        tts_backend=_FakeTts(),
+    )
+    normal = store.upsert_finding(
+        finding_type="due_soon_task",
+        entity_type="project_task",
+        entity_id="t1",
+        priority=Priority.NORMAL,
+        reason="soon",
+    )
+    urgent = store.upsert_finding(
+        finding_type="blocked_agent",
+        entity_type="agent",
+        entity_id="a1",
+        priority=Priority.URGENT,
+        reason="blocked",
+    )
+
+    assert speech.speak(normal)["success"] is False
+    assert speech.speak(urgent)["success"] is True
+    assert len(store.list_speech_events()) == 2
     store.close()

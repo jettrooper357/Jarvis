@@ -5,22 +5,32 @@ import {
   Bot,
   CheckCircle2,
   Clock,
+  MessageCircle,
   RadioTower,
   RefreshCw,
   ShieldAlert,
+  Volume2,
   WifiOff,
 } from 'lucide-react';
 import {
   escalateWatchtowerFinding,
   fetchWatchtowerFindings,
   fetchWatchtowerInternalRoutes,
+  fetchWatchtowerNotifications,
+  fetchWatchtowerSpeechEvents,
   fetchWatchtowerStatus,
   resolveWatchtowerFinding,
+  routeWatchtowerFindingToChief,
   scanWatchtowerNow,
   snoozeWatchtowerFinding,
+  speakWatchtowerFindingAgain,
+  testWatchtowerSpeech,
+  testWatchtowerTelegram,
   type WatchtowerFinding,
   type WatchtowerInternalRoute,
+  type WatchtowerNotification,
   type WatchtowerPriority,
+  type WatchtowerSpeechEvent,
   type WatchtowerStatus,
 } from '../../lib/api';
 
@@ -36,6 +46,8 @@ const priorityColor: Record<WatchtowerPriority, string> = {
 type WatchtowerTab =
   | 'All'
   | 'User Alerts'
+  | 'Spoken Alerts'
+  | 'Telegram Alerts'
   | 'Internal Routes'
   | 'Waiting on Agents'
   | 'Waiting on Me'
@@ -45,6 +57,8 @@ type WatchtowerTab =
 const tabs: WatchtowerTab[] = [
   'All',
   'User Alerts',
+  'Spoken Alerts',
+  'Telegram Alerts',
   'Internal Routes',
   'Waiting on Agents',
   'Waiting on Me',
@@ -114,20 +128,26 @@ export function WatchtowerPanel() {
   const [status, setStatus] = useState<WatchtowerStatus | null>(null);
   const [findings, setFindings] = useState<WatchtowerFinding[]>([]);
   const [routes, setRoutes] = useState<WatchtowerInternalRoute[]>([]);
+  const [notifications, setNotifications] = useState<WatchtowerNotification[]>([]);
+  const [speechEvents, setSpeechEvents] = useState<WatchtowerSpeechEvent[]>([]);
   const [activeTab, setActiveTab] = useState<WatchtowerTab>('All');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = async () => {
     setError(null);
-    const [nextStatus, nextFindings, nextRoutes] = await Promise.all([
+    const [nextStatus, nextFindings, nextRoutes, nextNotifications, nextSpeech] = await Promise.all([
       fetchWatchtowerStatus(),
       fetchWatchtowerFindings('active'),
       fetchWatchtowerInternalRoutes('sent'),
+      fetchWatchtowerNotifications(),
+      fetchWatchtowerSpeechEvents(),
     ]);
     setStatus(nextStatus);
     setFindings(nextFindings);
     setRoutes(nextRoutes);
+    setNotifications(nextNotifications);
+    setSpeechEvents(nextSpeech);
   };
 
   useEffect(() => {
@@ -146,7 +166,12 @@ export function WatchtowerPanel() {
   }, []);
 
   const visibleFindings = useMemo(() => {
-    if (activeTab === 'Internal Routes' || activeTab === 'Waiting on Agents') return [];
+    if (
+      activeTab === 'Internal Routes'
+      || activeTab === 'Waiting on Agents'
+      || activeTab === 'Spoken Alerts'
+      || activeTab === 'Telegram Alerts'
+    ) return [];
     return findings.filter((finding) => findingMatchesTab(finding, activeTab));
   }, [activeTab, findings]);
 
@@ -155,6 +180,11 @@ export function WatchtowerPanel() {
     if (activeTab === 'Internal Routes' || activeTab === 'Waiting on Agents') return routes;
     return [];
   }, [activeTab, routes]);
+
+  const visibleSpeechEvents = activeTab === 'Spoken Alerts' ? speechEvents : [];
+  const visibleTelegramNotifications = activeTab === 'Telegram Alerts'
+    ? notifications.filter((item) => item.route.includes('telegram') || item.route === 'both_user')
+    : [];
 
   const runScan = async () => {
     setLoading(true);
@@ -172,6 +202,16 @@ export function WatchtowerPanel() {
   const mutateFinding = async (
     action: () => Promise<void>,
   ) => {
+    setError(null);
+    try {
+      await action();
+      await refresh();
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const runAction = async (action: () => Promise<void>) => {
     setError(null);
     try {
       await action();
@@ -226,6 +266,7 @@ export function WatchtowerPanel() {
         <StatusPill icon={Bot} label={status?.rules_fallback_active ? 'Rules Fallback' : 'Local AI'} active={!status?.rules_fallback_active} />
         <StatusPill icon={Clock} label={status?.dnd_active ? 'DND Active' : 'DND Clear'} active={!!status?.dnd_active} />
         <StatusPill icon={Bell} label={status?.telegram_enabled ? 'Telegram On' : 'Telegram Off'} active={!!status?.telegram_enabled} />
+        <StatusPill icon={Volume2} label={status?.speech_enabled ? 'Speech On' : 'Speech Off'} active={!!status?.speech_enabled} />
       </div>
 
       <div className="mt-3 flex flex-wrap gap-1">
@@ -258,7 +299,8 @@ export function WatchtowerPanel() {
               Loading Watchtower state...
             </div>
           )}
-          {!loading && visibleFindings.length === 0 && visibleRoutes.length === 0 && (
+          {!loading && visibleFindings.length === 0 && visibleRoutes.length === 0
+            && visibleSpeechEvents.length === 0 && visibleTelegramNotifications.length === 0 && (
             <div className="rounded p-3 text-xs" style={{ color: 'var(--color-text-tertiary)', background: 'var(--color-bg-tertiary)' }}>
               No active Watchtower items for this view.
             </div>
@@ -315,7 +357,67 @@ export function WatchtowerPanel() {
                   <ShieldAlert size={12} />
                   Escalate
                 </button>
+                <button
+                  type="button"
+                  onClick={() => runAction(() => routeWatchtowerFindingToChief(finding.finding_id))}
+                  className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs"
+                  style={{ background: 'var(--color-bg-tertiary)', color: 'var(--color-accent)' }}
+                >
+                  <Bot size={12} />
+                  Ask Chief
+                </button>
+                <button
+                  type="button"
+                  onClick={() => runAction(() => speakWatchtowerFindingAgain(finding.finding_id))}
+                  className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs"
+                  style={{ background: 'var(--color-bg-tertiary)', color: 'var(--color-text-secondary)' }}
+                >
+                  <Volume2 size={12} />
+                  Speak Again
+                </button>
               </div>
+            </article>
+          ))}
+
+          {visibleSpeechEvents.map((event) => (
+            <article
+              key={event.speech_event_id}
+              className="rounded p-3"
+              style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border-subtle)' }}
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge tone={priorityColor[event.priority]}>{event.priority}</Badge>
+                <Badge tone={event.success ? 'var(--color-success)' : 'var(--color-error)'}>
+                  {event.success ? 'Spoken' : 'Speech Failed'}
+                </Badge>
+                {event.dnd_applied && <Badge>DND Applied</Badge>}
+              </div>
+              <p className="mt-2 text-xs leading-relaxed" style={{ color: 'var(--color-text-secondary)' }}>
+                {event.text_spoken}
+              </p>
+              <p className="mt-1 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                {event.error_message || formatTime(event.spoken_at)}
+              </p>
+            </article>
+          ))}
+
+          {visibleTelegramNotifications.map((notification) => (
+            <article
+              key={notification.notification_id}
+              className="rounded p-3"
+              style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border-subtle)' }}
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge tone={priorityColor[notification.priority]}>{notification.priority}</Badge>
+                <Badge>Telegram</Badge>
+                <Badge>{notification.decision}</Badge>
+              </div>
+              <h3 className="mt-2 text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+                {notification.title}
+              </h3>
+              <p className="mt-1 text-xs leading-relaxed" style={{ color: 'var(--color-text-secondary)' }}>
+                {notification.body}
+              </p>
             </article>
           ))}
 
@@ -376,6 +478,26 @@ export function WatchtowerPanel() {
               <dd className="text-right">{status?.local_ai_status || 'unknown'}</dd>
             </div>
           </dl>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => runAction(() => testWatchtowerTelegram())}
+              className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs"
+              style={{ background: 'var(--color-bg-tertiary)', color: 'var(--color-text-secondary)' }}
+            >
+              <MessageCircle size={12} />
+              Telegram Test
+            </button>
+            <button
+              type="button"
+              onClick={() => runAction(() => testWatchtowerSpeech())}
+              className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs"
+              style={{ background: 'var(--color-bg-tertiary)', color: 'var(--color-text-secondary)' }}
+            >
+              <Volume2 size={12} />
+              Speech Test
+            </button>
+          </div>
         </aside>
       </div>
     </section>

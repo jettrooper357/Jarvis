@@ -53,6 +53,19 @@ CREATE TABLE IF NOT EXISTS watchtower_notifications (
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS watchtower_speech_events (
+    speech_event_id TEXT PRIMARY KEY,
+    finding_id TEXT NOT NULL,
+    priority TEXT NOT NULL,
+    text_spoken TEXT NOT NULL,
+    dnd_applied INTEGER NOT NULL DEFAULT 0,
+    bypassed_dnd INTEGER NOT NULL DEFAULT 0,
+    spoken_at REAL,
+    success INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE TABLE IF NOT EXISTS watchtower_internal_routes (
     route_id TEXT PRIMARY KEY,
     finding_id TEXT NOT NULL,
@@ -94,6 +107,9 @@ ON watchtower_findings(status, priority);
 
 CREATE INDEX IF NOT EXISTS idx_watchtower_routes_status
 ON watchtower_internal_routes(status, priority);
+
+CREATE INDEX IF NOT EXISTS idx_watchtower_speech_finding
+ON watchtower_speech_events(finding_id, spoken_at);
 """
 
 
@@ -435,6 +451,101 @@ class WatchtowerStore:
             }
             for row in rows
         ]
+
+    def record_speech_event(
+        self,
+        *,
+        finding_id: str,
+        priority: Priority | str,
+        text_spoken: str,
+        success: bool,
+        dnd_applied: bool = False,
+        bypassed_dnd: bool = False,
+        error_message: str | None = None,
+        metadata: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        now = _now()
+        speech_event_id = _id("ws_")
+        pri = priority if isinstance(priority, Priority) else Priority(str(priority))
+        spoken_at = now if success else None
+        self._conn.execute(
+            "INSERT INTO watchtower_speech_events"
+            " (speech_event_id, finding_id, priority, text_spoken,"
+            " dnd_applied, bypassed_dnd, spoken_at, success, error_message,"
+            " metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                speech_event_id,
+                finding_id,
+                pri.value,
+                text_spoken,
+                1 if dnd_applied else 0,
+                1 if bypassed_dnd else 0,
+                spoken_at,
+                1 if success else 0,
+                error_message,
+                _json(metadata),
+            ),
+        )
+        self._conn.commit()
+        return {
+            "speech_event_id": speech_event_id,
+            "finding_id": finding_id,
+            "priority": pri.value,
+            "text_spoken": text_spoken,
+            "dnd_applied": dnd_applied,
+            "bypassed_dnd": bypassed_dnd,
+            "spoken_at": spoken_at,
+            "success": success,
+            "error_message": error_message,
+            "metadata": metadata or {},
+        }
+
+    def list_speech_events(
+        self,
+        *,
+        finding_id: str | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        params: list[Any] = []
+        where = ""
+        if finding_id:
+            where = " WHERE finding_id = ?"
+            params.append(finding_id)
+        rows = self._conn.execute(
+            f"SELECT * FROM watchtower_speech_events{where}"
+            " ORDER BY COALESCE(spoken_at, rowid) DESC LIMIT ?",
+            (*params, int(limit)),
+        ).fetchall()
+        return [
+            {
+                "speech_event_id": row["speech_event_id"],
+                "finding_id": row["finding_id"],
+                "priority": row["priority"],
+                "text_spoken": row["text_spoken"],
+                "dnd_applied": bool(row["dnd_applied"]),
+                "bypassed_dnd": bool(row["bypassed_dnd"]),
+                "spoken_at": row["spoken_at"],
+                "success": bool(row["success"]),
+                "error_message": row["error_message"],
+                "metadata": _parse_json(row["metadata_json"]),
+            }
+            for row in rows
+        ]
+
+    def list_overdue_internal_routes(
+        self,
+        *,
+        now_ts: float,
+        limit: int = 100,
+    ) -> List[InternalRoute]:
+        rows = self._conn.execute(
+            "SELECT * FROM watchtower_internal_routes"
+            " WHERE status = 'sent' AND requires_response = 1"
+            " AND response_due_at IS NOT NULL AND response_due_at <= ?"
+            " ORDER BY response_due_at ASC LIMIT ?",
+            (now_ts, int(limit)),
+        ).fetchall()
+        return [self._row_to_route(row) for row in rows]
 
     def update_internal_route_status(self, route_id: str, status: str) -> InternalRoute:
         now = _now()

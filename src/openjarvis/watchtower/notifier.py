@@ -40,12 +40,14 @@ class WatchtowerNotifier:
         event_bus: Any = None,
         telegram_channel: Any = None,
         telegram_chat_id: str = "",
+        speech: Any = None,
     ) -> None:
         self.store = store
         self.settings = settings
         self.event_bus = event_bus
         self.telegram_channel = telegram_channel
         self.telegram_chat_id = telegram_chat_id
+        self.speech = speech
 
     def decide_route(self, finding: WatchtowerFinding) -> NotificationRoute:
         pri = finding.priority
@@ -110,6 +112,8 @@ class WatchtowerNotifier:
                 sent = self._send_telegram(title, body)
                 if not sent:
                     error = "telegram_send_failed"
+            if self.speech is not None:
+                self.speech.speak(finding)
         except Exception as exc:  # pragma: no cover - defensive
             sent = False
             error = str(exc)

@@ -27,6 +27,14 @@ class TestNotificationRequest(BaseModel):
     route: Optional[str] = None
 
 
+class TestChannelRequest(BaseModel):
+    priority: str = "high"
+
+
+class SpeakAgainRequest(BaseModel):
+    finding_id: str
+
+
 class RouteToChiefRequest(BaseModel):
     finding_id: str
 
@@ -81,6 +89,38 @@ def create_watchtower_router() -> APIRouter:
     @router.get("/status")
     async def status(request: Request):
         return _service(request).status()
+
+    @router.get("/brief")
+    async def brief(request: Request):
+        return _service(request).brief()
+
+    @router.get("/notifications")
+    async def notifications(
+        request: Request,
+        finding_id: Optional[str] = None,
+        decision: Optional[str] = None,
+        limit: int = 100,
+    ):
+        return {
+            "notifications": _store(request).list_notifications(
+                finding_id=finding_id,
+                decision=decision,
+                limit=limit,
+            )
+        }
+
+    @router.get("/speech-events")
+    async def speech_events(
+        request: Request,
+        finding_id: Optional[str] = None,
+        limit: int = 100,
+    ):
+        return {
+            "speech_events": _store(request).list_speech_events(
+                finding_id=finding_id,
+                limit=limit,
+            )
+        }
 
     @router.get("/findings")
     async def findings(
@@ -221,6 +261,21 @@ def create_watchtower_router() -> APIRouter:
             metadata={"test": True, "requested_route": body.route},
         )
         return service.notifier.notify(finding)
+
+    @router.post("/test-telegram")
+    async def test_telegram(body: TestChannelRequest, request: Request):
+        return _service(request).test_telegram(Priority(str(body.priority)))
+
+    @router.post("/test-speech")
+    async def test_speech(body: TestChannelRequest, request: Request):
+        return _service(request).test_speech(Priority(str(body.priority)))
+
+    @router.post("/speak-again")
+    async def speak_again(body: SpeakAgainRequest, request: Request):
+        try:
+            return _service(request).speak_again(body.finding_id)
+        except KeyError:
+            raise HTTPException(404, f"Finding not found: {body.finding_id}")
 
     @router.post("/route-to-chief")
     async def route_to_chief(body: RouteToChiefRequest, request: Request):

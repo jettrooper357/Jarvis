@@ -142,9 +142,13 @@ class WatchtowerSettings:
     defer_high_priority: bool = False
     in_app_enabled: bool = True
     telegram_enabled: bool = True
+    speech_enabled: bool = True
     in_app_min_priority: Priority = Priority.INFO
     telegram_min_priority: Priority = Priority.HIGH
+    speech_min_priority: Priority = Priority.URGENT
     both_min_priority: Priority = Priority.URGENT
+    speak_normal_priority: bool = False
+    speak_high_priority: bool = False
     default_cooldown_minutes: int = 30
     emergency_cooldown_minutes: int = 5
     digest_interval_minutes: int = 60
@@ -167,6 +171,7 @@ class WatchtowerSettings:
         for key in (
             "in_app_min_priority",
             "telegram_min_priority",
+            "speech_min_priority",
             "both_min_priority",
         ):
             if key in normalized and not isinstance(normalized[key], Priority):

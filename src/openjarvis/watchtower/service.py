@@ -14,6 +14,7 @@ from openjarvis.watchtower.local_reasoner import LocalReasoner
 from openjarvis.watchtower.notifier import WatchtowerNotifier
 from openjarvis.watchtower.priority import priority_at_least
 from openjarvis.watchtower.rules import WatchtowerRules
+from openjarvis.watchtower.speech import WatchtowerSpeech
 from openjarvis.watchtower.store import WatchtowerStore
 from openjarvis.watchtower.types import Priority, WatchtowerFinding, WatchtowerSettings
 
@@ -32,6 +33,7 @@ class WatchtowerService:
         event_bus: Any = None,
         telegram_channel: Any = None,
         telegram_chat_id: str = "",
+        tts_backend: Any = None,
         provider_config: Any = None,
         engine: Any = None,
     ) -> None:
@@ -44,12 +46,14 @@ class WatchtowerService:
         self.rules = WatchtowerRules(self.settings)
         self.reasoner = LocalReasoner(provider_config=provider_config, engine=engine)
         self.internal_router = InternalRouter(store, agent_manager, self.settings)
+        self.speech = WatchtowerSpeech(store, self.settings, tts_backend=tts_backend)
         self.notifier = WatchtowerNotifier(
             store,
             self.settings,
             event_bus=event_bus,
             telegram_channel=telegram_channel,
             telegram_chat_id=telegram_chat_id,
+            speech=self.speech,
         )
         self.last_scan_at: float | None = None
         self.last_error: str = ""
@@ -98,6 +102,7 @@ class WatchtowerService:
             "dnd_enabled": self.settings.dnd_enabled,
             "dnd_active": dnd_active,
             "telegram_enabled": self.settings.telegram_enabled,
+            "speech_enabled": self.settings.speech_enabled,
             "active_findings": active_findings,
             "pending_internal_routes": pending_routes,
         }
@@ -126,6 +131,7 @@ class WatchtowerService:
             )
             persisted.append(finding)
             self._route_finding(finding)
+        escalations = self._escalate_unanswered_routes(now_ts=started)
         self.last_scan_at = time.time()
         self.last_error = ""
         return {
@@ -133,6 +139,7 @@ class WatchtowerService:
             "finished_at": self.last_scan_at,
             "findings_detected": len(raw_findings),
             "findings": [finding.to_dict() for finding in persisted],
+            "routes_escalated": escalations,
             "local_ai_status": self.local_ai_status,
         }
 
@@ -142,6 +149,27 @@ class WatchtowerService:
             raise KeyError(finding_id)
         route = self.internal_router.route_to_chief(finding)
         return route.to_dict() if route else {"status": "no_chief_configured"}
+
+    def brief(self) -> Dict[str, Any]:
+        findings = self.store.list_findings(status="active", limit=50)
+        actionable = [
+            finding
+            for finding in findings
+            if priority_at_least(finding.priority, Priority.HIGH)
+            or finding.finding_type in {"stale_approval", "task_waiting_user_input"}
+        ]
+        return {
+            "status": self.status(),
+            "active_count": len(findings),
+            "actionable_count": len(actionable),
+            "items": [finding.to_dict() for finding in actionable[:10]],
+            "recent_notifications": self.store.list_notifications(limit=10),
+            "recent_speech": self.store.list_speech_events(limit=10),
+            "pending_routes": [
+                route.to_dict()
+                for route in self.store.list_internal_routes(status="sent", limit=10)
+            ],
+        }
 
     def _route_finding(self, finding: WatchtowerFinding) -> None:
         self.internal_router.route_to_chief(finding)
@@ -160,6 +188,59 @@ class WatchtowerService:
         if finding.finding_type in {"stale_approval", "task_waiting_user_input"}:
             return True
         return priority_at_least(finding.priority, Priority.HIGH)
+
+    def speak_again(self, finding_id: str) -> Dict[str, Any]:
+        finding = self.store.get_finding(finding_id)
+        if finding is None:
+            raise KeyError(finding_id)
+        return self.speech.speak(finding, force=True)
+
+    def test_speech(self, priority: Priority | str = Priority.URGENT) -> Dict[str, Any]:
+        finding = self.store.upsert_finding(
+            finding_type="test_speech",
+            entity_type="system",
+            entity_id="watchtower-test-speech",
+            priority=priority,
+            reason="This is a harmless Watchtower speech test.",
+            recommended_action="No action is required.",
+            metadata={"test": True},
+        )
+        return self.speech.speak(finding, force=True)
+
+    def test_telegram(self, priority: Priority | str = Priority.HIGH) -> Dict[str, Any]:
+        finding = self.store.upsert_finding(
+            finding_type="test_telegram",
+            entity_type="system",
+            entity_id="watchtower-test-telegram",
+            priority=priority,
+            reason="This is a harmless Watchtower Telegram test.",
+            recommended_action="No action is required.",
+            metadata={"test": True},
+        )
+        return self.notifier.notify(finding)
+
+    def _escalate_unanswered_routes(self, *, now_ts: float) -> int:
+        escalated = 0
+        for route in self.store.list_overdue_internal_routes(now_ts=now_ts, limit=25):
+            finding = self.store.get_finding(route.finding_id)
+            if finding is None:
+                continue
+            self.store.update_internal_route_status(route.route_id, "escalated")
+            notification = None
+            if self._should_notify_user(finding):
+                notification = self.notifier.notify(finding)
+            self.store.record_escalation(
+                finding_id=finding.finding_id,
+                route_id=route.route_id,
+                escalation_reason="internal_route_response_timeout",
+                user_notified=bool(
+                    notification and notification.get("decision") == "sent"
+                ),
+                notification_id=(notification or {}).get("notification_id"),
+                metadata={"source": "watchtower", "route_type": route.route_type},
+            )
+            escalated += 1
+        return escalated
 
     def _collect_rule_findings(self, *, now_ts: float) -> List[Dict[str, Any]]:
         findings: list[dict[str, Any]] = []

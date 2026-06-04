@@ -5,11 +5,16 @@ import {
   escalateWatchtowerFinding,
   fetchWatchtowerFindings,
   fetchWatchtowerInternalRoutes,
+  fetchWatchtowerNotifications,
   fetchWatchtowerSettings,
+  fetchWatchtowerSpeechEvents,
   fetchWatchtowerStatus,
   patchWatchtowerSettings,
   resolveWatchtowerFinding,
+  routeWatchtowerFindingToChief,
   snoozeWatchtowerFinding,
+  speakWatchtowerFindingAgain,
+  testWatchtowerTelegram,
 } from '../../lib/api';
 import { WatchtowerPanel } from './WatchtowerPanel';
 import { WatchtowerSettingsSection } from './WatchtowerSettingsSection';
@@ -18,12 +23,18 @@ vi.mock('../../lib/api', () => ({
   escalateWatchtowerFinding: vi.fn(),
   fetchWatchtowerFindings: vi.fn(),
   fetchWatchtowerInternalRoutes: vi.fn(),
+  fetchWatchtowerNotifications: vi.fn(),
   fetchWatchtowerSettings: vi.fn(),
+  fetchWatchtowerSpeechEvents: vi.fn(),
   fetchWatchtowerStatus: vi.fn(),
   patchWatchtowerSettings: vi.fn(),
   resolveWatchtowerFinding: vi.fn(),
+  routeWatchtowerFindingToChief: vi.fn(),
   scanWatchtowerNow: vi.fn().mockResolvedValue({ findings: [] }),
   snoozeWatchtowerFinding: vi.fn(),
+  speakWatchtowerFindingAgain: vi.fn(),
+  testWatchtowerSpeech: vi.fn().mockResolvedValue(undefined),
+  testWatchtowerTelegram: vi.fn(),
 }));
 
 const status = {
@@ -36,6 +47,7 @@ const status = {
   rules_fallback_active: true,
   dnd_active: true,
   telegram_enabled: true,
+  speech_enabled: true,
   active_findings: 1,
   pending_internal_routes: 1,
 };
@@ -96,14 +108,46 @@ const settings = {
   defer_high_priority: false,
   in_app_enabled: true,
   telegram_enabled: true,
+  speech_enabled: true,
   in_app_min_priority: 'info',
   telegram_min_priority: 'high',
+  speech_min_priority: 'urgent',
   both_min_priority: 'urgent',
+  speak_normal_priority: false,
+  speak_high_priority: false,
   default_cooldown_minutes: 30,
   emergency_cooldown_minutes: 5,
   digest_interval_minutes: 60,
-  internal_route_timeout_minutes: 30,
+  internal_response_minutes: 30,
   local_ai_provider: 'ollama',
+};
+
+const speechEvent = {
+  speech_event_id: 'speech-1',
+  finding_id: 'finding-1',
+  priority: 'urgent',
+  text_spoken: 'Jarvis Watchtower alert.',
+  dnd_applied: false,
+  bypassed_dnd: false,
+  spoken_at: 1,
+  success: true,
+  error_message: null,
+  metadata: {},
+};
+
+const telegramNotification = {
+  notification_id: 'notification-1',
+  finding_id: 'finding-1',
+  priority: 'urgent',
+  route: 'telegram_user',
+  title: '[URGENT] Jarvis: approval',
+  body: 'Approval needed.',
+  decision: 'sent',
+  dnd_applied: false,
+  bypassed_dnd: false,
+  sent_at: 1,
+  error_message: null,
+  metadata: {},
 };
 
 describe('WatchtowerPanel', () => {
@@ -111,9 +155,14 @@ describe('WatchtowerPanel', () => {
     vi.mocked(fetchWatchtowerStatus).mockResolvedValue(status as any);
     vi.mocked(fetchWatchtowerFindings).mockResolvedValue([finding as any]);
     vi.mocked(fetchWatchtowerInternalRoutes).mockResolvedValue([route as any]);
+    vi.mocked(fetchWatchtowerNotifications).mockResolvedValue([telegramNotification as any]);
+    vi.mocked(fetchWatchtowerSpeechEvents).mockResolvedValue([speechEvent as any]);
     vi.mocked(resolveWatchtowerFinding).mockResolvedValue(undefined);
     vi.mocked(snoozeWatchtowerFinding).mockResolvedValue(undefined);
     vi.mocked(escalateWatchtowerFinding).mockResolvedValue(undefined);
+    vi.mocked(routeWatchtowerFindingToChief).mockResolvedValue(undefined);
+    vi.mocked(speakWatchtowerFindingAgain).mockResolvedValue(undefined);
+    vi.mocked(testWatchtowerTelegram).mockResolvedValue(undefined);
     vi.mocked(fetchWatchtowerSettings).mockResolvedValue(settings as any);
     vi.mocked(patchWatchtowerSettings).mockResolvedValue(settings as any);
   });
@@ -149,6 +198,28 @@ describe('WatchtowerPanel', () => {
     expect(resolveWatchtowerFinding).toHaveBeenCalledWith('finding-1');
     expect(escalateWatchtowerFinding).toHaveBeenCalledWith('finding-1');
   });
+
+  it('renders spoken and Telegram alert tabs', async () => {
+    render(<WatchtowerPanel />);
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Spoken Alerts' }));
+    expect(screen.getByText('Jarvis Watchtower alert.')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Telegram Alerts' }));
+    expect(screen.getByText('[URGENT] Jarvis: approval')).toBeInTheDocument();
+  });
+
+  it('calls Ask Chief, Speak Again, and Telegram Test APIs', async () => {
+    render(<WatchtowerPanel />);
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Ask Chief' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Speak Again' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Telegram Test' }));
+
+    await waitFor(() => expect(routeWatchtowerFindingToChief).toHaveBeenCalledWith('finding-1'));
+    expect(speakWatchtowerFindingAgain).toHaveBeenCalledWith('finding-1');
+    expect(testWatchtowerTelegram).toHaveBeenCalled();
+  });
 });
 
 describe('WatchtowerSettingsSection', () => {
@@ -168,6 +239,21 @@ describe('WatchtowerSettingsSection', () => {
     await waitFor(() =>
       expect(patchWatchtowerSettings).toHaveBeenCalledWith({
         telegram_min_priority: 'urgent',
+      }),
+    );
+  });
+
+  it('saves speech channel settings', async () => {
+    render(<WatchtowerSettingsSection />);
+
+    await userEvent.selectOptions(
+      await screen.findByDisplayValue('urgent'),
+      'emergency',
+    );
+
+    await waitFor(() =>
+      expect(patchWatchtowerSettings).toHaveBeenCalledWith({
+        speech_min_priority: 'emergency',
       }),
     );
   });
