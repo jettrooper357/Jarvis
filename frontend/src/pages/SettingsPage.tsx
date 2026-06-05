@@ -333,18 +333,31 @@ export function SettingsPage() {
               </div>
             </SettingRow>
             <SettingRow label="API URL" description="Set if backend runs on a different port or host">
-              <input
-                type="text"
-                value={settings.apiUrl}
-                onChange={(e) => { updateSettings({ apiUrl: e.target.value }); showSaved(); }}
-                placeholder="http://localhost:8000"
-                className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
-                style={{
-                  background: 'var(--color-bg-secondary)',
-                  color: 'var(--color-text)',
-                  border: '1px solid var(--color-border)',
-                }}
-              />
+              {(() => {
+                const apiUrlInvalid =
+                  !!settings.apiUrl && !/^https?:\/\/.+/i.test(settings.apiUrl.trim());
+                return (
+                  <div className="flex flex-col items-end gap-1">
+                    <input
+                      type="text"
+                      value={settings.apiUrl}
+                      onChange={(e) => { updateSettings({ apiUrl: e.target.value }); showSaved(); }}
+                      placeholder="http://localhost:8000"
+                      className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                      style={{
+                        background: 'var(--color-bg-secondary)',
+                        color: 'var(--color-text)',
+                        border: `1px solid ${apiUrlInvalid ? 'var(--color-error)' : 'var(--color-border)'}`,
+                      }}
+                    />
+                    {apiUrlInvalid && (
+                      <span className="text-[11px] w-56 text-right" style={{ color: 'var(--color-error)' }}>
+                        Must start with http:// or https:// — e.g. http://localhost:8000
+                      </span>
+                    )}
+                  </div>
+                );
+              })()}
             </SettingRow>
           </Section>
 
