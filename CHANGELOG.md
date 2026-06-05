@@ -10,6 +10,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Proactive Watchtower announcements (desktop)** — on login the desktop
+  client greets you by voice + toast ("Jarvis online. Monitoring active."), and
+  while open it speaks and toasts every new Watchtower finding as it appears
+  (backlog is baselined as already-seen, so login is greeting-only). Voice uses
+  the existing client-side TTS, respects the Watchtower speech toggle and
+  Do-Not-Disturb quiet hours, and is gated behind one user gesture for browser
+  autoplay. Purely additive frontend change (the prior actionable-only toast
+  behavior is now a subset); no backend changes.
+
 - **Controlled Autonomy (Rollback + Audit)** — a `RollbackStore` that records
   reversible autonomous actions with an undo payload and reverts them via a
   handler registry (built-in `file_write` restores prior bytes / deletes

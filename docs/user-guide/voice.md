@@ -74,6 +74,30 @@ submitted automatically.
 
 Each assistant message also has a small speaker icon to replay it on demand.
 
+## Proactive notifications (desktop)
+
+The desktop client doesn't just speak when you ask — Jarvis Watchtower speaks
+to you proactively. On login, Jarvis greets you by voice and toast ("Jarvis
+online. Monitoring active."). While the app is open, every **new** Watchtower
+finding is announced as a toast and spoken aloud through the local TTS loop, so
+you hear about overdue tasks, stale approvals, failures, and security events as
+they happen rather than discovering them later.
+
+- The login greeting is **greeting-only** — the existing backlog is marked as
+  already-seen and is never replayed; only items that appear *after* login are
+  announced.
+- Voice requires one click or keypress after launch (a browser autoplay rule);
+  until then a one-time "Click anywhere to enable Jarvis voice" prompt appears
+  and the toast still shows.
+- Spoken announcements respect the Watchtower **speech** toggle and are silenced
+  during Do-Not-Disturb quiet hours (when DnD is enabled). Toasts always show.
+- The whole feature is on by default. To turn it off, set the
+  `watchtower-proactive-enabled` key to `false` in the app's local storage (a
+  Settings toggle can be added later).
+
+Announcements are deduplicated and survive a reload, so refreshing the app does
+not re-announce items you've already heard.
+
 ## Endpoints
 
 | Endpoint | Purpose |
