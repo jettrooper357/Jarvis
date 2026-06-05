@@ -33,12 +33,37 @@ export async function initApiBase(): Promise<void> {
 
 const DESKTOP_API_FALLBACK = 'http://127.0.0.1:8000';
 
+/**
+ * A usable API base must be an absolute http(s) URL. Anything else (an
+ * email address, a bare host without scheme, free text) would be treated by
+ * `fetch` as a *relative* path and silently break every request with a 404
+ * (e.g. `<origin>/jettrooper@hotmail.com/v1/...`). Reject those so we fall
+ * back to a safe default instead.
+ */
+const isValidApiBase = (value: string): boolean => {
+  try {
+    const u = new URL(value);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
+
 const getSettingsApiUrl = (): string => {
   try {
     const raw = localStorage.getItem('openjarvis-settings');
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (parsed.apiUrl) return parsed.apiUrl.replace(/\/+$/, '');
+      if (parsed.apiUrl) {
+        const cleaned = String(parsed.apiUrl).trim().replace(/\/+$/, '');
+        if (isValidApiBase(cleaned)) return cleaned;
+        // Malformed stored value (e.g. an email typed into the API URL
+        // field): ignore it so getBase() uses the proper fallback rather
+        // than producing broken relative requests.
+        if (typeof console !== 'undefined') {
+          console.warn('Ignoring invalid saved API URL:', cleaned);
+        }
+      }
     }
   } catch {}
   return '';
