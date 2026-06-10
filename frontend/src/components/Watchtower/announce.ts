@@ -1,7 +1,6 @@
 import type { WatchtowerFinding, WatchtowerPriority } from '../../lib/api';
 
 const SEEN_KEY = 'watchtower-announced';
-const PROACTIVE_KEY = 'watchtower-proactive-enabled';
 const SEEN_CAP = 500; // max remembered finding ids; oldest-inserted are dropped first
 const MAX_SPEECH_CHARS = 320; // TTS-friendly cap for a single spoken announcement
 
@@ -47,10 +46,13 @@ export function diffNewFindings(
   active: WatchtowerFinding[],
   seen: SeenMap,
 ): WatchtowerFinding[] {
-  const fresh = active.filter((f) => {
-    const prev = seen[f.finding_id];
-    return prev === undefined || f.updated_at > prev;
-  });
+  // Novelty is keyed on finding_id ALONE, never on updated_at. The backend
+  // re-upserts active findings every scan and bumps updated_at unconditionally
+  // (store.py upsert UPDATE), so an updated_at comparison would re-announce the
+  // same finding on every poll — spamming toasts and the local TTS backend
+  // (which starves whisper STT). A finding re-announces only if it left the
+  // active set (pruned from `seen`) and later returns.
+  const fresh = active.filter((f) => seen[f.finding_id] === undefined);
   return fresh.sort((a, b) => {
     const pr = (PRIORITY_RANK[b.priority] ?? -1) - (PRIORITY_RANK[a.priority] ?? -1);
     return pr !== 0 ? pr : b.updated_at - a.updated_at;
@@ -76,35 +78,27 @@ export function pruneSeen(
   const ids = Object.keys(kept);
   if (ids.length <= cap) return kept;
   const capped: SeenMap = {};
-  for (const id of ids.slice(-cap)) capped[id] = kept[id];
+  for (const id of ids.slice(ids.length - cap)) capped[id] = kept[id];
   return capped;
 }
 
-export function humanizeFinding(f: WatchtowerFinding): {
+function humanizeType(findingType: string): string {
+  return findingType.replace(/_/g, ' ').trim();
+}
+
+export interface HumanizedFinding {
   title: string;
   description: string;
   speech: string;
-} {
-  const issue = f.finding_type.replace(/_/g, ' ');
-  return {
-    title: `Watchtower: ${issue}`,
-    description: f.reason,
-    speech: `Jarvis Watchtower. ${issue}. ${f.reason}`.slice(0, MAX_SPEECH_CHARS),
-  };
 }
 
-export function isProactiveEnabled(): boolean {
-  try {
-    return localStorage.getItem(PROACTIVE_KEY) !== 'false';
-  } catch {
-    return true;
+export function humanizeFinding(f: WatchtowerFinding): HumanizedFinding {
+  const human = humanizeType(f.finding_type);
+  const title = `Watchtower: ${human}`;
+  const description = f.reason;
+  let speech = `Jarvis Watchtower. ${human}. ${f.reason}`;
+  if (speech.length > MAX_SPEECH_CHARS) {
+    speech = speech.slice(0, MAX_SPEECH_CHARS - 1).trimEnd() + '…';
   }
-}
-
-export function setProactiveEnabled(value: boolean): void {
-  try {
-    localStorage.setItem(PROACTIVE_KEY, value ? 'true' : 'false');
-  } catch {
-    // ignore
-  }
+  return { title, description, speech };
 }

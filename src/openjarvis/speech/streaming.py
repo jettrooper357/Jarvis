@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 _SAMPLE_RATE = 16000
 
 
+def samples_duration_ms(n_samples: int, sample_rate: int = _SAMPLE_RATE) -> float:
+    """Duration in milliseconds of ``n_samples`` at ``sample_rate`` (pure)."""
+    if sample_rate <= 0:
+        return 0.0
+    return (n_samples / sample_rate) * 1000.0
+
+
 @dataclass(slots=True)
 class TranscriptEvent:
     """One event emitted by the streaming pipeline."""
@@ -46,6 +53,7 @@ class StreamingTranscriber:
         *,
         vad_threshold: float = 0.5,
         min_silence_ms: int = 400,
+        min_speech_ms: int = 0,
         language: Optional[str] = None,
     ) -> None:
         self._backend = backend
@@ -54,6 +62,9 @@ class StreamingTranscriber:
             min_silence_ms=min_silence_ms,
         )
         self._language = language
+        # Utterances shorter than this are treated as blips/echo and dropped
+        # before transcription. 0 disables the gate (previous behavior).
+        self._min_speech_ms = max(0, int(min_speech_ms))
         self._buffer: List[np.ndarray] = []
 
     def feed_int16(self, pcm: bytes) -> Iterator[TranscriptEvent]:
@@ -79,7 +90,14 @@ class StreamingTranscriber:
                 self._buffer.append(frame.audio)
 
             if frame.speech_ended:
-                text = self._transcribe_buffer()
+                buffered = sum(int(a.size) for a in self._buffer)
+                too_short = (
+                    self._min_speech_ms > 0
+                    and samples_duration_ms(buffered) < self._min_speech_ms
+                )
+                # Transcribe before clearing; skip whisper entirely when the
+                # utterance is too short (likely a cough/click/speaker echo).
+                text = "" if too_short else self._transcribe_buffer()
                 self._buffer.clear()
                 yield TranscriptEvent(type="speech_end")
                 if text:

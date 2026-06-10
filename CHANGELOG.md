@@ -10,6 +10,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Interactive hands-free voice conversation (desktop)** — a headset toggle in
+  the chat composer starts a continuous, interruptible voice loop
+  (Listening -> speech-to-text -> LLM -> spoken reply -> Listening). Full
+  barge-in: speaking over the assistant immediately stops playback, cancels the
+  in-flight TTS *and* LLM stream, and returns to listening, with the cut-off
+  turn saved and flagged `interrupted`. Driven by an explicit, unit-tested
+  conversation state machine; configurable silence timeout, minimum speech
+  duration, allow-interruption (full vs half duplex), and mic/speaker device
+  under Settings -> Speech -> Hands-free conversation. Additive and reuses the
+  existing streaming STT/TTS and chat send path (Chief Orchestrator ingress
+  unchanged); the prior wake-word, manual-mic, and text paths are preserved.
 - **Proactive Watchtower announcements (desktop)** — on login the desktop
   client greets you by voice + toast ("Jarvis online. Monitoring active."), and
   while open it speaks and toasts every new Watchtower finding as it appears

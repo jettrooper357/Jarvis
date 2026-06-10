@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { Send, Square, Crown } from 'lucide-react';
 import { useAppStore, generateId } from '../../lib/store';
 import { streamChat } from '../../lib/sse';
@@ -10,6 +10,10 @@ import { useSpeech } from '../../hooks/useSpeech';
 import { useStreamingSpeech } from '../../hooks/useStreamingSpeech';
 import { useTTSPlayer } from '../../hooks/useTTSPlayer';
 import { getEffectiveWakeWords, matchWakeWord } from '../../lib/wakeWord';
+import { useVoiceConversation } from './voice/useVoiceConversation';
+import { resolveVoiceConfig } from './voice/voiceConfig';
+import { VoiceLoopToggle } from './VoiceLoopToggle';
+import { JARVIS_SPEAK_EVENT } from '../../lib/voiceBus';
 import type { ChatMessage, ToolCallInfo, TokenUsage, MessageTelemetry } from '../../types';
 
 type ApiMessage = { role: string; content: string };
@@ -50,6 +54,11 @@ export function InputArea() {
   const wakeAwaitingCommandRef = useRef(false);
   const wakeTimeoutRef = useRef<number | null>(null);
   const ttsUnmuteTimeoutRef = useRef<number | null>(null);
+  // Set when a barge-in interrupts the assistant; stamped onto the assistant
+  // message at creation time (it is appended in the send() finally block).
+  const interruptedPendingRef = useRef(false);
+  // True only in full-duplex voice-loop mode (loop on + interruption allowed).
+  const fullDuplexRef = useRef(false);
 
   const activeId = useAppStore((s) => s.activeId);
   const selectedModel = useAppStore((s) => s.selectedModel);
@@ -78,6 +87,12 @@ export function InputArea() {
   });
   const ttsSpeed = useAppStore((s) => s.settings.ttsSpeed);
   const wakeWords = useAppStore((s) => s.settings.wakeWords);
+  const voiceLoopEnabled = useAppStore((s) => s.settings.voiceLoopEnabled);
+  const voiceAllowInterruption = useAppStore((s) => s.settings.voiceAllowInterruption);
+  const voiceSilenceTimeoutMs = useAppStore((s) => s.settings.voiceSilenceTimeoutMs);
+  const voiceMinSpeechMs = useAppStore((s) => s.settings.voiceMinSpeechMs);
+  const voiceMicDeviceId = useAppStore((s) => s.settings.voiceMicDeviceId);
+  const voiceSpeakerDeviceId = useAppStore((s) => s.settings.voiceSpeakerDeviceId);
   const maxTokens = useAppStore((s) => s.settings.maxTokens);
   const temperature = useAppStore((s) => s.settings.temperature);
   const createConversation = useAppStore((s) => s.createConversation);
@@ -90,6 +105,7 @@ export function InputArea() {
 
   const { state: speechState, available: speechAvailable, startRecording, stopRecording } = useSpeech();
   const sendRef = useRef<((override?: string) => Promise<void>) | null>(null);
+  const voiceRef = useRef<ReturnType<typeof useVoiceConversation> | null>(null);
   const clearWakeAwaitingCommand = useCallback(() => {
     if (wakeTimeoutRef.current !== null) {
       window.clearTimeout(wakeTimeoutRef.current);
@@ -111,6 +127,9 @@ export function InputArea() {
     }, 8000);
   }, []);
   const muteMicForTts = useCallback(() => {
+    // Full-duplex voice loop keeps the mic open during playback so the user
+    // can barge in mid-response; in that mode muting is a no-op.
+    if (fullDuplexRef.current) return;
     if (ttsUnmuteTimeoutRef.current !== null) {
       window.clearTimeout(ttsUnmuteTimeoutRef.current);
       ttsUnmuteTimeoutRef.current = null;
@@ -141,14 +160,21 @@ export function InputArea() {
     speed: ttsSpeed,
     onStart: muteMicForTts,
     onIdle: scheduleUnmuteMicAfterTts,
+    speakerDeviceId: voiceLoopEnabled ? voiceSpeakerDeviceId || undefined : undefined,
   });
   // Only auto-speak responses when voice streaming is on — a text-only chat
-  // session should stay silent even if TTS autoplay is enabled.
-  const autoSpeak = ttsAutoplay && speechStreaming;
+  // session should stay silent even if TTS autoplay is enabled. The hands-free
+  // voice loop always speaks responses.
+  const autoSpeak = (ttsAutoplay && speechStreaming) || voiceLoopEnabled;
   const streaming = useStreamingSpeech({
     onFinal: (text) => {
       const spoken = text.trim();
       if (!spoken) return;
+      // Hands-free loop: every final transcript is a conversation turn.
+      if (voiceLoopEnabled) {
+        voiceRef.current?.handleFinal(spoken);
+        return;
+      }
       const filtered = matchWakeWord(text, wakeWords);
       if (filtered === null) {
         if (wakeAwaitingCommandRef.current) {
@@ -166,10 +192,99 @@ export function InputArea() {
     },
     // Barge-in: the moment VAD hears the user, cut the assistant off.
     onSpeechStart: () => {
+      // Hands-free loop routes barge-in through the conversation machine,
+      // which also cancels the in-flight LLM and flags the interrupted turn.
+      if (voiceLoopEnabled) {
+        voiceRef.current?.handleSpeechStart();
+        return;
+      }
       if (!ttsMicMuted) tts.stop();
     },
     muted: ttsMicMuted,
+    // Only steer VAD silence / mic device from the hands-free loop so the
+    // normal chat mic keeps the server defaults.
+    silenceTimeoutMs: voiceLoopEnabled ? voiceSilenceTimeoutMs : undefined,
+    minSpeechMs: voiceLoopEnabled ? voiceMinSpeechMs : undefined,
+    micDeviceId: voiceLoopEnabled ? voiceMicDeviceId || undefined : undefined,
   });
+
+  // ---- Interactive hands-free voice conversation loop ----
+  // Record interrupt intent here; the flag is applied where the assistant
+  // message is built (in send()'s finally), which runs after the LLM aborts.
+  const markLastAssistantInterrupted = useCallback(() => {
+    interruptedPendingRef.current = true;
+  }, []);
+
+  const voiceConfig = useMemo(
+    () =>
+      resolveVoiceConfig({
+        voiceLoopEnabled,
+        voiceSilenceTimeoutMs,
+        voiceMinSpeechMs,
+        voiceAllowInterruption,
+        voiceMicDeviceId,
+        voiceSpeakerDeviceId,
+        ttsProvider,
+        ttsVoice,
+        wakeWords,
+      }),
+    [
+      voiceLoopEnabled,
+      voiceSilenceTimeoutMs,
+      voiceMinSpeechMs,
+      voiceAllowInterruption,
+      voiceMicDeviceId,
+      voiceSpeakerDeviceId,
+      ttsProvider,
+      ttsVoice,
+      wakeWords,
+    ],
+  );
+
+  const voice = useVoiceConversation({
+    config: voiceConfig,
+    startListening: async () => {
+      try {
+        if (streaming.state === 'idle') await streaming.start();
+      } catch {
+        // streaming.error surfaces the failure in the UI
+      }
+    },
+    stopListening: () => streaming.stop(),
+    stopTts: () => tts.stop(),
+    sendMessage: (text) => sendRef.current?.(text) ?? Promise.resolve(),
+    abortLlm: () => abortRef.current?.abort(),
+    markLastAssistantInterrupted,
+  });
+  // Keep the latest orchestrator reachable from the streaming/tts closures
+  // above without a declaration cycle.
+  voiceRef.current = voice;
+
+  // Keep the full-duplex flag (used by muteMicForTts) in sync.
+  useEffect(() => {
+    fullDuplexRef.current = voiceLoopEnabled && voiceAllowInterruption;
+  }, [voiceLoopEnabled, voiceAllowInterruption]);
+
+  // Bridge TTS playback start/stop into the conversation machine so it can
+  // advance PLAYING_RESPONSE -> LISTENING and arm the playback echo guard.
+  const wasSpeakingRef = useRef(false);
+  useEffect(() => {
+    if (voiceLoopEnabled) {
+      if (tts.isSpeaking && !wasSpeakingRef.current) voiceRef.current?.handleTtsStart();
+      if (!tts.isSpeaking && wasSpeakingRef.current) voiceRef.current?.handlePlaybackDone();
+    }
+    wasSpeakingRef.current = tts.isSpeaking;
+  }, [tts.isSpeaking, voiceLoopEnabled]);
+
+  // Start/stop the loop when the toggle flips (requires the speech backend).
+  useEffect(() => {
+    if (voiceLoopEnabled && speechEnabled && speechStreaming) {
+      void voiceRef.current?.start();
+    } else if (!voiceLoopEnabled) {
+      voiceRef.current?.stop();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [voiceLoopEnabled, speechEnabled, speechStreaming]);
 
   // Wake-word mode: when any wake phrase is configured, keep the mic open
   // continuously so the user can speak to the chat hands-free. The streaming
@@ -567,7 +682,9 @@ export function InputArea() {
         usage,
         telemetry,
         audio: audioMeta,
+        interrupted: interruptedPendingRef.current || undefined,
       };
+      interruptedPendingRef.current = false;
       addMessage(convId, assistantMsg);
       if (autoSpeak) tts.flush();
       if (timerRef.current) {
@@ -616,6 +733,20 @@ export function InputArea() {
     };
     window.addEventListener('jarvis-send', onSend as EventListener);
     return () => window.removeEventListener('jarvis-send', onSend as EventListener);
+  }, []);
+
+  // Single shared voice: proactive Watchtower announcements (and any other
+  // `jarvis-speak` dispatch) are spoken through THIS chat TTS, so there is only
+  // ever one voice and announcements queue behind the current reply.
+  const speakRef = useRef(tts.speak);
+  speakRef.current = tts.speak;
+  useEffect(() => {
+    const onSpeak = (e: Event) => {
+      const text = (e as CustomEvent<string>).detail;
+      if (text && text.trim()) speakRef.current?.(text);
+    };
+    window.addEventListener(JARVIS_SPEAK_EVENT, onSpeak as EventListener);
+    return () => window.removeEventListener(JARVIS_SPEAK_EVENT, onSpeak as EventListener);
   }, []);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -696,6 +827,7 @@ export function InputArea() {
           </button>
         ) : (
           <div className="flex items-center gap-1">
+            <VoiceLoopToggle state={voiceLoopEnabled ? voice.state : undefined} />
             <MicButton
               state={micState}
               onClick={handleMicClick}

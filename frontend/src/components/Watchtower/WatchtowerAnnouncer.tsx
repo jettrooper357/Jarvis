@@ -2,15 +2,15 @@ import { useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router';
 import { toast } from 'sonner';
 import { fetchWatchtowerFindings, fetchWatchtowerStatus } from '../../lib/api';
-import { useTTSPlayer } from '../../hooks/useTTSPlayer';
+import { speakViaChat } from '../../lib/voiceBus';
 import { useAudioUnlock } from '../../hooks/useAudioUnlock';
+import { useAppStore, generateId } from '../../lib/store';
 import {
   GREETING_SPEECH,
   GREETING_TOAST_DESCRIPTION,
   GREETING_TOAST_TITLE,
   diffNewFindings,
   humanizeFinding,
-  isProactiveEnabled,
   loadSeen,
   markSeen,
   pruneSeen,
@@ -22,8 +22,8 @@ const GREETED_KEY = 'watchtower-greeted';
 
 export function WatchtowerAnnouncer() {
   const navigate = useNavigate();
-  const { speak } = useTTSPlayer();
   const { unlocked } = useAudioUnlock();
+  const proactive = useAppStore((s) => s.settings.watchtowerProactive);
 
   const seenRef = useRef(loadSeen());
   const unlockedRef = useRef(unlocked);
@@ -38,11 +38,11 @@ export function WatchtowerAnnouncer() {
   useEffect(() => {
     if (!unlocked || !greetingPendingRef.current) return;
     greetingPendingRef.current = false;
-    speak(GREETING_SPEECH);
-  }, [unlocked, speak]);
+    speakViaChat(GREETING_SPEECH);
+  }, [unlocked]);
 
   useEffect(() => {
-    if (!isProactiveEnabled()) return;
+    if (!proactive) return;
     let cancelled = false;
     let timer: number | undefined;
 
@@ -62,7 +62,21 @@ export function WatchtowerAnnouncer() {
             duration: 15000,
             action: { label: 'Open', onClick: () => navigate('/command/mission-control') },
           });
-          if (voiceOk && unlockedRef.current) speak(speech);
+          // Surface the finding inside the active chat conversation so the
+          // chat assistant and the Watchtower share one thread ("connected").
+          const convId = useAppStore.getState().activeId;
+          if (convId) {
+            useAppStore.getState().addMessage(convId, {
+              id: generateId(),
+              role: 'assistant',
+              content: `**${title}**
+
+${description}`,
+              timestamp: Date.now(),
+            });
+          }
+          // One voice: speak through the single chat TTS (queued, no overlap).
+          if (voiceOk && unlockedRef.current) speakViaChat(speech);
         }
         seenRef.current = pruneSeen(markSeen(seenRef.current, fresh), findings);
         saveSeen(seenRef.current);
@@ -88,7 +102,7 @@ export function WatchtowerAnnouncer() {
         sessionStorage.setItem(GREETED_KEY, 'yes');
         toast.info(GREETING_TOAST_TITLE, { description: GREETING_TOAST_DESCRIPTION });
         if (unlockedRef.current) {
-          speak(GREETING_SPEECH);
+          speakViaChat(GREETING_SPEECH);
         } else {
           greetingPendingRef.current = true;
           toast.info('Click anywhere to enable Jarvis voice', { duration: 8000 });
@@ -108,7 +122,7 @@ export function WatchtowerAnnouncer() {
       window.removeEventListener('focus', onFocus);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [proactive]);
 
   return null;
 }

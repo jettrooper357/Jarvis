@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { toast } from 'sonner';
 import { fetchWatchtowerFindings, fetchWatchtowerStatus } from '../../lib/api';
 import type { WatchtowerFinding, WatchtowerStatus } from '../../lib/api';
+import { useAppStore } from '../../lib/store';
 import { WatchtowerAnnouncer } from './WatchtowerAnnouncer';
 
 const speak = vi.fn();
@@ -11,8 +12,9 @@ const speak = vi.fn();
 vi.mock('sonner', () => ({
   toast: { info: vi.fn(), warning: vi.fn() },
 }));
-vi.mock('../../hooks/useTTSPlayer', () => ({
-  useTTSPlayer: () => ({ speak, isSpeaking: false, feedToken: vi.fn(), flush: vi.fn(), stop: vi.fn() }),
+vi.mock('../../lib/voiceBus', () => ({
+  speakViaChat: (text: string) => speak(text),
+  JARVIS_SPEAK_EVENT: 'jarvis-speak',
 }));
 let mockUnlocked = true;
 vi.mock('../../hooks/useAudioUnlock', () => ({
@@ -73,6 +75,7 @@ describe('WatchtowerAnnouncer', () => {
     mockUnlocked = true;
     localStorage.clear();
     sessionStorage.clear();
+    useAppStore.setState((s) => ({ settings: { ...s.settings, watchtowerProactive: true } }));
     speak.mockClear();
     vi.mocked(toast.info).mockClear();
     vi.mocked(toast.warning).mockClear();
@@ -130,8 +133,26 @@ describe('WatchtowerAnnouncer', () => {
     expect(speak).not.toHaveBeenCalledWith(expect.stringContaining('Jarvis Watchtower.'));
   });
 
+  it('does not re-announce a persisting finding when its updated_at bumps', async () => {
+    vi.mocked(fetchWatchtowerFindings).mockResolvedValue([
+      finding({ finding_id: 'p', updated_at: 1 }),
+    ]);
+    renderAnnouncer();
+    await waitFor(() => expect(toast.info).toHaveBeenCalled());
+
+    // Backend bumps updated_at on the SAME finding each scan.
+    vi.mocked(fetchWatchtowerFindings).mockResolvedValue([
+      finding({ finding_id: 'p', updated_at: 999 }),
+    ]);
+    window.dispatchEvent(new Event('focus'));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(toast.warning).not.toHaveBeenCalled();
+    expect(speak).not.toHaveBeenCalledWith(expect.stringContaining('Jarvis Watchtower.'));
+  });
+
   it('does nothing when proactive announcements are disabled', async () => {
-    localStorage.setItem('watchtower-proactive-enabled', 'false');
+    useAppStore.setState((s) => ({ settings: { ...s.settings, watchtowerProactive: false } }));
     vi.mocked(fetchWatchtowerFindings).mockResolvedValue([finding()]);
     renderAnnouncer();
     await new Promise((r) => setTimeout(r, 50));

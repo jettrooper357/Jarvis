@@ -34,6 +34,7 @@ import {
 } from '../lib/api';
 import { VoiceCreator } from '../components/Settings/VoiceCreator';
 import { ShortcutsSettings } from '../components/Settings/ShortcutsSettings';
+import { VoiceLoopSettings } from '../components/Settings/VoiceLoopSettings';
 import { WatchtowerSettingsSection } from '../components/Watchtower/WatchtowerSettingsSection';
 
 function OllamaModelList() {
@@ -655,6 +656,13 @@ export function SettingsPage() {
                 }}
               />
             </SettingRow>
+            <div className="py-3" style={{ borderBottom: '1px solid var(--color-border-subtle)' }}>
+              <div className="text-sm mb-1" style={{ color: 'var(--color-text)' }}>Hands-free conversation</div>
+              <div className="text-xs mb-3" style={{ color: 'var(--color-text-tertiary)' }}>
+                Tune the continuous voice loop. Turn it on from the headset button in the chat input.
+              </div>
+              <VoiceLoopSettings />
+            </div>
             <SettingRow label="Voice service" description="Choose where voice replies are generated">
               <select
                 value={selectedTtsProvider}

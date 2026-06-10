@@ -15,6 +15,15 @@ interface UseStreamingSpeechOptions {
   language?: string;
   /** When true, keep the socket open but drop mic frames and transcripts. */
   muted?: boolean;
+  /**
+   * End-of-turn silence before VAD finalizes (ms). Forwarded to the backend
+   * silero-VAD as `min_silence_ms`. Omit to use the server default.
+   */
+  silenceTimeoutMs?: number;
+  /** Min utterance length (ms) below which the server drops the turn (0 = off). */
+  minSpeechMs?: number;
+  /** Specific microphone device id; omit for the system default. */
+  micDeviceId?: string;
 }
 
 function wsUrl(): string {
@@ -108,14 +117,14 @@ export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
 
     let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
+      const audioConstraints: MediaTrackConstraints = {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      };
+      if (opts.micDeviceId) audioConstraints.deviceId = { exact: opts.micDeviceId };
+      stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
     } catch {
       setError('Microphone access denied');
       return;
@@ -133,7 +142,16 @@ export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
     }
 
     let url = wsUrl();
-    if (opts.language) url += `?language=${encodeURIComponent(opts.language)}`;
+    const params = new URLSearchParams();
+    if (opts.language) params.set('language', opts.language);
+    if (opts.silenceTimeoutMs && opts.silenceTimeoutMs > 0) {
+      params.set('min_silence_ms', String(Math.round(opts.silenceTimeoutMs)));
+    }
+    if (opts.minSpeechMs && opts.minSpeechMs > 0) {
+      params.set('min_speech_ms', String(Math.round(opts.minSpeechMs)));
+    }
+    const qs = params.toString();
+    if (qs) url += `?${qs}`;
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
@@ -222,7 +240,7 @@ export function useStreamingSpeech(opts: UseStreamingSpeechOptions = {}) {
     };
     source.connect(node);
     setState('listening');
-  }, [cleanup, opts.language]);
+  }, [cleanup, opts.language, opts.silenceTimeoutMs, opts.minSpeechMs, opts.micDeviceId]);
 
   const stop = useCallback(() => {
     setState('idle');

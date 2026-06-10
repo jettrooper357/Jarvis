@@ -186,6 +186,9 @@ function MessageBubbleInner({ message }: Props) {
       <div className="flex items-center gap-2 mt-1.5">
         <CopyMessageButton content={cleanContent} />
         {cleanContent && <SpeakMessageButton content={cleanContent} />}
+        {message.interrupted && (
+          <span className="text-xs italic opacity-60">(interrupted)</span>
+        )}
       </div>
       <XRayFooter usage={message.usage} telemetry={message.telemetry} />
     </div>

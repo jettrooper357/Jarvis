@@ -70,6 +70,8 @@ export interface ChatMessage {
   usage?: TokenUsage;
   telemetry?: MessageTelemetry;
   audio?: { url: string };
+  /** True when this assistant turn was cut off by user barge-in. */
+  interrupted?: boolean;
 }
 
 export interface Conversation {

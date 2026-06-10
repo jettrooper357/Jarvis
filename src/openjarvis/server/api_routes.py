@@ -1023,8 +1023,33 @@ async def speech_stream(websocket: WebSocket):
         return
 
     language = websocket.query_params.get("language") or None
+
+    def _clamp_int_param(name: str, default: int, lo: int, hi: int) -> int:
+        """Read an optional int query param, clamped; fall back to ``default``.
+
+        Additive: when the client omits the param the streaming VAD keeps its
+        previous default behavior.
+        """
+        raw = websocket.query_params.get(name)
+        if raw is None:
+            return default
+        try:
+            return max(lo, min(hi, int(raw)))
+        except (TypeError, ValueError):
+            return default
+
+    # End-of-turn silence before VAD finalizes the utterance. Default matches
+    # StreamingTranscriber's own default so existing clients are unaffected.
+    min_silence_ms = _clamp_int_param("min_silence_ms", 400, 100, 5000)
+    # Drop utterances shorter than this (0 = disabled, the default).
+    min_speech_ms = _clamp_int_param("min_speech_ms", 0, 0, 2000)
     try:
-        transcriber = StreamingTranscriber(backend, language=language)
+        transcriber = StreamingTranscriber(
+            backend,
+            language=language,
+            min_silence_ms=min_silence_ms,
+            min_speech_ms=min_speech_ms,
+        )
     except ImportError as exc:
         await websocket.send_json(
             {

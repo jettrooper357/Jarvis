@@ -79,11 +79,20 @@ interface Settings {
   speechEnabled: boolean;
   speechStreaming: boolean;
   ttsAutoplay: boolean;
+  /** Proactive Watchtower voice + toast announcements on this device. */
+  watchtowerProactive: boolean;
   ttsProvider: string;
   ttsVoice: string;
   ttsVoicesByProvider: Record<string, string>;
   ttsSpeed: number;
   wakeWords: string[];
+  // Hands-free voice conversation loop (Chat page).
+  voiceLoopEnabled: boolean;
+  voiceSilenceTimeoutMs: number;
+  voiceMinSpeechMs: number;
+  voiceAllowInterruption: boolean;
+  voiceMicDeviceId: string;
+  voiceSpeakerDeviceId: string;
   /** Max recent messages sent verbatim; older turns are condensed. */
   contextMaxMessages: number;
   /**
@@ -108,11 +117,18 @@ function loadSettings(): Settings {
     speechEnabled: false,
     speechStreaming: true,
     ttsAutoplay: false,
+    watchtowerProactive: true,
     ttsProvider: 'auto',
     ttsVoice: '',
     ttsVoicesByProvider: {},
     ttsSpeed: 1.0,
     wakeWords: [],
+    voiceLoopEnabled: false,
+    voiceSilenceTimeoutMs: 1800,
+    voiceMinSpeechMs: 300,
+    voiceAllowInterruption: true,
+    voiceMicDeviceId: '',
+    voiceSpeakerDeviceId: '',
     contextMaxMessages: 12,
     chiefDirectMode: false,
   };

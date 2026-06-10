@@ -74,6 +74,60 @@ submitted automatically.
 
 Each assistant message also has a small speaker icon to replay it on demand.
 
+## Hands-free conversation (interruptible)
+
+The **headset button** in the chat composer turns on a continuous, hands-free
+voice conversation. Once enabled, Jarvis runs a real-time loop:
+
+```
+Listening -> You speak -> Silence detected -> Speech-to-text ->
+LLM response -> Spoken reply -> Listening (repeat)
+```
+
+You never touch the keyboard: speak, pause, and Jarvis answers aloud, then
+listens again. A small status pill shows the current phase
+(`Listening...`, `Thinking...`, `Speaking...`, `Interrupted`).
+
+### Barge-in (interrupting the assistant)
+
+While **Allow interruption** is on (the default), you can talk over the
+assistant at any time. The instant voice activity is detected during a reply,
+Jarvis immediately:
+
+1. stops audio playback,
+2. cancels any in-flight text-to-speech,
+3. aborts the pending LLM response,
+
+and returns to listening so your new words become the active turn. The cut-off
+reply is kept in the transcript with an *(interrupted)* marker so the context
+is preserved.
+
+Barge-in keeps the microphone open during playback (full-duplex), relying on
+the browser's echo cancellation. On speakers with weak echo cancellation the
+assistant could otherwise hear itself; a short post-playback guard (the
+**Minimum speech duration** setting) suppresses that. If your setup still
+self-interrupts, turn **Allow interruption** off — the mic is then muted while
+the assistant speaks (half-duplex turn-taking) and barge-in is disabled.
+
+### Settings
+
+Under **Settings -> Speech -> Hands-free conversation**:
+
+- **Allow interruption (barge-in)** — full-duplex (on) vs half-duplex mute (off).
+- **Silence timeout (ms)** — how long a pause ends your turn (sent to the
+  server VAD; default 1800 ms). Takes effect the next time the loop starts.
+- **Minimum speech duration (ms)** — also the post-playback echo-guard window.
+- **Microphone / Speaker** — pick specific input/output devices (speaker
+  routing uses `AudioContext.setSinkId`, supported on Chromium browsers).
+
+Wake words (Settings -> Speech -> Wake words) still apply to the non-loop mic
+mode; in the hands-free loop every utterance is treated as a turn. All turns
+flow through the normal chat path (and the Chief Orchestrator when routing is
+active) — the loop adds no new ingress.
+
+Enable verbose loop logging from the browser console with
+`window.__JARVIS_VOICE_DEBUG = true`.
+
 ## Proactive notifications (desktop)
 
 The desktop client doesn't just speak when you ask — Jarvis Watchtower speaks
@@ -91,9 +145,8 @@ they happen rather than discovering them later.
   and the toast still shows.
 - Spoken announcements respect the Watchtower **speech** toggle and are silenced
   during Do-Not-Disturb quiet hours (when DnD is enabled). Toasts always show.
-- The whole feature is on by default. To turn it off, set the
-  `watchtower-proactive-enabled` key to `false` in the app's local storage (a
-  Settings toggle can be added later).
+- The whole feature is on by default. Toggle it per device under
+  **Settings → Watchtower → Proactive voice & toasts**.
 
 Announcements are deduplicated and survive a reload, so refreshing the app does
 not re-announce items you've already heard.

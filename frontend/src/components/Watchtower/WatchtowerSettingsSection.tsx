@@ -6,6 +6,7 @@ import {
   type WatchtowerPriority,
   type WatchtowerSettings,
 } from '../../lib/api';
+import { useAppStore } from '../../lib/store';
 
 const priorities: WatchtowerPriority[] = ['info', 'low', 'normal', 'high', 'urgent', 'emergency'];
 
@@ -94,6 +95,8 @@ export function WatchtowerSettingsSection() {
   const [settings, setSettings] = useState<WatchtowerSettings | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const proactive = useAppStore((s) => s.settings.watchtowerProactive);
+  const updateSettings = useAppStore((s) => s.updateSettings);
 
   useEffect(() => {
     fetchWatchtowerSettings()
@@ -118,16 +121,32 @@ export function WatchtowerSettingsSection() {
     }
   };
 
+  const proactiveRow = (
+    <Row
+      label="Proactive voice & toasts"
+      description="Greet on login and speak/toast every new finding on this device"
+    >
+      <Toggle
+        checked={proactive}
+        onChange={(value) => updateSettings({ watchtowerProactive: value })}
+      />
+    </Row>
+  );
+
   if (!settings) {
     return (
-      <div className="text-xs" style={{ color: error ? 'var(--color-error)' : 'var(--color-text-tertiary)' }}>
-        {error || 'Loading Watchtower settings...'}
+      <div data-testid="watchtower-settings">
+        {proactiveRow}
+        <div className="text-xs" style={{ color: error ? 'var(--color-error)' : 'var(--color-text-tertiary)' }}>
+          {error || 'Loading Watchtower settings...'}
+        </div>
       </div>
     );
   }
 
   return (
     <div data-testid="watchtower-settings">
+      {proactiveRow}
       <Row label="Watchtower" description="Continuously scan projects, agents, approvals, deadlines, and jobs">
         <Toggle checked={settings.enabled} onChange={(enabled) => save({ enabled })} />
       </Row>

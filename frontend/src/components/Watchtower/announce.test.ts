@@ -3,12 +3,10 @@ import type { WatchtowerFinding } from '../../lib/api';
 import {
   diffNewFindings,
   humanizeFinding,
-  isProactiveEnabled,
   loadSeen,
   markSeen,
   pruneSeen,
   saveSeen,
-  setProactiveEnabled,
   type SeenMap,
 } from './announce';
 
@@ -49,10 +47,13 @@ describe('announce helpers', () => {
     expect(diffNewFindings(active, seen)).toEqual([]);
   });
 
-  it('re-detects a finding whose updated_at advanced', () => {
+  it('does NOT re-announce a finding whose only change is an updated_at bump', () => {
+    // The backend bumps updated_at on every scan (store.py upsert UPDATE), so
+    // novelty must be keyed on finding_id alone or the same finding repeats
+    // on every poll.
     const seen = markSeen({}, [finding({ finding_id: 'f1', updated_at: 1 })]);
     const active = [finding({ finding_id: 'f1', updated_at: 5 })];
-    expect(diffNewFindings(active, seen).map((f) => f.finding_id)).toEqual(['f1']);
+    expect(diffNewFindings(active, seen)).toEqual([]);
   });
 
   it('sorts fresh findings by priority desc then updated_at desc', () => {
@@ -109,9 +110,4 @@ describe('announce helpers', () => {
     expect(h.speech).toContain('Needs sign-off.');
   });
 
-  it('proactive toggle defaults to true and persists false', () => {
-    expect(isProactiveEnabled()).toBe(true);
-    setProactiveEnabled(false);
-    expect(isProactiveEnabled()).toBe(false);
-  });
 });

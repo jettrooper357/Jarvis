@@ -22,6 +22,8 @@ interface UseTTSPlayerOptions {
   speed?: number;
   onStart?: () => void;
   onIdle?: () => void;
+  /** Specific speaker/output device id (uses AudioContext.setSinkId where supported). */
+  speakerDeviceId?: string;
 }
 
 /**
@@ -46,6 +48,9 @@ export function useTTSPlayer(opts: UseTTSPlayerOptions = {}) {
   const onIdleRef = useRef(opts.onIdle);
   onStartRef.current = opts.onStart;
   onIdleRef.current = opts.onIdle;
+  const speakerDeviceIdRef = useRef(opts.speakerDeviceId);
+  speakerDeviceIdRef.current = opts.speakerDeviceId;
+  const appliedSinkRef = useRef<string | undefined>(undefined);
 
   const ensureCtx = (): AudioContext => {
     if (!ctxRef.current) {
@@ -54,8 +59,25 @@ export function useTTSPlayer(opts: UseTTSPlayerOptions = {}) {
     return ctxRef.current;
   };
 
+  // Route playback to a specific output device when one is selected and the
+  // browser supports AudioContext.setSinkId (Chromium). No-op otherwise.
+  const applySink = async (ctx: AudioContext): Promise<void> => {
+    const desired = speakerDeviceIdRef.current;
+    if (!desired || appliedSinkRef.current === desired) return;
+    const ac = ctx as AudioContext & { setSinkId?: (id: string) => Promise<void> };
+    if (typeof ac.setSinkId === 'function') {
+      try {
+        await ac.setSinkId(desired);
+        appliedSinkRef.current = desired;
+      } catch {
+        // unsupported device id or permission — keep the default sink
+      }
+    }
+  };
+
   const playAudio = useCallback(async (audioBytes: ArrayBuffer): Promise<void> => {
     const ctx = ensureCtx();
+    await applySink(ctx);
     if (ctx.state === 'suspended') await ctx.resume();
     const buf = await ctx.decodeAudioData(audioBytes.slice(0));
     return new Promise<void>((resolve) => {
