@@ -17,6 +17,36 @@ import {
 } from '../../lib/api';
 import type { ManagedAgent, AgentTask, AgentMessage, AgentTemplate, LearningLogEntry, AgentTrace } from '../../lib/api';
 
+interface WatchtowerRouteInfo {
+  messageType?: string;
+  summary?: string;
+  recommendedAction?: string;
+  priority?: string;
+}
+
+// Watchtower routes findings to the Chief as an internal message whose content
+// is a prose preamble followed by a JSON payload. Detect it so the UI can show
+// a clean card instead of dumping raw JSON into the conversation.
+function parseWatchtowerRoute(content: string): WatchtowerRouteInfo | null {
+  if (!content || !content.includes('Watchtower-triggered internal route')) return null;
+  const brace = content.indexOf('{');
+  if (brace === -1) return {};
+  try {
+    const obj = JSON.parse(content.slice(brace)) as Record<string, unknown>;
+    const md = (obj.metadata as Record<string, unknown>) || {};
+    const str = (v: unknown): string | undefined =>
+      typeof v === 'string' && v.trim() ? v : undefined;
+    return {
+      messageType: str(obj.message_type),
+      summary: str(obj.summary) || str(md.task_title),
+      recommendedAction: str(obj.recommended_action),
+      priority: str(obj.priority) || str(md.priority),
+    };
+  } catch {
+    return {};
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Colors — Catppuccin Mocha
 // ---------------------------------------------------------------------------
@@ -499,6 +529,35 @@ function InteractTab({ apiUrl, agentId }: { apiUrl: string; agentId: string }) {
           </div>
         )}
         {messages.map((msg) => {
+          const wt = parseWatchtowerRoute(msg.content);
+          if (wt) {
+            const mt = (wt.messageType || 'watchtower update').replace(/_/g, ' ');
+            return (
+              <div
+                key={msg.id}
+                style={{
+                  alignSelf: 'stretch',
+                  background: C.surface0,
+                  border: `1px solid ${C.border}`,
+                  borderLeft: `3px solid ${C.accent}`,
+                  borderRadius: 8,
+                  padding: '8px 12px',
+                  fontSize: 12,
+                }}
+              >
+                <div style={{ color: C.overlay0, fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  {'Watchtower → Chief'} · {mt}{wt.priority ? ` · ${wt.priority}` : ''}
+                </div>
+                <div style={{ color: C.text, marginTop: 4 }}>{wt.summary || mt}</div>
+                {wt.recommendedAction && (
+                  <div style={{ color: C.overlay0, marginTop: 4 }}>Suggested: {wt.recommendedAction}</div>
+                )}
+                <div style={{ color: C.overlay0, fontSize: 10, marginTop: 4 }}>
+                  Internal route · {msg.status === 'responded' ? 'handled' : 'awaiting Chief'}
+                </div>
+              </div>
+            );
+          }
           const isUser = msg.direction === 'user_to_agent';
           return (
             <div

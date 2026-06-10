@@ -1628,6 +1628,83 @@ class ManagedAgentRuntime:
                 agent_record.get("id"),
             )
 
+    def _cloud_key_available(self, model: str) -> bool:
+        """True when the cloud provider for ``model`` has an API key present."""
+        import os as _os
+
+        try:
+            from openjarvis.security.cloud_keys import hydrate_env_from_cloud_keys
+
+            hydrate_env_from_cloud_keys()
+        except Exception:
+            pass
+        m = (model or "").lower()
+        if m.startswith(("gpt-", "o1-", "o3-", "o4-", "chatgpt-")):
+            return bool(_os.environ.get("OPENAI_API_KEY"))
+        if m.startswith("claude-"):
+            return bool(_os.environ.get("ANTHROPIC_API_KEY"))
+        if m.startswith(("gemini-", "google/")):
+            return bool(
+                _os.environ.get("GEMINI_API_KEY")
+                or _os.environ.get("GOOGLE_API_KEY")
+            )
+        if m.startswith("openrouter/"):
+            return bool(_os.environ.get("OPENROUTER_API_KEY"))
+        # Unknown provider — do not block; let the engine decide.
+        return True
+
+    def _first_local_model(self) -> str:
+        """Best-effort: an installed local (Ollama) model to fall back to."""
+        try:
+            from openjarvis.core.config import load_config
+            from openjarvis.engine.ollama import OllamaEngine
+
+            cfg = load_config()
+            host = cfg.engine.ollama.host if cfg else ""
+            eng = OllamaEngine(host=host) if host else OllamaEngine()
+            ids: List[str] = []
+            for m in eng.list_models():
+                mid = getattr(m, "id", None)
+                if not mid and isinstance(m, dict):
+                    mid = m.get("id") or m.get("name")
+                if mid:
+                    ids.append(str(mid))
+            default = (self._default_model or "").strip()
+            if default and any(
+                i == default or i.startswith(default + ":") for i in ids
+            ):
+                return default
+            return ids[0] if ids else ""
+        except Exception:
+            return ""
+
+    def _runnable_model(self, model: str) -> str:
+        """Return ``model`` if it can run; otherwise fall back to a local model.
+
+        An agent pinned to a cloud model with no API key would error every turn
+        with "cloud model and cannot be pulled by Ollama". Instead of failing,
+        self-heal by running this turn on an available local model. The agent's
+        stored config is left unchanged — this only affects the current run.
+        """
+        if not model:
+            return model
+        try:
+            from openjarvis.engine.ollama import _is_cloud_model
+
+            if _is_cloud_model(model) and not self._cloud_key_available(model):
+                fallback = self._first_local_model()
+                if fallback and fallback != model:
+                    logger.warning(
+                        "Managed-agent model %r has no provider API key; "
+                        "falling back to local model %r for this run.",
+                        model,
+                        fallback,
+                    )
+                    return fallback
+        except Exception:
+            pass
+        return model
+
     def _run_turn(
         self,
         *,
@@ -1648,6 +1725,7 @@ class ManagedAgentRuntime:
             or getattr(self._engine, "_model", "")
             or self._default_model
         )
+        model = self._runnable_model(model)
         if not model:
             raise RuntimeError("No model configured for managed agent runtime")
 
@@ -2028,6 +2106,7 @@ class ManagedAgentRuntime:
             or getattr(self._engine, "_model", "")
             or self._default_model
         )
+        model = self._runnable_model(model)
         if not model:
             raise RuntimeError("No model configured for resume")
 
