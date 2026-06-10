@@ -2313,6 +2313,25 @@ function AgentConfigGrid({ agent, onAgentUpdated }: { agent: ManagedAgent; onAge
   useEffect(() => {
     let cancelled = false;
     async function checkModel() {
+      // Cloud models (gpt-/claude-/gemini-/openrouter) are not in Ollama; treat
+      // them as available when the matching API key is configured locally.
+      const CLOUD_MODEL_KEYS = [
+        { prefixes: ['gpt-', 'o1-', 'o3-', 'o4-', 'chatgpt-'], storageKey: 'openjarvis-openai-key' },
+        { prefixes: ['claude-'], storageKey: 'openjarvis-anthropic-key' },
+        { prefixes: ['gemini-'], storageKey: 'openjarvis-gemini-key' },
+        { prefixes: ['openrouter/'], storageKey: 'openjarvis-openrouter-key' },
+      ];
+      const cloud = CLOUD_MODEL_KEYS.find((c) =>
+        c.prefixes.some((p) => currentModel.startsWith(p)),
+      );
+      if (cloud) {
+        if (!cancelled) {
+          setModelAvailable(
+            localStorage.getItem(cloud.storageKey) ? 'available' : 'unavailable',
+          );
+        }
+        return;
+      }
       try {
         const res = await fetch('http://localhost:11434/api/tags');
         if (!res.ok) { setModelAvailable('unknown'); return; }
@@ -2366,7 +2385,11 @@ function AgentConfigGrid({ agent, onAgentUpdated }: { agent: ManagedAgent; onAge
       await updateManagedAgent(agent.id, { config: newConfig });
       onAgentUpdated();
       toast.success(`Model changed to ${newModel}`);
-    } catch { /* ignore */ }
+    } catch (e) {
+      toast.error(
+        `Could not change model — ${e instanceof Error ? e.message : 'backend unreachable'}`,
+      );
+    }
     setEditingModel(false);
     setChangingModel(false);
   }
