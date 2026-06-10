@@ -87,7 +87,7 @@ describe('WatchtowerAnnouncer', () => {
     vi.mocked(fetchWatchtowerFindings).mockResolvedValue([finding({ finding_id: 'backlog' })]);
     renderAnnouncer();
     await waitFor(() => expect(toast.info).toHaveBeenCalledWith('Jarvis online', expect.any(Object)));
-    await waitFor(() => expect(speak).toHaveBeenCalledWith('Jarvis online. Monitoring active.'));
+    await waitFor(() => expect(speak).toHaveBeenCalledWith("Good to see you. I'm online and keeping watch."));
     expect(toast.warning).not.toHaveBeenCalled();
     expect(speak).toHaveBeenCalledTimes(1);
   });
@@ -106,7 +106,7 @@ describe('WatchtowerAnnouncer', () => {
     await waitFor(() =>
       expect(toast.warning).toHaveBeenCalledWith('Watchtower: stale approval', expect.objectContaining({ description: 'Sign-off needed.' })),
     );
-    expect(speak).toHaveBeenCalledWith('Jarvis Watchtower. stale approval. Sign-off needed.');
+    expect(speak).toHaveBeenCalledWith('When you have a moment, Sign-off needed. Check.');
   });
 
   it('toasts but does not speak when speech is disabled', async () => {
@@ -118,7 +118,7 @@ describe('WatchtowerAnnouncer', () => {
     vi.mocked(fetchWatchtowerFindings).mockResolvedValue([finding({ finding_id: 'new' })]);
     window.dispatchEvent(new Event('focus'));
     await waitFor(() => expect(toast.warning).toHaveBeenCalled());
-    expect(speak).not.toHaveBeenCalledWith(expect.stringContaining('Jarvis Watchtower.'));
+    expect(speak).not.toHaveBeenCalledWith(expect.stringContaining('Task overdue'));
   });
 
   it('toasts but does not speak findings during DnD', async () => {
@@ -130,7 +130,7 @@ describe('WatchtowerAnnouncer', () => {
     vi.mocked(fetchWatchtowerFindings).mockResolvedValue([finding({ finding_id: 'new' })]);
     window.dispatchEvent(new Event('focus'));
     await waitFor(() => expect(toast.warning).toHaveBeenCalled());
-    expect(speak).not.toHaveBeenCalledWith(expect.stringContaining('Jarvis Watchtower.'));
+    expect(speak).not.toHaveBeenCalledWith(expect.stringContaining('Task overdue'));
   });
 
   it('does not re-announce a persisting finding when its updated_at bumps', async () => {
@@ -148,7 +148,7 @@ describe('WatchtowerAnnouncer', () => {
     await new Promise((r) => setTimeout(r, 50));
 
     expect(toast.warning).not.toHaveBeenCalled();
-    expect(speak).not.toHaveBeenCalledWith(expect.stringContaining('Jarvis Watchtower.'));
+    expect(speak).not.toHaveBeenCalledWith(expect.stringContaining('Task overdue'));
   });
 
   it('does nothing when proactive announcements are disabled', async () => {
@@ -182,7 +182,7 @@ describe('WatchtowerAnnouncer', () => {
     );
 
     await waitFor(() =>
-      expect(speak).toHaveBeenCalledWith('Jarvis online. Monitoring active.'),
+      expect(speak).toHaveBeenCalledWith("Good to see you. I'm online and keeping watch."),
     );
   });
 });

@@ -2240,8 +2240,18 @@ export function ProjectsPage() {
   const reload = useCallback(async (preferId?: string) => {
     try {
       const bundle = await getProjectBundle();
-      const projs = bundle.projects;
-      const tasksByProject = bundle.tasks_by_project;
+      // Hide the backend's "Unassigned Work" system catch-all (and any project
+      // tagged "system") from the Projects section. Backend routing and Mission
+      // Control still use it; it is simply not surfaced here.
+      const hiddenProjectIds = new Set(
+        bundle.projects
+          .filter((p) => p.name === 'Unassigned Work' || (p.tags || []).includes('system'))
+          .map((p) => p.id),
+      );
+      const projs = bundle.projects.filter((p) => !hiddenProjectIds.has(p.id));
+      const tasksByProject = Object.fromEntries(
+        Object.entries(bundle.tasks_by_project).filter(([pid]) => !hiddenProjectIds.has(pid)),
+      ) as typeof bundle.tasks_by_project;
       const built = buildGanttData(projs, tasksByProject);
       setRawProjects(projs);
       setRawTasks(Object.values(tasksByProject).flat());

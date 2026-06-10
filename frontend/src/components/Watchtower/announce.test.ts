@@ -102,11 +102,11 @@ describe('announce helpers', () => {
     expect(loadSeen()).toEqual({ f1: 3 });
   });
 
-  it('humanizeFinding produces title, description, speech', () => {
+  it('humanizeFinding produces title, description, warm speech', () => {
     const h = humanizeFinding(finding({ finding_type: 'stale_approval', reason: 'Needs sign-off.' }));
     expect(h.title).toBe('Watchtower: stale approval');
     expect(h.description).toBe('Needs sign-off.');
-    expect(h.speech).toContain('stale approval');
+    expect(h.speech.toLowerCase()).toContain('when you have a moment');
     expect(h.speech).toContain('Needs sign-off.');
   });
 

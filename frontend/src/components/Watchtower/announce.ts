@@ -6,7 +6,7 @@ const MAX_SPEECH_CHARS = 320; // TTS-friendly cap for a single spoken announceme
 
 export const GREETING_TOAST_TITLE = 'Jarvis online';
 export const GREETING_TOAST_DESCRIPTION = 'Monitoring active.';
-export const GREETING_SPEECH = 'Jarvis online. Monitoring active.';
+export const GREETING_SPEECH = "Good to see you. I'm online and keeping watch.";
 
 /** finding_id -> last announced updated_at */
 export type SeenMap = Record<string, number>;
@@ -96,7 +96,18 @@ export function humanizeFinding(f: WatchtowerFinding): HumanizedFinding {
   const human = humanizeType(f.finding_type);
   const title = `Watchtower: ${human}`;
   const description = f.reason;
-  let speech = `Jarvis Watchtower. ${human}. ${f.reason}`;
+  // Warm, calm phrasing — a reassuring heads-up, not a robotic label. The
+  // opener softens by priority so urgent items still feel human, not alarming.
+  const opener =
+    f.priority === 'emergency' || f.priority === 'urgent'
+      ? 'Sorry to interrupt,'
+      : f.priority === 'high'
+        ? 'A quick heads up,'
+        : 'When you have a moment,';
+  const parts = [opener, f.reason.trim()];
+  const action = (f.recommended_action || '').trim();
+  if (action) parts.push(action);
+  let speech = parts.join(' ');
   if (speech.length > MAX_SPEECH_CHARS) {
     speech = speech.slice(0, MAX_SPEECH_CHARS - 1).trimEnd() + '…';
   }
