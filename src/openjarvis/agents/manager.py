@@ -544,6 +544,27 @@ class AgentManager:
         if "config" in kwargs:
             prior = self.get_agent(agent_id)
             prior_config = (prior or {}).get("config") or {}
+            # Self-heal a stuck `budget_exceeded` badge: when the budget caps
+            # are edited (e.g. set to Unlimited or raised), recompute against
+            # accrued usage and clear the status if it no longer applies. The
+            # caller may still override `status` explicitly.
+            if (
+                prior
+                and prior.get("status") == "budget_exceeded"
+                and "status" not in kwargs
+            ):
+                new_config = kwargs["config"] or {}
+                max_cost = new_config.get("max_cost", 0) or 0
+                # Lifetime token budget uses a dedicated key, not generation
+                # `max_tokens` (see executor budget enforcement).
+                budget_max_tokens = new_config.get("budget_max_tokens", 0) or 0
+                total_cost = prior.get("total_cost", 0) or 0
+                total_tokens = prior.get("total_tokens", 0) or 0
+                still_exceeded = (max_cost > 0 and total_cost > max_cost) or (
+                    budget_max_tokens > 0 and total_tokens > budget_max_tokens
+                )
+                if not still_exceeded:
+                    kwargs["status"] = "idle"
         sets: List[str] = []
         vals: List[Any] = []
         for key in (

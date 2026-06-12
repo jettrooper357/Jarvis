@@ -635,11 +635,16 @@ class AgentExecutor:
             if agent_data:
                 config = agent_data.get("config", {})
                 max_cost = config.get("max_cost", 0)
-                max_tokens = config.get("max_tokens", 0)
+                # Lifetime token budget uses a dedicated key. `max_tokens` is the
+                # per-completion generation limit and must NOT act as a budget.
+                budget_max_tokens = config.get("budget_max_tokens", 0)
                 exceeded = False
                 if max_cost > 0 and agent_data["total_cost"] > max_cost:
                     exceeded = True
-                if max_tokens > 0 and agent_data["total_tokens"] > max_tokens:
+                if (
+                    budget_max_tokens > 0
+                    and agent_data["total_tokens"] > budget_max_tokens
+                ):
                     exceeded = True
                 if exceeded:
                     self._manager.update_agent(agent_id, status="budget_exceeded")
@@ -650,7 +655,7 @@ class AgentExecutor:
                             "total_cost": agent_data["total_cost"],
                             "total_tokens": agent_data["total_tokens"],
                             "max_cost": max_cost,
-                            "max_tokens": max_tokens,
+                            "budget_max_tokens": budget_max_tokens,
                         },
                     )
             self._bus.publish(

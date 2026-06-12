@@ -64,12 +64,12 @@ def test_budget_unlimited_skips_check(tmp_path):
 
 
 def test_token_budget_exceeded(tmp_path):
-    """Agent exceeding max_tokens gets budget_exceeded."""
+    """Agent exceeding budget_max_tokens gets budget_exceeded."""
     mgr = AgentManager(str(tmp_path / "test.db"))
     bus = EventBus()
     executor = AgentExecutor(mgr, bus)
 
-    agent = mgr.create_agent("token-heavy", config={"max_tokens": 1000})
+    agent = mgr.create_agent("token-heavy", config={"budget_max_tokens": 1000})
     mgr.start_tick(agent["id"])
 
     result = AgentResult(content="done", metadata={"cost": 0.01, "tokens_used": 1500})
@@ -77,4 +77,87 @@ def test_token_budget_exceeded(tmp_path):
 
     updated = mgr.get_agent(agent["id"])
     assert updated["status"] == "budget_exceeded"
+    mgr.close()
+
+
+def test_generation_max_tokens_is_not_a_budget(tmp_path):
+    """A per-completion max_tokens must NOT trip the lifetime token budget."""
+    mgr = AgentManager(str(tmp_path / "test.db"))
+    bus = EventBus()
+    executor = AgentExecutor(mgr, bus)
+
+    # 4096 is the classic generation output cap (e.g. monitor_operative default).
+    agent = mgr.create_agent("chief-like", config={"max_tokens": 4096})
+    mgr.start_tick(agent["id"])
+
+    result = AgentResult(content="done", metadata={"tokens_used": 57565})
+    executor._finalize_tick(agent["id"], result, error=None, duration=1.0)
+
+    updated = mgr.get_agent(agent["id"])
+    assert updated["status"] == "idle"
+    mgr.close()
+
+
+def test_config_update_to_unlimited_clears_budget_exceeded(tmp_path):
+    """Setting budget to unlimited clears a stuck budget_exceeded status."""
+    mgr = AgentManager(str(tmp_path / "test.db"))
+    bus = EventBus()
+    executor = AgentExecutor(mgr, bus)
+
+    agent = mgr.create_agent("spendy", config={"max_cost": 1.0})
+    mgr.start_tick(agent["id"])
+    result = AgentResult(content="done", metadata={"cost": 5.0, "tokens_used": 100})
+    executor._finalize_tick(agent["id"], result, error=None, duration=1.0)
+    assert mgr.get_agent(agent["id"])["status"] == "budget_exceeded"
+
+    # User removes the cap (Budget: Unlimited) — badge must clear. Preserve the
+    # generation max_tokens so we also prove it is not treated as a budget.
+    mgr.update_agent(agent["id"], config={"max_cost": 0, "max_tokens": 4096})
+    assert mgr.get_agent(agent["id"])["status"] == "idle"
+    mgr.close()
+
+
+def test_config_update_raising_cap_clears_budget_exceeded(tmp_path):
+    """Raising max_cost above accrued cost clears budget_exceeded."""
+    mgr = AgentManager(str(tmp_path / "test.db"))
+    bus = EventBus()
+    executor = AgentExecutor(mgr, bus)
+
+    agent = mgr.create_agent("spendy", config={"max_cost": 1.0})
+    mgr.start_tick(agent["id"])
+    result = AgentResult(content="done", metadata={"cost": 5.0, "tokens_used": 100})
+    executor._finalize_tick(agent["id"], result, error=None, duration=1.0)
+    assert mgr.get_agent(agent["id"])["status"] == "budget_exceeded"
+
+    mgr.update_agent(agent["id"], config={"max_cost": 100.0})
+    assert mgr.get_agent(agent["id"])["status"] == "idle"
+    mgr.close()
+
+
+def test_config_update_still_over_cap_stays_budget_exceeded(tmp_path):
+    """If the new cap is still below accrued cost, status stays exceeded."""
+    mgr = AgentManager(str(tmp_path / "test.db"))
+    bus = EventBus()
+    executor = AgentExecutor(mgr, bus)
+
+    agent = mgr.create_agent("spendy", config={"max_cost": 1.0})
+    mgr.start_tick(agent["id"])
+    result = AgentResult(content="done", metadata={"cost": 5.0, "tokens_used": 100})
+    executor._finalize_tick(agent["id"], result, error=None, duration=1.0)
+    assert mgr.get_agent(agent["id"])["status"] == "budget_exceeded"
+
+    # Raise the cap a little, but still under the 5.0 already spent.
+    mgr.update_agent(agent["id"], config={"max_cost": 2.0})
+    assert mgr.get_agent(agent["id"])["status"] == "budget_exceeded"
+    mgr.close()
+
+
+def test_config_update_does_not_disturb_non_budget_status(tmp_path):
+    """A config edit on a normal agent must not flip its status to idle."""
+    mgr = AgentManager(str(tmp_path / "test.db"))
+    agent = mgr.create_agent("normal", config={"max_cost": 0})
+    mgr.update_agent(agent["id"], status="running")
+
+    mgr.update_agent(agent["id"], config={"max_cost": 0, "model": "qwen2.5"})
+    assert mgr.get_agent(agent["id"])["status"] == "running"
     mgr.close()
